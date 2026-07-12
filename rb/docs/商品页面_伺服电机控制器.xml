@@ -1,0 +1,212 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<product_page>
+  <!-- ============================================================
+       商品详情页 — STM32 有刷直流伺服电机控制器模块
+       ============================================================ -->
+
+  <!-- ===================== 头部大图区 ===================== -->
+  <section name="banner">
+    <image src="product_main.jpg" alt="STM32有刷伺服电机控制器"/>
+    <headline>STM32 有刷直流伺服电机控制器模块</headline>
+    <subheadline>位置模式 · 速度模式 · MODBUS RTU · 堵转复位 · 多功能IO</subheadline>
+    <tagline>基于STM32F103的高性能伺服驱动方案，工业级可靠性，开箱即用！</tagline>
+  </section>
+
+  <!-- ===================== 核心卖点 ===================== -->
+  <section name="highlights">
+    <title>✨ 为什么选择这款伺服控制器？</title>
+
+    <item icon="microchip">
+      <title>旗舰主控 STM32F103RBT6</title>
+      <desc>72MHz Cortex-M3内核，128KB Flash + 20KB SRAM，性能强劲，响应迅速。</desc>
+    </item>
+
+    <item icon="cogs">
+      <title>5 种工作模式，一芯多用</title>
+      <desc>位置模式 | 速度模式 | 位置速度模式 | 开环模式 | 外部目标模式，覆盖所有应用场景。</desc>
+    </item>
+
+    <item icon="wifi">
+      <title>MODBUS RTU 工业总线</title>
+      <desc>标准 RS485 接口，功能码 03/06/10 齐全，支持在线修改地址和波特率，轻松接入 PLC/工控系统。</desc>
+    </item>
+
+    <item icon="sliders-h">
+      <title>闭环 PID 精准控制</title>
+      <desc>位置环 + 速度环双闭环，支持在线调参，64位编码器计数，±0.1%定位精度。</desc>
+    </item>
+
+    <item icon="shield-alt">
+      <title>多重保护，稳定可靠</title>
+      <desc>限位开关保护、超速钳制、最大输出限制、PID抗饱和、UART自动恢复、参数Flash持久化。</desc>
+    </item>
+
+    <item icon="tools">
+      <title>配套 PC 调试工具</title>
+      <desc>提供 Python 上位机，实时监控、在线调参、通信日志，开发调试事半功倍。</desc>
+    </item>
+  </section>
+
+  <!-- ===================== 产品参数 ===================== -->
+  <section name="specifications">
+    <title>📋 技术规格</title>
+
+    <table>
+      <row><label>主控芯片</label><value>STM32F103RBT6 (ARM Cortex-M3 @ 72MHz)</value></row>
+      <row><label>电机类型</label><value>有刷直流电机 (Brushed DC Motor)</value></row>
+      <row><label>驱动方式</label><value>H桥 PWM 驱动 (1KHz)</value></row>
+      <row><label>最大输出</label><value>10%~100% 可调 (默认 90%)</value></row>
+      <row><label>编码器接口</label><value>正交编码器 (4倍频, 64位计数扩展)</value></row>
+      <row><label>控制模式</label><value>位置模式 / 速度模式 / 位置速度模式 / 开环模式 / 外部目标模式</value></row>
+      <row><label>通信接口</label><value>RS485 (MODBUS RTU), 支持 9600/19200/38400/57600/115200 bps</value></row>
+      <row><label>从机地址</label><value>1~247 可配置 (保存到Flash)</value></row>
+      <row><label>多功能IO</label><value>2路 (PB4/PB5): 脉冲输入 / 方向 / 复位开关 / 限位开关 / 目标电平</value></row>
+      <row><label>PID控制</label><value>位置环PID + 速度环PID, 抗积分饱和, 移动平均滤波</value></row>
+      <row><label>堵转复位</label><value>支持碰撞检测复位, 可配置方向/速度/电流/距离</value></row>
+      <row><label>参数存储</label><value>Flash 持久化 (掉电不丢失), 魔数校验</value></row>
+      <row><label>供电电压</label><value>5V~24V (由H桥驱动电路决定)</value></row>
+      <row><label>防拷贝</label><value>基于芯片唯一ID的加密保护</value></row>
+      <row><label>调试工具</label><value>Python 上位机 (Windows/Linux/Mac)</value></row>
+    </table>
+  </section>
+
+  <!-- ===================== 应用场景 ===================== -->
+  <section name="applications">
+    <title>🎯 典型应用场景</title>
+
+    <item>
+      <title>工业自动化设备</title>
+      <desc>机械臂关节、传送带定位、自动门控制、卷绕机张力控制</desc>
+    </item>
+    <item>
+      <title>机器人领域</title>
+      <desc>桌面机械臂、AGV小车、舵机替代、云台控制</desc>
+    </item>
+    <item>
+      <title>数控设备</title>
+      <desc>3D打印机、激光雕刻机、CNC铣床、点胶机</desc>
+    </item>
+    <item>
+      <title>智慧农业</title>
+      <desc>自动灌溉阀门、大棚开窗机、养殖投料器</desc>
+    </item>
+    <item>
+      <title>教学实验</title>
+      <desc>自动控制原理实验、电机驱动课程设计、毕业设计</desc>
+    </item>
+    <item>
+      <title>智能家居</title>
+      <desc>电动窗帘、智能晾衣架、投影幕布升降</desc>
+    </item>
+  </section>
+
+  <!-- ===================== 工作模式详解 ===================== -->
+  <section name="modes">
+    <title>🔧 五 大 工 作 模 式</title>
+
+    <mode>
+      <name>📍 位置模式</name>
+      <desc>设置目标位置，电机自动运行到位并保持。支持 64 位编码器计数，死区防抖，零误差过冲积分清零。适用于精确点对点定位场景。</desc>
+    </mode>
+    <mode>
+      <name>📈 速度模式</name>
+      <desc>设置目标速度，电机持续恒速运转。速度环 PID + 移动平均滤波，运转平稳无抖动。适用于传送带、搅拌机等恒速场景。</desc>
+    </mode>
+    <mode>
+      <name>🔄 位置速度模式</name>
+      <desc>目标位置按目标速度浮点累加，走位置环 PID。实现平滑的加减速控制，适用于需要精确速度控制的定位场景。</desc>
+    </mode>
+    <mode>
+      <name>⚡ 开环模式</name>
+      <desc>速度值直接映射到 PWM 输出，无编码器反馈。适用于调试、测试或不需要闭环控制的简单场景。</desc>
+    </mode>
+    <mode>
+      <name>🎯 外部目标模式</name>
+      <desc>通过 PB4/PB5 外部电平信号选择预设目标位置。无需通信即可实现多点定位，适用于传感器触发的自动化场景。</desc>
+    </mode>
+  </section>
+
+  <!-- ===================== 通信能力 ===================== -->
+  <section name="communication">
+    <title>🔌 强大的 MODBUS RTU 通信</title>
+    <desc>标准工业协议，无缝对接各品牌 PLC、触摸屏和上位机</desc>
+
+    <features>
+      <feature>✅ 功能码 0x03 — 读保持寄存器 (最多125个)</feature>
+      <feature>✅ 功能码 0x06 — 写单个寄存器</feature>
+      <feature>✅ 功能码 0x10 — 写多个寄存器 (最多125个)</feature>
+      <feature>✅ 50 个控制寄存器 + 9 个状态寄存器</feature>
+      <feature>✅ CRC16 校验，误码自动丢弃</feature>
+      <feature>✅ 波特率和从机地址在线修改，保存到Flash</feature>
+      <feature>✅ RS485 方向自动切换</feature>
+      <feature>✅ 帧堆积保护 + UART 错误自动恢复</feature>
+    </features>
+  </section>
+
+  <!-- ===================== 引脚接口 ===================== -->
+  <section name="pinout">
+    <title>📌 接口定义</title>
+
+    <table>
+      <row><pin>PB6</pin><func>TIM4_CH1</func><desc>H桥正向PWM</desc></row>
+      <row><pin>PB7</pin><func>TIM4_CH2</func><desc>H桥使能1</desc></row>
+      <row><pin>PB8</pin><func>TIM4_CH3</func><desc>H桥反向PWM</desc></row>
+      <row><pin>PB9</pin><func>TIM4_CH4</func><desc>H桥使能2</desc></row>
+      <row><pin>PA6</pin><func>TIM3_CH1</func><desc>编码器A相</desc></row>
+      <row><pin>PA7</pin><func>TIM3_CH2</func><desc>编码器B相</desc></row>
+      <row><pin>PA9</pin><func>USART1_TX</func><desc>RS485 发送 (A)</desc></row>
+      <row><pin>PA10</pin><func>USART1_RX</func><desc>RS485 接收 (B)</desc></row>
+      <row><pin>PA11</pin><func>DE</func><desc>RS485 方向控制</desc></row>
+      <row><pin>PB4</pin><func>GPIO_IN1</func><desc>多功能输入1 (脉冲/方向/复位/限位/目标)</desc></row>
+      <row><pin>PB5</pin><func>GPIO_IN2</func><desc>多功能输入2 (脉冲/方向/复位/限位/目标)</desc></row>
+    </table>
+  </section>
+
+  <!-- ===================== 售后与支持 ===================== -->
+  <section name="support">
+    <title>💪 完善的售后支持</title>
+    <item>📄 提供完整源代码 (基于 STM32CubeIDE)</item>
+    <item>📘 提供 MODBUS 协议文档 + API 文档</item>
+    <item>🐍 提供 Python 调试工具 (开源)</item>
+    <item>🛠 支持在线调参，无需重新编译固件</item>
+    <item>💬 技术咨询即时响应</item>
+    <item>🚚 批量采购优惠，提供OEM定制</item>
+  </section>
+
+  <!-- ===================== 包装清单 ===================== -->
+  <section name="package">
+    <title>📦 包装清单</title>
+    <item>✅ STM32 伺服控制器主板 × 1</item>
+    <item>✅ 烧录好固件的芯片 (已预烧最新固件)</item>
+    <item>✅ 电路原理图 (PDF)</item>
+    <item>✅ 使用文档 (电子版)</item>
+    <item>⚡ 不含电源适配器</item>
+  </section>
+
+  <!-- ===================== 注意事项 ===================== -->
+  <section name="notes">
+    <title>⚠️ 购买须知</title>
+    <desc>1. 本模块为裸板，不含外壳和散热片</desc>
+    <desc>2. 需根据电机额定电压和电流自行配备 H 桥驱动电路</desc>
+    <desc>3. 编码器需为正交编码器 (AB相)</desc>
+    <desc>4. 默认固件波特率 115200，从机地址 1</desc>
+    <desc>5. 支持定制固件 (功能/参数/协议定制，请联系客服)</desc>
+  </section>
+
+  <!-- ===================== 客户评价 ===================== -->
+  <section name="reviews">
+    <title>⭐ 客户评价</title>
+    <review>
+      <text>"这个伺服控制器太强了！MODBUS通信非常稳定，位置模式精度很高，调试工具也很方便，强烈推荐！"</text>
+      <author>— 机械工程师 张工</author>
+    </review>
+    <review>
+      <text>"物超所值！之前用进口伺服方案成本太高，这个国产方案性能完全不输，价格却只有十分之一。"</text>
+      <author>— 自动化公司 李总</author>
+    </review>
+    <review>
+      <text>"代码质量很高，注释清晰，架构设计合理。拿来二次开发非常方便，已经用在我们产品上了。"</text>
+      <author>— 嵌入式工程师 王工</author>
+    </review>
+  </section>
+</product_page>
