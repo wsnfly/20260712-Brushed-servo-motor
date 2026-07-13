@@ -130,12 +130,10 @@ int main(void)
   /* 启动UART中断接收（�?�字节，由HAL_UART_RxCpltCallback处理�????? */
   HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1);
 
-  /* 启动TIM2 10us中断（脉冲输入边沿检测） */
-  HAL_TIM_Base_Start_IT(&htim2);
-
-  /* MODBUS相关中断优先级设为最低，确保电机控制(PID/编码�?????)不被打断 */
-  HAL_NVIC_SetPriority(TIM1_UP_IRQn, 1, 0);
-  HAL_NVIC_SetPriority(TIM2_IRQn, 2, 0);
+  /* TIM2启停和ARR由MotorControl_UpdateIrqPriority统一管理:
+   *   有脉冲输入(PB4或PB5=PIN_FUNC_PULSE)时启动TIM2
+   *   无脉冲输入时关闭TIM2, 释放CPU给USART1等 */
+  MotorControl_UpdateIrqPriority();
   HAL_NVIC_SetPriority(USART1_IRQn, 3, 0);
   /* USER CODE END 2 */
 

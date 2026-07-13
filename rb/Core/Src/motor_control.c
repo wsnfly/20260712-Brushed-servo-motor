@@ -60,6 +60,7 @@
 
 extern void MODBUS_SyncTargetPosition(int64_t position);
 
+extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim4;
 
@@ -108,6 +109,7 @@ typedef struct {
     uint32_t pin4_target_speed;
     uint32_t pin5_target_speed;
     uint32_t mode;
+    uint32_t tim2_arr;          /* TIM2 ARR值, 决定脉冲采样中断周期 */
 } FlashConfig_t;
 
 typedef enum {
@@ -208,7 +210,7 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         if (cfg->mode <= EXTERNAL_TARGET_SPEED_MODE) {
             mc->mode = (MotorMode_t)cfg->mode;
         }
-        if (cfg->pin4_func <= PIN_FUNC_TARGET) {
+        if (cfg->pin4_func <= PIN_FUNC_NONE) {
             mc->pin4_func = (uint8_t)cfg->pin4_func;
         }
         if (cfg->pin4_polarity <= 1) {
@@ -217,7 +219,7 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         if (cfg->pin4_limit_dir <= 1) {
             mc->pin4_limit_dir = (uint8_t)cfg->pin4_limit_dir;
         }
-        if (cfg->pin5_func <= PIN_FUNC_TARGET) {
+        if (cfg->pin5_func <= PIN_FUNC_NONE) {
             mc->pin5_func = (uint8_t)cfg->pin5_func;
         }
         if (cfg->pin5_polarity <= 1) {
@@ -228,6 +230,9 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         }
         if (cfg->max_run_speed <= 1000000) {
             mc->max_run_speed = (int32_t)cfg->max_run_speed;
+        }
+        if (cfg->tim2_arr >= 99 && cfg->tim2_arr <= 65535) {
+            mc->tim2_arr = cfg->tim2_arr;
         }
         if (cfg->target_pos_magic == FLASH_TARGET_MAGIC) {
             mc->pin4_target_pos = (int64_t)(((uint64_t)cfg->pin4_target_pos_h << 32) | cfg->pin4_target_pos_l);
@@ -290,6 +295,7 @@ void MotorControl_SaveConfig(MotorControl_t *mc)
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 140, (uint32_t)mc->pin4_target_speed);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 144, (uint32_t)mc->pin5_target_speed);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 148, (uint32_t)mc->mode);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 152, (uint32_t)mc->tim2_arr);
 
     HAL_FLASH_Lock();
 }
@@ -397,6 +403,7 @@ void MotorControl_Init(MotorControl_t *mc,
     mc->home_precision_speed = 100;
     mc->home_precision_cycles = 3;
     mc->pin4_func = PIN_FUNC_PULSE;
+    mc->tim2_arr = 639;  /* 默认10us周期 (639+1)/64MHz */
     mc->pin4_polarity = POLARITY_ACTIVE_HIGH;
     mc->pin4_limit_dir = 0;
     mc->pin5_func = PIN_FUNC_DIR;
@@ -1187,6 +1194,40 @@ void Encoder_Reset(void)
 void MotorControl_ProcessInputs(void)
 {
     if (!motor_ctl) return;
+}
+
+/* 应用TIM2 ARR值到硬件寄存器（修改脉冲采样中断周期）
+ * mc->tim2_arr 有效范围 99~65535, 周期 = (ARR+1)/64MHz
+ * 注意: 应在TIM2停止或主循环中调用, 避免在运行中改写产生异常 */
+void MotorControl_ApplyTim2Arr(void)
+{
+    if (!motor_ctl) return;
+    uint32_t arr = motor_ctl->tim2_arr;
+    if (arr < 99) arr = 99;
+    if (arr > 65535) arr = 65535;
+    __HAL_TIM_SET_AUTORELOAD(&htim2, arr);
+}
+
+/* 根据PB4/PB5是否配置为脉冲输入，动态调整TIM1/TIM2中断优先级
+ * 普通模式: TIM1(PID 100us)=1, TIM2关闭
+ * 脉冲模式: TIM2(脉冲边沿检测 10us)=1, TIM1(PID 100us)=2  防止脉冲计数不准确
+ * 编码器(TIM3)始终为0(最高), USART1始终为3(最低)
+ * TIM2只负责脉冲和方向引脚采样, 无脉冲输入时直接关闭以释放CPU */
+void MotorControl_UpdateIrqPriority(void)
+{
+    if (!motor_ctl) return;
+    if (motor_ctl->pin4_func == PIN_FUNC_PULSE || motor_ctl->pin5_func == PIN_FUNC_PULSE) {
+        /* 脉冲计数模式: 启动TIM2, 优先级高于TIM1，防止丢脉冲 */
+        MotorControl_ApplyTim2Arr();
+        HAL_TIM_Base_Start_IT(&htim2);
+        HAL_NVIC_SetPriority(TIM1_UP_IRQn, 2, 0);
+        HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
+    } else {
+        /* 无脉冲输入: 关闭TIM2中断, 释放CPU给USART1等 */
+        HAL_TIM_Base_Stop_IT(&htim2);
+        HAL_NVIC_SetPriority(TIM1_UP_IRQn, 1, 0);
+        HAL_NVIC_SetPriority(TIM2_IRQn, 2, 0);
+    }
 }
 
 /* TIM2 10us中断中调用：脉冲输入边沿检测（高速采样避免丢脉冲） */

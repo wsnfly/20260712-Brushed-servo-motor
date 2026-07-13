@@ -82,6 +82,10 @@
 #define REG_INPUT1_TARGET_SPEED_L    0x0036  /* PB4外部目标速度低16位 */
 #define REG_INPUT2_TARGET_SPEED_H    0x0037  /* PB5外部目标速度高16位 */
 #define REG_INPUT2_TARGET_SPEED_L    0x0038  /* PB5外部目标速度低16位 */
+#define REG_TIM2_ARR                 0x0039  /* TIM2自动重装载值(ARR), 决定脉冲采样中断周期
+                                             * 周期 = (ARR+1)/64MHz, 默认639 -> 10us
+                                             * 范围: 99~65535, 即约1.56us~1.024ms
+                                             * 增大ARR可降低中断频率以减轻CPU负担(影响脉冲采样精度) */
 
 /* 状态寄存器 (只读) */
 #define REG_CURRENT_POS_H3           0x0100  /* 当前位置高32位 */

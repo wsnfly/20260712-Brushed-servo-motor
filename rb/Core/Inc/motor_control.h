@@ -56,7 +56,8 @@ typedef enum {
     PIN_FUNC_DIR,          /* 方向信号：脉冲方向控制 */
     PIN_FUNC_HOME,         /* 复位开关：堵转复位时设为原点 */
     PIN_FUNC_LIMIT,        /* 限位开关：停止该方向运动 */
-    PIN_FUNC_TARGET        /* 目标位置/速度电平：外部目标位置/速度模式下有效时到达预设目标位置/速度，无效时回原点/停止 */
+    PIN_FUNC_TARGET,       /* 目标位置/速度电平：外部目标位置/速度模式下有效时到达预设目标位置/速度，无效时回原点/停止 */
+    PIN_FUNC_NONE          /* 无功能：引脚不参与任何逻辑 */
 } PinFunc_t;
 
 /* 引脚有效电平 */
@@ -101,6 +102,9 @@ typedef struct {
     int64_t pin5_target_pos;     /* PB5目标位置电平功能的预设目标位置 */
     int32_t pin4_target_speed;   /* PB4外部目标速度 */
     int32_t pin5_target_speed;   /* PB5外部目标速度 */
+    uint32_t tim2_arr;           /* TIM2自动重装载值(ARR), 决定脉冲采样中断周期
+                                  * 周期 = (ARR+1)/64MHz, 默认639 -> 10us
+                                  * 范围: 99~65535, 即约1.56us~1.024ms */
     MotorMode_t mode;
     float target_speed;
     int64_t target_position;
@@ -153,6 +157,8 @@ void MotorControl_LoadConfig(MotorControl_t *mc);
 
 void MotorControl_ProcessInputs(void);  /* 主循环中调用, 处理PB4/PB5输入 */
 void MotorControl_PulseTick10us(void);  /* TIM2 10us中断中调用, 脉冲边沿检测 */
+void MotorControl_UpdateIrqPriority(void);  /* PB4/PB5为脉冲输入时交换TIM1/TIM2优先级，防止丢脉冲 */
+void MotorControl_ApplyTim2Arr(void);  /* 应用tim2_arr到TIM2硬件寄存器, 修改脉冲采样中断周期 */
 void Motor_Start(void);
 void Motor_Stop(void);
 void Motor_SetPWM(int16_t output);

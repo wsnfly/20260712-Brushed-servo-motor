@@ -11,10 +11,10 @@
 ../Core/Src/modbus.c:213:6:MODBUS_SendResponse	32	static
 ../Core/Src/modbus.c:236:13:MODBUS_SendException	24	static
 ../Core/Src/modbus.c:248:17:MODBUS_ReadRegister	32	static
-../Core/Src/modbus.c:406:13:MODBUS_ApplyTarget	24	static
-../Core/Src/modbus.c:417:13:MODBUS_ApplyMode	24	static
-../Core/Src/modbus.c:440:13:MODBUS_WriteRegister	352	static
-../Core/Src/modbus.c:732:13:MODBUS_ProcessReadHoldingRegs	88	static
-../Core/Src/modbus.c:767:13:MODBUS_ProcessWriteSingleReg	24	static
-../Core/Src/modbus.c:795:13:MODBUS_ProcessWriteMultipleRegs	48	static
-../Core/Src/modbus.c:842:6:MODBUS_Process	40	static
+../Core/Src/modbus.c:408:13:MODBUS_ApplyTarget	24	static
+../Core/Src/modbus.c:419:13:MODBUS_ApplyMode	24	static
+../Core/Src/modbus.c:442:13:MODBUS_WriteRegister	352	static
+../Core/Src/modbus.c:743:13:MODBUS_ProcessReadHoldingRegs	88	static
+../Core/Src/modbus.c:778:13:MODBUS_ProcessWriteSingleReg	24	static
+../Core/Src/modbus.c:806:13:MODBUS_ProcessWriteMultipleRegs	48	static
+../Core/Src/modbus.c:853:6:MODBUS_Process	40	static

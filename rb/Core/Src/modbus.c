@@ -277,7 +277,7 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
     }
     
     /* 控制寄存器（可读写） */
-    if (addr >= 0x0000 && addr <= 0x0038) {
+    if (addr >= 0x0000 && addr <= 0x0039) {
         switch (addr) {
             case REG_CONTROL_WORD:
                 return pending_control_word & CTRL_MODE_MASK;
@@ -393,6 +393,8 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return (uint16_t)((int32_t)mc->pin5_target_speed >> 16);
             case REG_INPUT2_TARGET_SPEED_L:
                 return (uint16_t)((int32_t)mc->pin5_target_speed & 0xFFFF);
+            case REG_TIM2_ARR:
+                return (uint16_t)mc->tim2_arr;
         }
     }
     
@@ -448,7 +450,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
     }
     
     /* 控制寄存器 */
-    if (addr >= 0x0000 && addr <= 0x0038) {
+    if (addr >= 0x0000 && addr <= 0x0039) {
         switch (addr) {
             case REG_CONTROL_WORD:
                 pending_control_word = value & CTRL_MODE_MASK;
@@ -618,9 +620,10 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 config_dirty = 1;
                 break;
             case REG_INPUT1_FUNC:
-                if (value <= PIN_FUNC_TARGET) {
+                if (value <= PIN_FUNC_NONE) {
                     mc->pin4_func = (uint8_t)value;
                     config_dirty = 1;
+                    MotorControl_UpdateIrqPriority();
                 }
                 break;
             case REG_INPUT1_POLARITY:
@@ -632,9 +635,10 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 config_dirty = 1;
                 break;
             case REG_INPUT2_FUNC:
-                if (value <= PIN_FUNC_TARGET) {
+                if (value <= PIN_FUNC_NONE) {
                     mc->pin5_func = (uint8_t)value;
                     config_dirty = 1;
+                    MotorControl_UpdateIrqPriority();
                 }
                 break;
             case REG_INPUT2_POLARITY:
@@ -717,6 +721,13 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 mc->pin5_target_speed = (int32_t)(((uint32_t)mc->pin5_target_speed & 0xFFFF0000) | value);
                 config_dirty = 1;
                 break;
+            case REG_TIM2_ARR:
+                if (value >= 99 && value <= 65535) {
+                    mc->tim2_arr = value;
+                    config_dirty = 1;
+                    MotorControl_ApplyTim2Arr();
+                }
+                break;
         }
     }
     
@@ -736,9 +747,9 @@ static void MODBUS_ProcessReadHoldingRegs(MB_Context_t *ctx, uint16_t start_addr
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
-    /* 检查地址范围：控制寄存器 0x0000~0x0038, 状态寄存器 0x0100~0x0108 */
+    /* 检查地址范围：控制寄存器 0x0000~0x0039, 状态寄存器 0x0100~0x0108 */
     uint16_t end_addr = start_addr + quantity - 1;
-    if (!((start_addr <= 0x0038 && end_addr <= 0x0038) ||
+    if (!((start_addr <= 0x0039 && end_addr <= 0x0039) ||
           (start_addr >= 0x0100 && end_addr <= 0x0108))) {
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
@@ -769,7 +780,7 @@ static void MODBUS_ProcessWriteSingleReg(MB_Context_t *ctx, uint16_t addr, uint1
     uint8_t old_slave_addr = ctx->slave_addr;
 
     /* 检查地址范围 */
-    if (addr > 0x0038) {
+    if (addr > 0x0039) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_SINGLE_REG, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
@@ -798,7 +809,7 @@ static void MODBUS_ProcessWriteMultipleRegs(MB_Context_t *ctx, uint16_t start_ad
     uint8_t old_slave_addr = ctx->slave_addr;
     pending_baud_rate = 0;
     /* 检查地址范围 */
-    if (quantity > 125 || start_addr + quantity > 0x0039) {
+    if (quantity > 125 || start_addr + quantity > 0x003A) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_MULTIPLE_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }

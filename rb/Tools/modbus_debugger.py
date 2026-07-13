@@ -256,6 +256,9 @@ class ModbusDebuggerApp:
     REG_INPUT1_TARGET_SPEED_L = 0x0036  # PB4外部目标速度低16位
     REG_INPUT2_TARGET_SPEED_H = 0x0037  # PB5外部目标速度高16位
     REG_INPUT2_TARGET_SPEED_L = 0x0038  # PB5外部目标速度低16位
+    REG_TIM2_ARR = 0x0039               # TIM2自动重装载值(ARR), 决定脉冲采样中断周期
+                                        # 周期=(ARR+1)/64MHz, 默认639->10us
+                                        # 范围99~65535, 即约1.56us~1.024ms
     
     REG_CURRENT_POS_H3 = 0x0100
     REG_CURRENT_POS_H2 = 0x0101
@@ -495,11 +498,16 @@ class ModbusDebuggerApp:
         self.home_auto_start_var = tk.StringVar(value="开启")
         ttk.Combobox(other_frame, textvariable=self.home_auto_start_var, width=8,
                      values=["关闭", "开启"], state="readonly").grid(row=14, column=1, padx=5, pady=2)
-        
-        ttk.Button(other_frame, text="应用", command=self.apply_other_params).grid(row=15, column=0, pady=5)
-        ttk.Button(other_frame, text="读取参数", command=self.read_other_params).grid(row=15, column=1, pady=5)
-        ttk.Button(other_frame, text="恢复默认", command=self.reset_config).grid(row=15, column=2, pady=5)
-        ttk.Button(other_frame, text="执行复位", command=self.trigger_homing).grid(row=16, column=0, columnspan=3, pady=5)
+
+        ttk.Label(other_frame, text="TIM2采样周期:").grid(row=15, column=0, padx=5, pady=2)
+        self.tim2_arr_var = tk.StringVar(value="639")
+        ttk.Entry(other_frame, textvariable=self.tim2_arr_var, width=10).grid(row=15, column=1, padx=5, pady=2)
+        ttk.Label(other_frame, text="ARR值, 639=10us").grid(row=15, column=2, padx=5, pady=2)
+
+        ttk.Button(other_frame, text="应用", command=self.apply_other_params).grid(row=16, column=0, pady=5)
+        ttk.Button(other_frame, text="读取参数", command=self.read_other_params).grid(row=16, column=1, pady=5)
+        ttk.Button(other_frame, text="恢复默认", command=self.reset_config).grid(row=16, column=2, pady=5)
+        ttk.Button(other_frame, text="执行复位", command=self.trigger_homing).grid(row=17, column=0, columnspan=3, pady=5)
 
         # PB4/PB5 引脚配置
         pin_frame = ttk.LabelFrame(left_frame, text="PB4/PB5 引脚配置", padding=10)
@@ -515,7 +523,7 @@ class ModbusDebuggerApp:
         ttk.Label(pin_frame, text="PB4").grid(row=1, column=0, padx=5, pady=2)
         self.pin4_func_var = tk.StringVar(value="脉冲")
         ttk.Combobox(pin_frame, textvariable=self.pin4_func_var, width=9,
-                     values=["脉冲", "方向", "复位开关", "限位开关", "目标位置速度"], state="readonly").grid(row=1, column=1, padx=2, pady=2)
+                     values=["脉冲", "方向", "复位开关", "限位开关", "目标位置速度", "无功能"], state="readonly").grid(row=1, column=1, padx=2, pady=2)
         self.pin4_pol_var = tk.StringVar(value="高电平")
         ttk.Combobox(pin_frame, textvariable=self.pin4_pol_var, width=8,
                      values=["高电平", "低电平"], state="readonly").grid(row=1, column=2, padx=2, pady=2)
@@ -530,7 +538,7 @@ class ModbusDebuggerApp:
         ttk.Label(pin_frame, text="PB5").grid(row=2, column=0, padx=5, pady=2)
         self.pin5_func_var = tk.StringVar(value="方向")
         ttk.Combobox(pin_frame, textvariable=self.pin5_func_var, width=9,
-                     values=["脉冲", "方向", "复位开关", "限位开关", "目标位置速度"], state="readonly").grid(row=2, column=1, padx=2, pady=2)
+                     values=["脉冲", "方向", "复位开关", "限位开关", "目标位置速度", "无功能"], state="readonly").grid(row=2, column=1, padx=2, pady=2)
         self.pin5_pol_var = tk.StringVar(value="高电平")
         ttk.Combobox(pin_frame, textvariable=self.pin5_pol_var, width=8,
                      values=["高电平", "低电平"], state="readonly").grid(row=2, column=2, padx=2, pady=2)
@@ -1100,6 +1108,7 @@ class ModbusDebuggerApp:
                         home_auto_start = 1 if self.home_auto_start_var.get() == "开启" else 0
                         home_precision_speed = int(self.home_precision_speed_var.get())
                         home_precision_cycles = int(self.home_precision_cycles_var.get())
+                        tim2_arr = int(self.tim2_arr_var.get())
                         home_values = [
                             home_mode,
                             home_dir,
@@ -1127,7 +1136,10 @@ class ModbusDebuggerApp:
                             self.get_slave_addr(), self.REG_HOME_PRECISION_SPEED_H,
                             [(home_precision_speed >> 16) & 0xFFFF, home_precision_speed & 0xFFFF])
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_HOME_PRECISION_CYCLES, home_precision_cycles)
-                        
+                        # TIM2 ARR (范围99~65535, 超界由固件拒绝)
+                        if 99 <= tim2_arr <= 65535:
+                            self.modbus.write_single_register(self.get_slave_addr(), self.REG_TIM2_ARR, tim2_arr)
+
                         hm_name = {0: "关闭", 1: "堵转", 2: "精确复位"}
                         self.root.after(0, lambda: self.log(
                             f"应用参数成功: 死区={dead_zone}, 最大输出={max_output}, "
@@ -1135,7 +1147,8 @@ class ModbusDebuggerApp:
                             f"启动方式={'标志位' if start_mode else '直接'}, "
                             f"电机={'反转' if motor_dir else '正转'}, "
                             f"编码器={'反转' if encoder_dir else '正常'}, "
-                            f"复位={hm_name.get(home_mode, '?')}"))
+                            f"复位={hm_name.get(home_mode, '?')}, "
+                            f"TIM2_ARR={tim2_arr}"))
                     finally:
                         self.serial_lock.release()
                 else:
@@ -1165,6 +1178,8 @@ class ModbusDebuggerApp:
                             self.get_slave_addr(), self.REG_MAX_RUN_SPEED_H, 2)
                         precision_data = self.modbus.read_holding_registers(
                             self.get_slave_addr(), self.REG_HOME_PRECISION_SPEED_H, 3)
+                        tim2_arr_data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_TIM2_ARR, 1)
                         dead_zone = data[0]
                         max_output = data[1]
                         max_run_speed = (max_run_data[0] << 16) | max_run_data[1]
@@ -1182,6 +1197,7 @@ class ModbusDebuggerApp:
                         home_auto_start = home_data[10]
                         home_precision_speed = (precision_data[0] << 16) | precision_data[1]
                         home_precision_cycles = precision_data[2]
+                        tim2_arr = tim2_arr_data[0]
 
                         hm_display = {0: "关闭", 1: "堵转", 2: "精确复位"}
                         def update_ui():
@@ -1200,13 +1216,15 @@ class ModbusDebuggerApp:
                             self.home_auto_start_var.set("开启" if home_auto_start else "关闭")
                             self.home_precision_speed_var.set(str(home_precision_speed))
                             self.home_precision_cycles_var.set(str(home_precision_cycles))
+                            self.tim2_arr_var.set(str(tim2_arr))
                             self.log(
                                 f"读取参数: 死区={dead_zone}, 最大输出={max_output}, "
                                 f"最大运行速度={max_run_speed}, "
                                 f"启动模式={'标志位' if start_mode else '直接'}, "
                                 f"电机={'反转' if motor_dir else '正转'}, "
                                 f"编码器={'反转' if encoder_dir else '正常'}, "
-                                f"复位={hm_display.get(home_mode, '?')}")
+                                f"复位={hm_display.get(home_mode, '?')}, "
+                                f"TIM2_ARR={tim2_arr}")
                         self.root.after(0, update_ui)
                     finally:
                         self.serial_lock.release()
@@ -1272,6 +1290,9 @@ class ModbusDebuggerApp:
                         self.modbus.write_multiple_registers(
                             self.get_slave_addr(), self.REG_INPUT1_TARGET_SPEED_H,
                             [0, 0, 0, 0])
+                        # TIM2 ARR 恢复默认639 (10us周期)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_TIM2_ARR, 639)
 
                         def update_ui():
                             self.pos_kp_var.set("7.00")
@@ -1295,6 +1316,7 @@ class ModbusDebuggerApp:
                             self.home_auto_start_var.set("开启")
                             self.home_precision_speed_var.set("100")
                             self.home_precision_cycles_var.set("3")
+                            self.tim2_arr_var.set("639")
                             self.pin4_func_var.set("脉冲")
                             self.pin4_pol_var.set("高电平")
                             self.pin4_ldir_var.set("停止正方向")
@@ -1359,7 +1381,7 @@ class ModbusDebuggerApp:
                         p5_speed = (speed_data[2] << 16) | speed_data[3]
                         if p5_speed >= 0x80000000:
                             p5_speed -= 0x100000000
-                        fm = {0:"脉冲",1:"方向",2:"复位开关",3:"限位开关",4:"目标位置速度"}
+                        fm = {0:"脉冲",1:"方向",2:"复位开关",3:"限位开关",4:"目标位置速度",5:"无功能"}
                         pm = {0:"高电平",1:"低电平"}
                         lm = {0:"停止正方向",1:"停止负方向"}
                         self.root.after(0, lambda: self.pin4_func_var.set(fm.get(p4f,"?")))
@@ -1385,7 +1407,7 @@ class ModbusDebuggerApp:
         if not self.modbus:
             messagebox.showwarning("警告", "请先连接串口")
             return
-        fm = {"脉冲":0,"方向":1,"复位开关":2,"限位开关":3,"目标位置速度":4}
+        fm = {"脉冲":0,"方向":1,"复位开关":2,"限位开关":3,"目标位置速度":4,"无功能":5}
         pm = {"高电平":0,"低电平":1}
         lm = {"停止正方向":0,"停止负方向":1}
         try:
