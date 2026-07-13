@@ -298,6 +298,7 @@ static uint8_t motor_running = 0;
 static float current_velocity = 0.0f;
 static float ramped_target_speed = 0.0f;
 static volatile int32_t encoder_wrap = 0;
+static int64_t last_valid_count = 0;  /* 上一次合成的有效计数值(不含方向取反), 用于竞争跳过时返回 */
 static MotorControl_t *motor_ctl = NULL;
 static volatile int16_t current_pwm_output = 0;  /* 当前PWM输出(-1000~+1000) */
 static HomingState_t homing_state = HOMING_IDLE;
@@ -1081,13 +1082,16 @@ void Motor_Start(void)
     /* 启动前清零编码器 */
     __HAL_TIM_SET_COUNTER(&htim3, 0);
     encoder_wrap = 0;
+    last_valid_count = 0;
 
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
 
     /* 清除初始化时残留的更新标志，再使能中断 */
     __HAL_TIM_CLEAR_FLAG(&htim3, TIM_FLAG_UPDATE);
     __HAL_TIM_ENABLE_IT(&htim3, TIM_IT_UPDATE);
-    HAL_NVIC_SetPriority(TIM3_IRQn, 1, 0);
+    /* TIM3编码器溢出中断优先级设为最高(0)，确保编码器计数原子性
+     * 高于TIM1(PID,优先级2)/TIM2(脉冲,优先级2)/USART1(MODBUS,优先级2) */
+    HAL_NVIC_SetPriority(TIM3_IRQn, 0, 0);
     HAL_NVIC_EnableIRQ(TIM3_IRQn);
 }
 
@@ -1138,7 +1142,23 @@ void Encoder_OverflowHandler(void)
 
 int64_t Encoder_GetCount(void)
 {
-    int64_t count = (int64_t)encoder_wrap * 65536 + TIM3->CNT;
+    /* seqlock模式: 读取前后比较encoder_wrap，检测读取过程中是否发生TIM3溢出中断
+     * TIM3优先级最高(0)，在TIM1(PID)中断中调用本函数时TIM3仍可抢占执行，
+     * 因此wrap可能在读取CNT前后变化。若变化说明刚好中断来袭，跳过本轮合成，
+     * 返回上一次有效值，避免合成出错误计数(如 0*65536+小值 而非 1*65536+小值)。 */
+    int32_t wrap1 = encoder_wrap;
+    uint16_t cnt = (uint16_t)TIM3->CNT;  /* 必须用uint16_t: CNT是0~65535无符号值, 误用int16_t会让>=32768的值变负数导致跳变65536 */
+    int32_t wrap2 = encoder_wrap;
+
+    int64_t count;
+    if (wrap1 != wrap2) {
+        /* 读取过程中发生了TIM3溢出中断，跳过本轮合成，返回上一次有效值 */
+        count = last_valid_count;
+    } else {
+        count = (int64_t)wrap1 * 65536 + cnt;
+        last_valid_count = count;
+    }
+
     /* 编码器方向反转时计数取反 */
     if (motor_ctl && motor_ctl->encoder_dir == ENCODER_DIR_REVERSED) {
         count = -count;
@@ -1160,6 +1180,7 @@ void Encoder_Reset(void)
 {
     TIM3->CNT = 0;
     encoder_wrap = 0;
+    last_valid_count = 0;
 }
 
 /* 主循环中处理PB4/PB5输入（备份检查，定时器中断已处理脉冲/限位） */
