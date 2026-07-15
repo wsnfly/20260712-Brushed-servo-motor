@@ -268,8 +268,14 @@ class ModbusDebuggerApp:
     REG_SPEED_ACQ_DIV = 0x003B          # 转速采集分频值(1=100us, 50=5ms, 默认50)
     REG_SPEED_ACQ_COUNT = 0x003C        # 转速采集已采样数量(只读, 0~512)
     REG_SPEED_ACQ_STATUS = 0x003D       # 转速采集状态(只读)
-    REG_SPEED_ACQ_TYPE = 0x003E         # 采集类型: 0=转速, 1=PWM
+    REG_SPEED_ACQ_TYPE = 0x003E         # 采集类型: 0=转速, 1=PWM, 2=位置(相对起始偏移, ±32767脉冲)
     REG_SPEED_ACQ_SIZE = 0x003F         # 采集点数(1~5120)
+
+    REG_STALL_PROT_EN = 0x0040          # 堵转保护使能: 0=关闭, 1=开启
+    REG_STALL_ERR_LIMIT = 0x0041        # 堵转误差阈值(位置=脉冲, 速度=脉冲/秒)
+    REG_STALL_TIME = 0x0042             # 堵转持续时长(单位=PID周期5ms)
+    REG_STALL_STATUS = 0x0043           # 堵转状态(只读): 0=正常, 1=已触发
+    REG_STALL_RESET = 0x0044            # 堵转复位(写1清除)
 
     REG_SPEED_DATA_BASE = 0x0200        # 采集数据起始地址
     REG_SPEED_DATA_END = 0x15FF         # 采集数据结束地址 (5120个寄存器, 10KB)
@@ -579,6 +585,31 @@ class ModbusDebuggerApp:
         ttk.Button(btn_frame, text="读取引脚配置", command=self.read_pin_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="写入引脚配置", command=self.write_pin_config).pack(side=tk.LEFT, padx=5)
 
+        # === 堵转保护配置 ===
+        stall_frame = ttk.LabelFrame(left_frame, text="堵转保护", padding=10)
+        stall_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(stall_frame, text="使能:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+        self.stall_en_var = tk.StringVar(value="关闭")
+        ttk.Combobox(stall_frame, textvariable=self.stall_en_var, width=6,
+                     values=["关闭", "开启"], state="readonly").grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(stall_frame, text="误差阈值:").grid(row=0, column=2, padx=5, pady=2, sticky=tk.W)
+        self.stall_err_var = tk.StringVar(value="200")
+        ttk.Entry(stall_frame, textvariable=self.stall_err_var, width=8).grid(row=0, column=3, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(stall_frame, text="(脉冲/脉冲·秒⁻¹)").grid(row=0, column=4, padx=2, pady=2, sticky=tk.W)
+
+        ttk.Label(stall_frame, text="持续时长:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+        self.stall_time_var = tk.StringVar(value="200")
+        ttk.Entry(stall_frame, textvariable=self.stall_time_var, width=8).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(stall_frame, text="(×5ms = 1.0s)").grid(row=1, column=2, columnspan=3, padx=2, pady=2, sticky=tk.W)
+
+        stall_btn_frame = ttk.Frame(stall_frame)
+        stall_btn_frame.grid(row=2, column=0, columnspan=5, pady=5)
+        ttk.Button(stall_btn_frame, text="读取参数", command=self.read_stall_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(stall_btn_frame, text="写入参数", command=self.write_stall_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(stall_btn_frame, text="复位堵转", command=self.reset_stall).pack(side=tk.LEFT, padx=5)
+
         # 右侧：Canvas+滚动条 包裹 PanedWindow（可整体滚动 + 可调整各窗口大小）
         right_frame = ttk.Frame(paned)
         paned.add(right_frame, weight=2)
@@ -662,24 +693,28 @@ class ModbusDebuggerApp:
         self.status_labels['homing'] = ttk.Label(status_frame, text="空闲", foreground="gray", font=("Arial", 12, "bold"))
         self.status_labels['homing'].grid(row=8, column=1, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID误差:").grid(row=9, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="堵转保护:").grid(row=9, column=0, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['stall'] = ttk.Label(status_frame, text="正常", foreground="gray", font=("Arial", 12, "bold"))
+        self.status_labels['stall'].grid(row=9, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="PID误差:").grid(row=10, column=0, padx=5, pady=2, sticky=tk.W)
         self.status_labels['pid_error'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_error'].grid(row=9, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_error'].grid(row=10, column=1, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID-P:").grid(row=10, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="PID-P:").grid(row=11, column=0, padx=5, pady=2, sticky=tk.W)
         self.status_labels['pid_p'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_p'].grid(row=10, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_p'].grid(row=11, column=1, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID-I:").grid(row=11, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="PID-I:").grid(row=12, column=0, padx=5, pady=2, sticky=tk.W)
         self.status_labels['pid_i'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_i'].grid(row=11, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_i'].grid(row=12, column=1, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID-D:").grid(row=12, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="PID-D:").grid(row=13, column=0, padx=5, pady=2, sticky=tk.W)
         self.status_labels['pid_d'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_d'].grid(row=12, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_d'].grid(row=13, column=1, padx=5, pady=2, sticky=tk.W)
 
         self.monitor_btn = ttk.Button(status_frame, text="开始监控", command=self.toggle_monitor)
-        self.monitor_btn.grid(row=13, column=0, columnspan=2, pady=5)
+        self.monitor_btn.grid(row=14, column=0, columnspan=2, pady=5)
 
         # === 采集曲线图（可调高度） ===
         chart_frame = ttk.LabelFrame(right_vpaned, text="采集曲线", padding=5)
@@ -692,7 +727,7 @@ class ModbusDebuggerApp:
         ttk.Label(ctrl_bar, text="采集类型:").pack(side=tk.LEFT, padx=(0, 2))
         self.acq_type_var = tk.StringVar(value="转速")
         acq_type_combo = ttk.Combobox(ctrl_bar, textvariable=self.acq_type_var, width=8,
-                                      values=["转速", "PWM"], state="readonly")
+                                      values=["转速", "PWM", "位置"], state="readonly")
         acq_type_combo.pack(side=tk.LEFT, padx=2)
         acq_type_combo.bind("<<ComboboxSelected>>", self.on_acq_type_changed)
 
@@ -1570,6 +1605,95 @@ class ModbusDebuggerApp:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"写入引脚配置失败: {str(e)}"))
         threading.Thread(target=do_write, daemon=True).start()
 
+    # ========== 堵转保护配置 ==========
+
+    def read_stall_config(self):
+        """读取堵转保护参数"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        def do_read():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_STALL_PROT_EN, 3)
+                        en = data[0]
+                        err_limit_raw = data[1]
+                        if err_limit_raw >= 0x8000:
+                            err_limit_raw -= 0x10000
+                        time_ticks = data[2]
+                        self.root.after(0, lambda: self.stall_en_var.set("开启" if en else "关闭"))
+                        self.root.after(0, lambda: self.stall_err_var.set(str(err_limit_raw)))
+                        self.root.after(0, lambda: self.stall_time_var.set(str(time_ticks)))
+                        self.root.after(0, lambda: self.log(
+                            f"读取堵转保护: 使能={'开启' if en else '关闭'}, "
+                            f"误差阈值={err_limit_raw}, 持续={time_ticks}×5ms={time_ticks*5}ms"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"读取堵转保护失败: {str(e)}"))
+        threading.Thread(target=do_read, daemon=True).start()
+
+    def write_stall_config(self):
+        """写入堵转保护参数"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        try:
+            err_limit = int(self.stall_err_var.get())
+            time_ticks = int(self.stall_time_var.get())
+            if time_ticks < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("警告", "误差阈值和持续时长必须为整数")
+            return
+        en = 1 if self.stall_en_var.get() == "开启" else 0
+        # 误差阈值转成16位有符号
+        if err_limit < -32768 or err_limit > 32767:
+            messagebox.showwarning("警告", "误差阈值范围: -32768~32767")
+            return
+        err_reg = err_limit & 0xFFFF
+        def do_write():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        self.modbus.write_multiple_registers(
+                            self.get_slave_addr(), self.REG_STALL_PROT_EN,
+                            [en, err_reg, time_ticks & 0xFFFF])
+                        self.root.after(0, lambda: self.log(
+                            f"写入堵转保护: 使能={'开启' if en else '关闭'}, "
+                            f"误差阈值={err_limit}, 持续={time_ticks}×5ms={time_ticks*5}ms"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"写入堵转保护失败: {str(e)}"))
+        threading.Thread(target=do_write, daemon=True).start()
+
+    def reset_stall(self):
+        """清除堵转保护触发标志"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        def do_reset():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_STALL_RESET, 1)
+                        self.root.after(0, lambda: self.log("已清除堵转保护触发标志"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"复位堵转失败: {str(e)}"))
+        threading.Thread(target=do_reset, daemon=True).start()
+
     def toggle_monitor(self):
         """切换监控状态"""
         if self.monitoring:
@@ -1657,6 +1781,7 @@ class ModbusDebuggerApp:
                 start_flag = start_flag_data[0] != 0
                 homing_active = (status & 0x4000) != 0
                 homing_failed = (status & 0x2000) != 0
+                stall_tripped = (status & 0x1000) != 0
 
                 # 解析PWM输出 (16位有符号, 范围-1000~+1000, 转换为百分比)
                 pwm_raw = data[8]
@@ -1678,6 +1803,10 @@ class ModbusDebuggerApp:
                 self.root.after(0, lambda active=homing_active, failed=homing_failed: self.status_labels['homing'].config(
                     text="失败" if failed else ("复位中" if active else "空闲"),
                     foreground="red" if failed else ("orange" if active else "gray")
+                ))
+                self.root.after(0, lambda tripped=stall_tripped: self.status_labels['stall'].config(
+                    text="已触发" if tripped else "正常",
+                    foreground="red" if tripped else "gray"
                 ))
                 # PWM显示：带方向颜色（正=红, 负=蓝, 零=灰）
                 def update_pwm(p):
@@ -1774,28 +1903,44 @@ class ModbusDebuggerApp:
         """采集类型切换回调"""
         if not self.modbus:
             messagebox.showwarning("警告", "请先连接串口")
-            # 恢复原值
-            self.acq_type_var.set("转速" if self._current_acq_type() == 0 else "PWM")
+            # 恢复为默认值
+            self.acq_type_var.set("转速")
             return
-        acq_type = 1 if self.acq_type_var.get() == "PWM" else 0
+        acq_type = self._current_acq_type()
         # 更新Y轴标签(即时响应)
-        y_label = "PWM输出" if acq_type == 1 else "转速 (脉冲/秒)"
-        self.speed_ax.set_ylabel(y_label)
+        self.speed_ax.set_ylabel(self._acq_y_label(acq_type))
         self.speed_canvas.draw()
         # 写寄存器放到线程中，避免阻塞UI
         def _worker():
             try:
                 with self.serial_lock:
                     self.modbus.write_single_register(self.get_slave_addr(), self.REG_SPEED_ACQ_TYPE, acq_type)
-                label = "PWM输出" if acq_type == 1 else "转速"
-                self.root.after(0, lambda: self.log(f"设置采集类型: {label}"))
+                self.root.after(0, lambda: self.log(f"设置采集类型: {self._acq_label(acq_type)}"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"设置采集类型失败: {e}"))
         threading.Thread(target=_worker, daemon=True).start()
 
+    # 采集类型映射表: 0=转速, 1=PWM, 2=位置
+    _ACQ_LABELS = {0: "转速", 1: "PWM输出", 2: "位置"}
+    _ACQ_Y_LABELS = {0: "转速 (脉冲/秒)", 1: "PWM输出", 2: "位置偏移 (脉冲)"}
+    _ACQ_TITLES = {0: "转速采集曲线", 1: "PWM采集曲线", 2: "位置采集曲线"}
+    _ACQ_LABEL_TO_TYPE = {"转速": 0, "PWM": 1, "位置": 2}
+
     def _current_acq_type(self):
-        """当前采集类型 0=转速 1=PWM"""
-        return 1 if self.acq_type_var.get() == "PWM" else 0
+        """当前采集类型 0=转速 1=PWM 2=位置"""
+        return self._ACQ_LABEL_TO_TYPE.get(self.acq_type_var.get(), 0)
+
+    def _acq_label(self, acq_type):
+        """类型代号转中文标签"""
+        return self._ACQ_LABELS.get(acq_type, "转速")
+
+    def _acq_y_label(self, acq_type):
+        """类型代号转Y轴标签"""
+        return self._ACQ_Y_LABELS.get(acq_type, "转速 (脉冲/秒)")
+
+    def _acq_title(self, acq_type):
+        """类型代号转图表标题"""
+        return self._ACQ_TITLES.get(acq_type, "转速采集曲线")
 
     def set_speed_acq_params(self):
         """设置采集分频值和采集点数"""
@@ -1900,8 +2045,9 @@ class ModbusDebuggerApp:
                 text=f"状态: {status_text} ({count}点)", foreground=status_color))
 
             # 绘图
+            acq_type = self._current_acq_type()
             self.root.after(0, lambda: self._plot_speed_data(speed_data))
-            self.root.after(0, lambda: self.log(f"读取{len(speed_data)}个转速数据并绘图"))
+            self.root.after(0, lambda: self.log(f"读取{len(speed_data)}个{self._acq_label(acq_type)}数据并绘图"))
 
         except Exception as e:
             self.root.after(0, lambda: self.acq_status_label.config(
@@ -1912,9 +2058,9 @@ class ModbusDebuggerApp:
 
     def _plot_speed_data(self, speed_data):
         """绘制采集曲线"""
-        is_pwm = self._current_acq_type() == 1
-        y_label = "PWM输出" if is_pwm else "转速 (脉冲/秒)"
-        title = "PWM采集曲线" if is_pwm else "转速采集曲线"
+        acq_type = self._current_acq_type()
+        y_label = self._acq_y_label(acq_type)
+        title = self._acq_title(acq_type)
         self.speed_ax.clear()
         self.speed_ax.plot(range(len(speed_data)), speed_data, 'b-', linewidth=0.8)
         self.speed_ax.set_xlabel("采样点")
@@ -1926,9 +2072,9 @@ class ModbusDebuggerApp:
 
     def clear_speed_plot(self):
         """清空采集曲线"""
-        is_pwm = self._current_acq_type() == 1
-        y_label = "PWM输出" if is_pwm else "转速 (脉冲/秒)"
-        title = "PWM采集曲线" if is_pwm else "转速采集曲线"
+        acq_type = self._current_acq_type()
+        y_label = self._acq_y_label(acq_type)
+        title = self._acq_title(acq_type)
         self.speed_ax.clear()
         self.speed_ax.set_xlabel("采样点")
         self.speed_ax.set_ylabel(y_label)

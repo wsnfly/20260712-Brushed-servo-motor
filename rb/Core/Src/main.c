@@ -155,8 +155,8 @@ int main(void)
 	  if (now - last_2s >= 5000) {
 		  last_2s = now;
 		  // 你的逻辑
-		 //MotorControl_SetMode(&motor, POSITION_MODE);
-		 //MotorControl_SetTarget(&motor, 10000);   // 转到 10000 脉冲位置
+		  //MotorControl_SetMode(&motor, SPEED_MODE);
+		  //MotorControl_SetSpeed(&motor, 2000.0f);  // 2000 脉冲/秒
 		 //Motor_Start();
 	  }
     /* USER CODE END WHILE */
@@ -166,10 +166,13 @@ int main(void)
     /* ============ 用户示例代码（注释形式，取消注释即可使用）============ */
 
     /* 示例1：旋转到指定位置（绝对位置，单位=编码器脉冲）
-     * 注意：SetMode 切到位置模式时会把当前编码器值作为目标，
-     *       所以必须紧接着 SetTarget 设真正的目标，否则电机不动 */
+     * 注意1：SetMode 切到位置模式时会把当前编码器值作为目标，
+     *        所以必须紧接着 SetTarget 设真正的目标，否则电机不动
+     * 注意2：上位机读的目标位置是 MODBUS 内部的 pending 缓存，不是 mc->target_position。
+     *        主循环里改了目标位置后，必须再调 MODBUS_SyncTargetPosition 同步，上位机才能读到 */
     // MotorControl_SetMode(&motor, POSITION_MODE);
-    // MotorControl_SetTarget(&motor, 10000);   // 转到 10000 脉冲位置
+    // MotorControl_SetTarget(&motor, 10000);          // 转到 10000 脉冲位置
+    // MODBUS_SyncTargetPosition(10000);               // 同步到 MODBUS pending 缓存，上位机才能读到
     // Motor_Start();
 
     /* 示例2：以指定速度旋转（单位=脉冲/秒，负值=反转）*/
@@ -190,11 +193,13 @@ int main(void)
     //     case 0:
     //         MotorControl_SetMode(&motor, POSITION_MODE);
     //         MotorControl_SetTarget(&motor, 5000);
+    //         MODBUS_SyncTargetPosition(5000);     // 同步pending，上位机可见
     //         run_step = 1; run_time = now;
     //         break;
     //     case 1:
     //         if (llabs(Encoder_GetCount() - 5000) < 20 && (now - run_time) > 1000) {
     //             MotorControl_SetTarget(&motor, -5000);
+    //             MODBUS_SyncTargetPosition(-5000); // 同步pending，上位机可见
     //             run_step = 2; run_time = now;
     //         }
     //         break;
@@ -219,7 +224,9 @@ int main(void)
     // if (now - last_move > 3000) {
     //     last_move = now;
     //     MotorControl_SetMode(&motor, POSITION_MODE);
-    //     MotorControl_SetTarget(&motor, pos_toggle ? 0 : 10000);
+    //     int64_t tgt = pos_toggle ? 0 : 10000;
+    //     MotorControl_SetTarget(&motor, tgt);
+    //     MODBUS_SyncTargetPosition(tgt);          // 同步pending，上位机可见
     //     pos_toggle ^= 1;
     // }
 
@@ -230,6 +237,7 @@ int main(void)
     //     } else if (run_step == 0) {
     //         MotorControl_SetMode(&motor, POSITION_MODE);
     //         MotorControl_SetTarget(&motor, 8000);
+    //         MODBUS_SyncTargetPosition(8000);      // 同步pending，上位机可见
     //     }
     // }
 

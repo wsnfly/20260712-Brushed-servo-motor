@@ -90,8 +90,15 @@
 #define REG_SPEED_ACQ_DIV            0x003B  /* 转速采集分频值(1=100us, 50=5ms, 默认50) */
 #define REG_SPEED_ACQ_COUNT          0x003C  /* 采集已采样数量(只读, 0~5120) */
 #define REG_SPEED_ACQ_STATUS         0x003D  /* 转速采集状态(只读, 同0x003A读取值) */
-#define REG_SPEED_ACQ_TYPE           0x003E  /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000) */
+#define REG_SPEED_ACQ_TYPE           0x003E  /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000), 2=位置(相对起始位置偏移, ±32767脉冲) */
 #define REG_SPEED_ACQ_SIZE           0x003F  /* 采集点数(1~5120, 默认5120) */
+
+/* 堵转保护寄存器 0x0040~0x0044 */
+#define REG_STALL_PROT_EN            0x0040  /* 堵转保护使能: 0=关闭, 1=开启 */
+#define REG_STALL_ERR_LIMIT          0x0041  /* 堵转误差阈值: 位置模式=脉冲, 速度模式=脉冲/秒 */
+#define REG_STALL_TIME               0x0042  /* 堵转持续时间阈值(单位=PID周期5ms, 0=立即触发) */
+#define REG_STALL_STATUS             0x0043  /* 堵转状态(只读): 0=正常, 1=已触发输出关闭 */
+#define REG_STALL_RESET              0x0044  /* 堵转复位(写1清除堵转标志并恢复PID运行) */
 
 /* 数据寄存器 (只读) - 采集缓冲区 0x0200~0x15FF (5120个int16_t, 10KB) */
 #define REG_SPEED_DATA_BASE          0x0200  /* 采集数据起始地址 */

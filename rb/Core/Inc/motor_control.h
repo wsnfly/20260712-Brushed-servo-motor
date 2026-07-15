@@ -132,8 +132,16 @@ typedef struct {
     uint16_t speed_acq_div_cnt;    /* 分频计数器 (内部使用) */
     uint8_t  speed_acq_active;     /* 采集激活标志 */
     uint8_t  speed_acq_done;       /* 采集完成标志 (采满speed_acq_size个样本) */
-    uint8_t  speed_acq_type;       /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000) */
+    uint8_t  speed_acq_type;       /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000), 2=位置(相对起始位置偏移, ±32767脉冲) */
     uint16_t speed_acq_size;       /* 采集点数 (1~SPEED_ACQ_BUF_SIZE, 默认SPEED_ACQ_BUF_SIZE) */
+    int64_t  speed_acq_pos_start;  /* 位置采样起始位置(仅type=2使用, 启动采集时记录) */
+
+    /* 堵转保护 */
+    uint8_t  stall_protect_en;     /* 堵转保护使能: 0=关闭, 1=开启 */
+    int32_t  stall_err_limit;      /* 堵转误差阈值: 位置模式=脉冲, 速度模式=脉冲/秒 */
+    uint16_t stall_time_ticks;     /* 堵转持续时间阈值(单位=PID周期5ms, 0=立即触发) */
+    uint16_t stall_tick_cnt;       /* 堵转持续计数器(内部使用) */
+    uint8_t  stall_tripped;        /* 堵转已触发标志: 0=正常, 1=已触发输出关闭 */
 } MotorControl_t;
 
 void MotorControl_Init(MotorControl_t *mc,
@@ -176,5 +184,9 @@ int64_t Encoder_GetCount(void);
 float Encoder_GetSpeed(void);
 void Encoder_Reset(void);
 void Encoder_OverflowHandler(void);
+
+/* 堵转保护 */
+uint8_t MotorControl_IsStallTripped(void);          /* 查询是否已触发堵转保护 */
+void MotorControl_ResetStall(MotorControl_t *mc);   /* 清除堵转标志并恢复PID运行 */
 
 #endif

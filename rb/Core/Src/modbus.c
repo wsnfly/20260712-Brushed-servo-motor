@@ -270,6 +270,7 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return (start_flag_set ? 0x8000 : 0) |
                        (MotorControl_IsHoming() ? 0x4000 : 0) |
                        (MotorControl_HomingFailed() ? 0x2000 : 0) |
+                       (MotorControl_IsStallTripped() ? 0x1000 : 0) |
                        (mc->mode & 0x0F);
             case REG_CURRENT_PWM:
                 return (uint16_t)MotorControl_GetPWM();
@@ -315,6 +316,22 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return mc->speed_acq_type;
             case REG_SPEED_ACQ_SIZE:
                 return mc->speed_acq_size;
+        }
+    }
+
+    /* 堵转保护寄存器 0x0040~0x0044 */
+    if (addr >= REG_STALL_PROT_EN && addr <= REG_STALL_RESET) {
+        switch (addr) {
+            case REG_STALL_PROT_EN:
+                return mc->stall_protect_en ? 1 : 0;
+            case REG_STALL_ERR_LIMIT:
+                return (uint16_t)mc->stall_err_limit;
+            case REG_STALL_TIME:
+                return mc->stall_time_ticks;
+            case REG_STALL_STATUS:
+                return mc->stall_tripped ? 1 : 0;
+            case REG_STALL_RESET:
+                return 0;  /* 写触发型寄存器, 读取始终返回0 */
         }
     }
     
@@ -787,6 +804,10 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                     mc->speed_acq_div_cnt = 0;
                     mc->speed_acq_active = 1;
                     mc->speed_acq_done = 0;
+                    /* 位置采样(type=2)启动时记录当前位置作为基准 */
+                    if (mc->speed_acq_type == 2) {
+                        mc->speed_acq_pos_start = Encoder_GetCount();
+                    }
                 } else if (value == 0) {
                     /* 停止采集 */
                     mc->speed_acq_active = 0;
@@ -798,7 +819,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 }
                 break;
             case REG_SPEED_ACQ_TYPE:
-                if (value <= 1) {
+                if (value <= 2) {
                     mc->speed_acq_type = (uint8_t)value;
                 }
                 break;
@@ -813,7 +834,30 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 break;
         }
     }
-    
+
+    /* 堵转保护控制寄存器 0x0040~0x0044 */
+    if (addr >= REG_STALL_PROT_EN && addr <= REG_STALL_RESET) {
+        switch (addr) {
+            case REG_STALL_PROT_EN:
+                mc->stall_protect_en = value ? 1 : 0;
+                break;
+            case REG_STALL_ERR_LIMIT:
+                mc->stall_err_limit = (int32_t)(int16_t)value;  /* 允许负值(无意义但兼容) */
+                break;
+            case REG_STALL_TIME:
+                mc->stall_time_ticks = value;
+                break;
+            case REG_STALL_RESET:
+                if (value == 1) {
+                    MotorControl_ResetStall(mc);
+                }
+                break;
+            case REG_STALL_STATUS:
+                /* 只读寄存器，忽略写入 */
+                break;
+        }
+    }
+
     /* 如果需要立即应用目标值 */
     if (need_apply) {
         MODBUS_ApplyTarget(ctx);
@@ -830,9 +874,9 @@ static void MODBUS_ProcessReadHoldingRegs(MB_Context_t *ctx, uint16_t start_addr
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
-    /* 检查地址范围：控制寄存器 0x0000~0x003F, 状态寄存器 0x0100~0x0110, 数据寄存器 0x0200~0x15FF */
+    /* 检查地址范围：控制寄存器 0x0000~0x0044, 状态寄存器 0x0100~0x0110, 数据寄存器 0x0200~0x15FF */
     uint16_t end_addr = start_addr + quantity - 1;
-    if (!((start_addr <= 0x003F && end_addr <= 0x003F) ||
+    if (!((start_addr <= 0x0044 && end_addr <= 0x0044) ||
           (start_addr >= 0x0100 && end_addr <= 0x0110) ||
           (start_addr >= REG_SPEED_DATA_BASE && end_addr <= REG_SPEED_DATA_END))) {
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
@@ -863,8 +907,8 @@ static void MODBUS_ProcessWriteSingleReg(MB_Context_t *ctx, uint16_t addr, uint1
 {
     uint8_t old_slave_addr = ctx->slave_addr;
 
-    /* 检查地址范围 (控制寄存器 0x0000~0x003F 可写, 数据寄存器只读) */
-    if (addr > 0x003F) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x0044 可写, 数据寄存器只读) */
+    if (addr > 0x0044) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_SINGLE_REG, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
@@ -892,8 +936,8 @@ static void MODBUS_ProcessWriteMultipleRegs(MB_Context_t *ctx, uint16_t start_ad
     MotorControl_t *mc = ctx->motor;
     uint8_t old_slave_addr = ctx->slave_addr;
     pending_baud_rate = 0;
-    /* 检查地址范围 (控制寄存器 0x0000~0x003F 可写) */
-    if (quantity > 125 || start_addr + quantity > 0x0040) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x0044 可写) */
+    if (quantity > 125 || start_addr + quantity > 0x0045) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_MULTIPLE_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }

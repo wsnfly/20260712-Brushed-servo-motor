@@ -446,6 +446,13 @@ void MotorControl_Init(MotorControl_t *mc,
     mc->speed_acq_done = 0;
     mc->speed_acq_type = 0;      /* 默认采集转速 */
     mc->speed_acq_size = SPEED_ACQ_BUF_SIZE;  /* 默认采满缓冲区 */
+
+    /* 堵转保护初始化(默认关闭, 需用户启用) */
+    mc->stall_protect_en = 0;
+    mc->stall_err_limit = 200;       /* 默认200脉冲 / 200脉冲/秒 */
+    mc->stall_time_ticks = 200;      /* 默认200个tick = 1秒持续 */
+    mc->stall_tick_cnt = 0;
+    mc->stall_tripped = 0;
 }
 
 static void MotorControl_ClearMotionState(MotorControl_t *mc)
@@ -706,6 +713,54 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         ramped_target_speed = 0.0f;
         Motor_SetPWM(0);
         return 0;
+    }
+
+    /* ========== 堵转保护 ==========
+     * 检测条件: 电机"应该动但没动", 且持续 stall_time_ticks 个PID周期(5ms/tick)
+     *   - 位置模式: 位置误差 > stall_err_limit (应该动) AND 实际速度近0 (没动)
+     *   - 速度模式: 目标速度 > stall_err_limit (应该动) AND 实际速度近0 (没动)
+     * 注意1: 仅"误差大"不能判定堵转 —— 长距离定位时误差天然很大但电机在正常转动
+     * 注意2: 复位(homing)进行中不检测, 避免与homing自带的堵转检测冲突
+     * "速度近0"阈值 = stall_err_limit/10 (最小5脉冲/秒), 由误差阈值派生, 无需额外配置 */
+    if (mc->stall_protect_en && homing_state == HOMING_IDLE) {
+        if (mc->stall_tripped) {
+            /* 已触发: 持续关闭输出, 等待用户复位 */
+            Motor_SetPWM(0);
+            return 0;
+        }
+        if (mc->stall_err_limit > 0) {
+            /* 速度近0阈值: 误差阈值的1/10, 最小5脉冲/秒 */
+            float zero_speed_thresh = (float)mc->stall_err_limit / 10.0f;
+            if (zero_speed_thresh < 5.0f) zero_speed_thresh = 5.0f;
+            float abs_vel = fabsf(mc->velocity);
+            uint8_t should_move_but_stopped = 0;  /* 1=应该动但没动(堵转特征) */
+
+            if (mc->mode == SPEED_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE) {
+                /* 速度模式: 目标速度明显非0但电机不转 */
+                float abs_target = fabsf(mc->target_speed);
+                if (abs_target > (float)mc->stall_err_limit && abs_vel < zero_speed_thresh) {
+                    should_move_but_stopped = 1;
+                }
+            } else {
+                /* 位置模式: 位置误差大但电机不转 */
+                int64_t pos_err = abs64(mc->target_position - current_position);
+                if ((float)pos_err > (float)mc->stall_err_limit && abs_vel < zero_speed_thresh) {
+                    should_move_but_stopped = 1;
+                }
+            }
+
+            if (should_move_but_stopped) {
+                mc->stall_tick_cnt++;
+                if (mc->stall_tick_cnt >= mc->stall_time_ticks) {
+                    mc->stall_tripped = 1;
+                    mc->integral = 0;
+                    Motor_SetPWM(0);
+                    return 0;
+                }
+            } else {
+                mc->stall_tick_cnt = 0;
+            }
+        }
     }
 
     if (homing_state == HOMING_SEARCH) {
@@ -1287,6 +1342,12 @@ void MotorControl_TimerTick100us(void)
                 if (motor_ctl->speed_acq_type == 1) {
                     /* 采集PWM输出 (-1000~+1000) */
                     sample = current_pwm_output;
+                } else if (motor_ctl->speed_acq_type == 2) {
+                    /* 采集位置(相对起始位置的偏移, int16_t范围±32767脉冲) */
+                    int64_t diff = Encoder_GetCount() - motor_ctl->speed_acq_pos_start;
+                    if (diff > 32767) diff = 32767;
+                    if (diff < -32767) diff = -32767;
+                    sample = (int16_t)diff;
                 } else {
                     /* 采集转速 (脉冲/秒, int16_t范围±32767) */
                     float spd = Encoder_GetSpeed();
@@ -1315,4 +1376,22 @@ void MotorControl_TimerTick100us(void)
             MotorControl_Update(motor_ctl, Encoder_GetCount());
         }
     }
+}
+
+/* ========== 堵转保护接口 ========== */
+
+uint8_t MotorControl_IsStallTripped(void)
+{
+    return motor_ctl ? motor_ctl->stall_tripped : 0;
+}
+
+void MotorControl_ResetStall(MotorControl_t *mc)
+{
+    /* 关中断清零, 避免与PID中断竞争 */
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+    mc->stall_tripped = 0;
+    mc->stall_tick_cnt = 0;
+    mc->integral = 0;
+    mc->prev_error = 0;
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
 }
