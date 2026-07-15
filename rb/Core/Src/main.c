@@ -152,13 +152,89 @@ int main(void)
 
 	  // 示例：每 2 秒执行一�????
 	  static int64_t last_2s = 0;
-	  if (now - last_2s >= 2000) {
+	  if (now - last_2s >= 5000) {
 		  last_2s = now;
 		  // 你的逻辑
+		 //MotorControl_SetMode(&motor, POSITION_MODE);
+		 //MotorControl_SetTarget(&motor, 10000);   // 转到 10000 脉冲位置
+		 //Motor_Start();
 	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    /* ============ 用户示例代码（注释形式，取消注释即可使用）============ */
+
+    /* 示例1：旋转到指定位置（绝对位置，单位=编码器脉冲）
+     * 注意：SetMode 切到位置模式时会把当前编码器值作为目标，
+     *       所以必须紧接着 SetTarget 设真正的目标，否则电机不动 */
+    // MotorControl_SetMode(&motor, POSITION_MODE);
+    // MotorControl_SetTarget(&motor, 10000);   // 转到 10000 脉冲位置
+    // Motor_Start();
+
+    /* 示例2：以指定速度旋转（单位=脉冲/秒，负值=反转）*/
+    // MotorControl_SetMode(&motor, SPEED_MODE);
+    // MotorControl_SetSpeed(&motor, 2000.0f);  // 2000 脉冲/秒
+    // Motor_Start();
+
+    /* 示例3：读当前位置/速度，可用于条件判断 */
+    // int64_t cur_pos = Encoder_GetCount();    // 当前位置（脉冲）
+    // float    cur_spd = Encoder_GetSpeed();    // 当前速度（脉冲/秒）
+    // int16_t  cur_pwm = MotorControl_GetPWM(); // 当前PWM输出(-1000~+1000)
+
+    /* 示例4：顺序动作状态机——先到5000再到-5000，到位停1秒
+     * 放在主循环每次都执行的位置（非节拍块内），用 now 做时间判断 */
+    // static uint8_t  run_step = 0;
+    // static int64_t  run_time = 0;
+    // switch (run_step) {
+    //     case 0:
+    //         MotorControl_SetMode(&motor, POSITION_MODE);
+    //         MotorControl_SetTarget(&motor, 5000);
+    //         run_step = 1; run_time = now;
+    //         break;
+    //     case 1:
+    //         if (llabs(Encoder_GetCount() - 5000) < 20 && (now - run_time) > 1000) {
+    //             MotorControl_SetTarget(&motor, -5000);
+    //             run_step = 2; run_time = now;
+    //         }
+    //         break;
+    //     case 2:
+    //         if (llabs(Encoder_GetCount() + 5000) < 20) {
+    //             Motor_Stop();
+    //             run_step = 3;
+    //         }
+    //         break;
+    //     default: break;
+    // }
+
+    /* 示例5：每500ms切换速度方向做正反往复——应放在上面 last_500ms 节拍块内 */
+    // static uint8_t toggle = 0;
+    // MotorControl_SetMode(&motor, SPEED_MODE);
+    // MotorControl_SetSpeed(&motor, toggle ? 1500.0f : -1500.0f);
+    // toggle ^= 1;
+
+    /* 示例6：每3秒在 0 和 10000 之间来回摆动（位置模式）*/
+    // static uint8_t  pos_toggle = 0;
+    // static int64_t  last_move  = 0;
+    // if (now - last_move > 3000) {
+    //     last_move = now;
+    //     MotorControl_SetMode(&motor, POSITION_MODE);
+    //     MotorControl_SetTarget(&motor, pos_toggle ? 0 : 10000);
+    //     pos_toggle ^= 1;
+    // }
+
+    /* 示例7：开机先回零，完成后转到 8000 脉冲处 */
+    // if (!MotorControl_IsHoming()) {
+    //     if (MotorControl_HomingFailed()) {
+    //         // 复位失败处理……
+    //     } else if (run_step == 0) {
+    //         MotorControl_SetMode(&motor, POSITION_MODE);
+    //         MotorControl_SetTarget(&motor, 8000);
+    //     }
+    // }
+
+    /* ============ 系统任务（勿删）============ */
+
     /* 处理PB4/PB5输入引脚 */
     MotorControl_ProcessInputs();
 

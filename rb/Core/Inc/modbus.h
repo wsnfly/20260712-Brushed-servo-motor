@@ -86,6 +86,16 @@
                                              * 周期 = (ARR+1)/64MHz, 默认639 -> 10us
                                              * 范围: 99~65535, 即约1.56us~1.024ms
                                              * 增大ARR可降低中断频率以减轻CPU负担(影响脉冲采样精度) */
+#define REG_SPEED_ACQ_START          0x003A  /* 转速采集启动/状态: 写1启动采集, 读=状态(0=空闲,1=采集中,2=完成) */
+#define REG_SPEED_ACQ_DIV            0x003B  /* 转速采集分频值(1=100us, 50=5ms, 默认50) */
+#define REG_SPEED_ACQ_COUNT          0x003C  /* 采集已采样数量(只读, 0~5120) */
+#define REG_SPEED_ACQ_STATUS         0x003D  /* 转速采集状态(只读, 同0x003A读取值) */
+#define REG_SPEED_ACQ_TYPE           0x003E  /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000) */
+#define REG_SPEED_ACQ_SIZE           0x003F  /* 采集点数(1~5120, 默认5120) */
+
+/* 数据寄存器 (只读) - 采集缓冲区 0x0200~0x15FF (5120个int16_t, 10KB) */
+#define REG_SPEED_DATA_BASE          0x0200  /* 采集数据起始地址 */
+#define REG_SPEED_DATA_END           0x15FF  /* 采集数据结束地址 (0x0200 + SPEED_ACQ_BUF_SIZE - 1) */
 
 /* 状态寄存器 (只读) */
 #define REG_CURRENT_POS_H3           0x0100  /* 当前位置高32位 */
@@ -97,6 +107,14 @@
 #define REG_CURRENT_MODE             0x0106  /* 当前模式 */
 #define REG_STATUS                   0x0107  /* 状态字 */
 #define REG_CURRENT_PWM              0x0108  /* 当前PWM输出(有符号, -1000~+1000, 即±100%) */
+#define REG_PID_ERROR_H              0x0109  /* PID当前误差高16位(×100, 有符号32位) */
+#define REG_PID_ERROR_L              0x010A  /* PID当前误差低16位 */
+#define REG_PID_P_H                  0x010B  /* PID比例项P输出高16位(×100) */
+#define REG_PID_P_L                  0x010C  /* PID比例项P输出低16位 */
+#define REG_PID_I_H                  0x010D  /* PID积分项I输出高16位(×100) */
+#define REG_PID_I_L                  0x010E  /* PID积分项I输出低16位 */
+#define REG_PID_D_H                  0x010F  /* PID微分项D输出高16位(×100) */
+#define REG_PID_D_L                  0x0110  /* PID微分项D输出低16位 */
 
 /* 控制字位定义 */
 #define CTRL_MODE_MASK               0x000F  /* 模式掩码 */
@@ -111,7 +129,7 @@
 
 /* MODBUS接收缓冲区大小 */
 #define MB_RX_BUF_SIZE               128
-#define MB_TX_BUF_SIZE               64
+#define MB_TX_BUF_SIZE               256  /* 支持一次读取最多125个寄存器(255字节) */
 
 /*
  * 帧间超时最小阈值（TIM1 100us中断计数）

@@ -250,7 +250,7 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
     MotorControl_t *mc = ctx->motor;
     
     /* 状态寄存器（只读） */
-    if (addr >= 0x0100 && addr <= 0x0108) {
+    if (addr >= 0x0100 && addr <= 0x0110) {
         switch (addr) {
             case REG_CURRENT_POS_H3:
                 return (uint16_t)(Encoder_GetCount() >> 48);
@@ -273,6 +273,48 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                        (mc->mode & 0x0F);
             case REG_CURRENT_PWM:
                 return (uint16_t)MotorControl_GetPWM();
+            case REG_PID_ERROR_H:
+                return (uint16_t)((int32_t)(mc->pid_error * 100) >> 16);
+            case REG_PID_ERROR_L:
+                return (uint16_t)((int32_t)(mc->pid_error * 100) & 0xFFFF);
+            case REG_PID_P_H:
+                return (uint16_t)((int32_t)(mc->pid_p * 100) >> 16);
+            case REG_PID_P_L:
+                return (uint16_t)((int32_t)(mc->pid_p * 100) & 0xFFFF);
+            case REG_PID_I_H:
+                return (uint16_t)((int32_t)(mc->pid_i * 100) >> 16);
+            case REG_PID_I_L:
+                return (uint16_t)((int32_t)(mc->pid_i * 100) & 0xFFFF);
+            case REG_PID_D_H:
+                return (uint16_t)((int32_t)(mc->pid_d * 100) >> 16);
+            case REG_PID_D_L:
+                return (uint16_t)((int32_t)(mc->pid_d * 100) & 0xFFFF);
+        }
+    }
+
+    /* 转速采集数据寄存器（只读） 0x0200~0x03FF */
+    if (addr >= REG_SPEED_DATA_BASE && addr <= REG_SPEED_DATA_END) {
+        uint16_t idx = addr - REG_SPEED_DATA_BASE;
+        if (idx < mc->speed_acq_count) {
+            return (uint16_t)mc->speed_acq_buffer[idx];
+        }
+        return 0;  /* 未采集到的位置返回0 */
+    }
+
+    /* 转速采集控制/状态寄存器 0x003A~0x003F */
+    if (addr >= REG_SPEED_ACQ_START && addr <= REG_SPEED_ACQ_SIZE) {
+        switch (addr) {
+            case REG_SPEED_ACQ_START:
+            case REG_SPEED_ACQ_STATUS:
+                return mc->speed_acq_done ? 2 : (mc->speed_acq_active ? 1 : 0);
+            case REG_SPEED_ACQ_DIV:
+                return mc->speed_acq_divider;
+            case REG_SPEED_ACQ_COUNT:
+                return mc->speed_acq_count;
+            case REG_SPEED_ACQ_TYPE:
+                return mc->speed_acq_type;
+            case REG_SPEED_ACQ_SIZE:
+                return mc->speed_acq_size;
         }
     }
     
@@ -300,13 +342,13 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
             case REG_POS_KI:
                 return (uint16_t)(int16_t)(mc->pos_Ki * 100);
             case REG_POS_KD:
-                return (uint16_t)(int16_t)(mc->pos_Kd * 100);
+                return (uint16_t)(int16_t)(mc->pos_Kd * 1000);  /* D项×1000, 3位小数 */
             case REG_SPD_KP:
                 return (uint16_t)(int16_t)(mc->spd_Kp * 100);
             case REG_SPD_KI:
                 return (uint16_t)(int16_t)(mc->spd_Ki * 100);
             case REG_SPD_KD:
-                return (uint16_t)(int16_t)(mc->spd_Kd * 100);
+                return (uint16_t)(int16_t)(mc->spd_Kd * 1000);  /* D项×1000, 3位小数 */
             case REG_DEAD_ZONE:
                 return mc->dead_zone;
             case REG_MAX_OUTPUT:
@@ -445,7 +487,11 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
     uint8_t need_apply = 0;  /* 标记是否需要立即应用目标值 */
     
     /* 只读寄存器 */
-    if (addr >= 0x0100 && addr <= 0x0107) {
+    if (addr >= 0x0100 && addr <= 0x0110) {
+        return;
+    }
+    /* 转速数据寄存器只读 0x0200~0x03FF */
+    if (addr >= REG_SPEED_DATA_BASE && addr <= REG_SPEED_DATA_END) {
         return;
     }
     
@@ -501,7 +547,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 MotorControl_SetPosPID(mc,
                     (addr == REG_POS_KP) ? (float)(int16_t)value / 100.0f : mc->pos_Kp,
                     (addr == REG_POS_KI) ? (float)(int16_t)value / 100.0f : mc->pos_Ki,
-                    (addr == REG_POS_KD) ? (float)(int16_t)value / 100.0f : mc->pos_Kd);
+                    (addr == REG_POS_KD) ? (float)(int16_t)value / 1000.0f : mc->pos_Kd);  /* D项×1000 */
                 config_dirty = 1;
                 break;
             case REG_SPD_KP:
@@ -510,7 +556,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 MotorControl_SetSpdPID(mc,
                     (addr == REG_SPD_KP) ? (float)(int16_t)value / 100.0f : mc->spd_Kp,
                     (addr == REG_SPD_KI) ? (float)(int16_t)value / 100.0f : mc->spd_Ki,
-                    (addr == REG_SPD_KD) ? (float)(int16_t)value / 100.0f : mc->spd_Kd);
+                    (addr == REG_SPD_KD) ? (float)(int16_t)value / 1000.0f : mc->spd_Kd);  /* D项×1000 */
                 config_dirty = 1;
                 break;
             case REG_DEAD_ZONE:
@@ -730,6 +776,43 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 break;
         }
     }
+
+    /* 转速采集控制寄存器 0x003A~0x003F */
+    if (addr >= REG_SPEED_ACQ_START && addr <= REG_SPEED_ACQ_SIZE) {
+        switch (addr) {
+            case REG_SPEED_ACQ_START:
+                if (value == 1) {
+                    /* 启动采集：清空缓冲区并激活 */
+                    mc->speed_acq_count = 0;
+                    mc->speed_acq_div_cnt = 0;
+                    mc->speed_acq_active = 1;
+                    mc->speed_acq_done = 0;
+                } else if (value == 0) {
+                    /* 停止采集 */
+                    mc->speed_acq_active = 0;
+                }
+                break;
+            case REG_SPEED_ACQ_DIV:
+                if (value >= 1) {
+                    mc->speed_acq_divider = value;
+                }
+                break;
+            case REG_SPEED_ACQ_TYPE:
+                if (value <= 1) {
+                    mc->speed_acq_type = (uint8_t)value;
+                }
+                break;
+            case REG_SPEED_ACQ_SIZE:
+                if (value >= 1 && value <= SPEED_ACQ_BUF_SIZE) {
+                    mc->speed_acq_size = value;
+                }
+                break;
+            case REG_SPEED_ACQ_COUNT:
+            case REG_SPEED_ACQ_STATUS:
+                /* 只读寄存器，忽略写入 */
+                break;
+        }
+    }
     
     /* 如果需要立即应用目标值 */
     if (need_apply) {
@@ -747,10 +830,11 @@ static void MODBUS_ProcessReadHoldingRegs(MB_Context_t *ctx, uint16_t start_addr
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
-    /* 检查地址范围：控制寄存器 0x0000~0x0039, 状态寄存器 0x0100~0x0108 */
+    /* 检查地址范围：控制寄存器 0x0000~0x003F, 状态寄存器 0x0100~0x0110, 数据寄存器 0x0200~0x15FF */
     uint16_t end_addr = start_addr + quantity - 1;
-    if (!((start_addr <= 0x0039 && end_addr <= 0x0039) ||
-          (start_addr >= 0x0100 && end_addr <= 0x0108))) {
+    if (!((start_addr <= 0x003F && end_addr <= 0x003F) ||
+          (start_addr >= 0x0100 && end_addr <= 0x0110) ||
+          (start_addr >= REG_SPEED_DATA_BASE && end_addr <= REG_SPEED_DATA_END))) {
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
@@ -779,8 +863,8 @@ static void MODBUS_ProcessWriteSingleReg(MB_Context_t *ctx, uint16_t addr, uint1
 {
     uint8_t old_slave_addr = ctx->slave_addr;
 
-    /* 检查地址范围 */
-    if (addr > 0x0039) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x003F 可写, 数据寄存器只读) */
+    if (addr > 0x003F) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_SINGLE_REG, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
@@ -808,8 +892,8 @@ static void MODBUS_ProcessWriteMultipleRegs(MB_Context_t *ctx, uint16_t start_ad
     MotorControl_t *mc = ctx->motor;
     uint8_t old_slave_addr = ctx->slave_addr;
     pending_baud_rate = 0;
-    /* 检查地址范围 */
-    if (quantity > 125 || start_addr + quantity > 0x003A) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x003F 可写) */
+    if (quantity > 125 || start_addr + quantity > 0x0040) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_MULTIPLE_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }

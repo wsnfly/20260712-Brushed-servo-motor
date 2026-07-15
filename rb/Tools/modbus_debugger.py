@@ -12,7 +12,12 @@ import serial.tools.list_ports
 import struct
 import threading
 import time
- 
+
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
 class CRC16:
     """MODBUS CRC16计算"""
     @staticmethod
@@ -259,6 +264,16 @@ class ModbusDebuggerApp:
     REG_TIM2_ARR = 0x0039               # TIM2自动重装载值(ARR), 决定脉冲采样中断周期
                                         # 周期=(ARR+1)/64MHz, 默认639->10us
                                         # 范围99~65535, 即约1.56us~1.024ms
+    REG_SPEED_ACQ_START = 0x003A        # 转速采集启动/状态: 写1启动, 读=状态(0=空闲,1=采集中,2=完成)
+    REG_SPEED_ACQ_DIV = 0x003B          # 转速采集分频值(1=100us, 50=5ms, 默认50)
+    REG_SPEED_ACQ_COUNT = 0x003C        # 转速采集已采样数量(只读, 0~512)
+    REG_SPEED_ACQ_STATUS = 0x003D       # 转速采集状态(只读)
+    REG_SPEED_ACQ_TYPE = 0x003E         # 采集类型: 0=转速, 1=PWM
+    REG_SPEED_ACQ_SIZE = 0x003F         # 采集点数(1~5120)
+
+    REG_SPEED_DATA_BASE = 0x0200        # 采集数据起始地址
+    REG_SPEED_DATA_END = 0x15FF         # 采集数据结束地址 (5120个寄存器, 10KB)
+    SPEED_ACQ_BUF_SIZE = 5120           # 采集缓冲区大小
     
     REG_CURRENT_POS_H3 = 0x0100
     REG_CURRENT_POS_H2 = 0x0101
@@ -269,6 +284,14 @@ class ModbusDebuggerApp:
     REG_CURRENT_MODE = 0x0106
     REG_STATUS = 0x0107
     REG_CURRENT_PWM = 0x0108
+    REG_PID_ERROR_H = 0x0109
+    REG_PID_ERROR_L = 0x010A
+    REG_PID_P_H = 0x010B
+    REG_PID_P_L = 0x010C
+    REG_PID_I_H = 0x010D
+    REG_PID_I_L = 0x010E
+    REG_PID_D_H = 0x010F
+    REG_PID_D_L = 0x0110
     
     # 模式定义
     MODE_POSITION = 0
@@ -281,13 +304,14 @@ class ModbusDebuggerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("MODBUS RTU 电机控制器调试工具")
-        self.root.geometry("1100x700")
+        self.root.geometry("1280x800")
         
         self.serial = None
         self.modbus = None
         self.monitoring = False
         self.monitor_thread = None
         self.serial_lock = threading.Lock()  # 串口互斥锁
+        self.acq_reading = False  # 采集数据读取标志（读取时暂停监控）
         self.device_baud_var = tk.StringVar(value="115200")
         self.baud_window = None
         self._raw_entries = 0
@@ -555,16 +579,53 @@ class ModbusDebuggerApp:
         ttk.Button(btn_frame, text="读取引脚配置", command=self.read_pin_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="写入引脚配置", command=self.write_pin_config).pack(side=tk.LEFT, padx=5)
 
-        # 右侧状态显示和日志
+        # 右侧：Canvas+滚动条 包裹 PanedWindow（可整体滚动 + 可调整各窗口大小）
         right_frame = ttk.Frame(paned)
-        paned.add(right_frame, weight=1)
-        
-        # 实时状态
-        status_frame = ttk.LabelFrame(right_frame, text="实时状态", padding=10)
-        status_frame.pack(fill=tk.X, pady=5)
-        
+        paned.add(right_frame, weight=2)
+
+        right_canvas = tk.Canvas(right_frame, highlightthickness=0)
+        right_scrollbar = ttk.Scrollbar(right_frame, orient=tk.VERTICAL, command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scrollbar.set)
+        right_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right_inner = ttk.Frame(right_canvas)
+        right_canvas_window = right_canvas.create_window((0, 0), window=right_inner, anchor=tk.NW)
+
+        def _on_right_configure(event):
+            right_canvas.configure(scrollregion=right_canvas.bbox("all"))
+
+        def _on_right_canvas_configure(event):
+            # 宽度跟随Canvas，高度根据内容自适应（最小不低于Canvas高度）
+            content_h = right_inner.winfo_reqheight()
+            min_h = event.height
+            right_canvas.itemconfig(right_canvas_window, width=event.width, height=max(content_h, min_h))
+
+        right_inner.bind('<Configure>', _on_right_configure)
+        right_canvas.bind('<Configure>', _on_right_canvas_configure)
+
+        def _on_right_mousewheel(event):
+            right_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        # 鼠标在右侧区域时启用滚轮
+        def _bind_wheel(event):
+            right_canvas.bind_all('<MouseWheel>', _on_right_mousewheel)
+
+        def _unbind_wheel(event):
+            right_canvas.unbind_all('<MouseWheel>')
+
+        right_canvas.bind('<Enter>', _bind_wheel)
+        right_canvas.bind('<Leave>', _unbind_wheel)
+
+        right_vpaned = ttk.PanedWindow(right_inner, orient=tk.VERTICAL)
+        right_vpaned.pack(fill=tk.BOTH, expand=True)
+
+        # === 实时状态（可调高度） ===
+        status_frame = ttk.LabelFrame(right_vpaned, text="实时状态", padding=10)
+        right_vpaned.add(status_frame, weight=1)
+
         self.status_labels = {}
-        
+
         ttk.Label(status_frame, text="当前位置:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
         self.status_labels['position'] = ttk.Label(status_frame, text="0", foreground="blue", font=("Arial", 12, "bold"))
         self.status_labels['position'].grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
@@ -601,41 +662,111 @@ class ModbusDebuggerApp:
         self.status_labels['homing'] = ttk.Label(status_frame, text="空闲", foreground="gray", font=("Arial", 12, "bold"))
         self.status_labels['homing'].grid(row=8, column=1, padx=5, pady=2, sticky=tk.W)
 
+        ttk.Label(status_frame, text="PID误差:").grid(row=9, column=0, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_error'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['pid_error'].grid(row=9, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="PID-P:").grid(row=10, column=0, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_p'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['pid_p'].grid(row=10, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="PID-I:").grid(row=11, column=0, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_i'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['pid_i'].grid(row=11, column=1, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="PID-D:").grid(row=12, column=0, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_d'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['pid_d'].grid(row=12, column=1, padx=5, pady=2, sticky=tk.W)
+
         self.monitor_btn = ttk.Button(status_frame, text="开始监控", command=self.toggle_monitor)
-        self.monitor_btn.grid(row=9, column=0, columnspan=2, pady=5)
-        
-        # 底部容器：日志(左) + 原始数据包(右) - 使用PanedWindow可拖动分隔
-        bottom_paned = ttk.PanedWindow(right_frame, orient=tk.HORIZONTAL)
-        bottom_paned.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.monitor_btn.grid(row=13, column=0, columnspan=2, pady=5)
+
+        # === 采集曲线图（可调高度） ===
+        chart_frame = ttk.LabelFrame(right_vpaned, text="采集曲线", padding=5)
+        right_vpaned.add(chart_frame, weight=3)
+
+        # 采集控制工具栏
+        ctrl_bar = ttk.Frame(chart_frame)
+        ctrl_bar.pack(fill=tk.X, pady=(0, 5))
+
+        ttk.Label(ctrl_bar, text="采集类型:").pack(side=tk.LEFT, padx=(0, 2))
+        self.acq_type_var = tk.StringVar(value="转速")
+        acq_type_combo = ttk.Combobox(ctrl_bar, textvariable=self.acq_type_var, width=8,
+                                      values=["转速", "PWM"], state="readonly")
+        acq_type_combo.pack(side=tk.LEFT, padx=2)
+        acq_type_combo.bind("<<ComboboxSelected>>", self.on_acq_type_changed)
+
+        ttk.Label(ctrl_bar, text="分频:").pack(side=tk.LEFT, padx=(10, 2))
+        self.acq_div_var = tk.StringVar(value="50")
+        ttk.Entry(ctrl_bar, textvariable=self.acq_div_var, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(ctrl_bar, text="(1=100us)").pack(side=tk.LEFT, padx=(0, 5))
+
+        ttk.Label(ctrl_bar, text="采集点数:").pack(side=tk.LEFT, padx=(10, 2))
+        self.acq_size_var = tk.StringVar(value="5120")
+        ttk.Entry(ctrl_bar, textvariable=self.acq_size_var, width=7).pack(side=tk.LEFT, padx=2)
+        ttk.Label(ctrl_bar, text="(1~5120)").pack(side=tk.LEFT, padx=(0, 5))
+
+        ttk.Button(ctrl_bar, text="设置参数", command=self.set_speed_acq_params).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctrl_bar, text="启动采集", command=self.start_speed_acq).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctrl_bar, text="读取并绘图", command=self.read_and_plot_speed).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctrl_bar, text="清空曲线", command=self.clear_speed_plot).pack(side=tk.LEFT, padx=2)
+
+        self.acq_status_label = ttk.Label(ctrl_bar, text="状态: 空闲", foreground="gray")
+        self.acq_status_label.pack(side=tk.LEFT, padx=10)
+
+        # matplotlib 图表 + 工具栏（支持缩放/平移）
+        self.speed_fig = Figure(figsize=(6, 3), dpi=100)
+        self.speed_ax = self.speed_fig.add_subplot(111)
+        self.speed_ax.set_xlabel("采样点")
+        self.speed_ax.set_ylabel("转速 (脉冲/秒)")
+        self.speed_ax.set_title("采集曲线")
+        self.speed_ax.grid(True)
+        self.speed_fig.tight_layout()
+
+        self.speed_canvas = FigureCanvasTkAgg(self.speed_fig, chart_frame)
+        self.speed_canvas.draw()
+        self.speed_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        # matplotlib 工具栏（缩放/平移/保存等）
+        self.speed_toolbar = NavigationToolbar2Tk(self.speed_canvas, chart_frame)
+        self.speed_toolbar.update()
+        self.speed_toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # === 底部：日志(左) + 原始数据包(右) - 水平PanedWindow可拖动分隔 ===
+        bottom_hpaned = ttk.PanedWindow(right_vpaned, orient=tk.HORIZONTAL)
+        right_vpaned.add(bottom_hpaned, weight=2)
 
         # 日志区域（左）
-        log_frame = ttk.LabelFrame(bottom_paned, text="通信日志", padding=10)
-        bottom_paned.add(log_frame, weight=1)
+        log_frame = ttk.LabelFrame(bottom_hpaned, text="通信日志", padding=5)
+        bottom_hpaned.add(log_frame, weight=1)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=15, font=("Consolas", 9))
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, font=("Consolas", 9))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Button(log_frame, text="清除日志", command=self.clear_log).pack(pady=5)
+        ttk.Button(log_frame, text="清除日志", command=self.clear_log).pack(pady=2)
 
         # 原始数据包窗口（右）
-        raw_frame = ttk.LabelFrame(bottom_paned, text="原始数据包", padding=10)
-        bottom_paned.add(raw_frame, weight=1)
+        raw_frame = ttk.LabelFrame(bottom_hpaned, text="原始数据包", padding=5)
+        bottom_hpaned.add(raw_frame, weight=1)
 
-        self.raw_text = scrolledtext.ScrolledText(raw_frame, height=15, font=("Consolas", 9), state=tk.DISABLED)
+        self.raw_text = scrolledtext.ScrolledText(raw_frame, height=8, font=("Consolas", 9), state=tk.DISABLED)
         self.raw_text.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Button(raw_frame, text="清除数据", command=self.clear_raw).pack(pady=5)
+        ttk.Button(raw_frame, text="清除数据", command=self.clear_raw).pack(pady=2)
 
-        # 设置初始分隔线位置（左右各50%）。窗口刚创建时宽度可能尚未完成计算，
-        # 因此等到拿到有效宽度后再设置，避免左侧控制区初始被压到不可见。
+        # 设置初始分隔线位置
         def _set_initial_sashes(retry=0):
             main_width = paned.winfo_width()
-            bottom_width = bottom_paned.winfo_width()
-            if main_width > 100 and bottom_width > 100:
-                paned.sashpos(0, main_width // 2)
-                bottom_paned.sashpos(0, bottom_width // 2)
+            right_height = right_vpaned.winfo_height()
+            bottom_width = bottom_hpaned.winfo_width()
+            if main_width > 100 and right_height > 200 and bottom_width > 100:
+                paned.sashpos(0, main_width // 3)  # 左侧占1/3
+                bottom_hpaned.sashpos(0, bottom_width // 2)
+                # 垂直分隔：状态区占约25%，曲线区占约50%，日志区占约25%
+                right_vpaned.sashpos(0, int(right_height * 0.25))
+                right_vpaned.sashpos(1, int(right_height * 0.75))
                 return
-            if retry < 10:
+            if retry < 15:
                 self.root.after(50, lambda: _set_initial_sashes(retry + 1))
 
         self.root.after(50, _set_initial_sashes)
@@ -973,27 +1104,27 @@ class ModbusDebuggerApp:
             messagebox.showwarning("警告", "请先连接串口")
             return
         
-        def clamp_pid(value):
-            """将PID参数限幅到16位有符号范围 (-32768~32767)，精度0.01"""
-            v = int(float(value) * 100)
+        def clamp_pid(value, scale=100):
+            """将PID参数限幅到16位有符号范围 (-32768~32767)"""
+            v = int(float(value) * scale)
             if v > 32767:
                 v = 32767
             elif v < -32768:
                 v = -32768
             return v
-        
+
         def do_apply_pid():
             try:
                 if self.serial_lock.acquire(timeout=1.0):
                     try:
                         pos_kp = clamp_pid(self.pos_kp_var.get())
                         pos_ki = clamp_pid(self.pos_ki_var.get())
-                        pos_kd = clamp_pid(self.pos_kd_var.get())
+                        pos_kd = clamp_pid(self.pos_kd_var.get(), 1000)  # D项×1000, 3位小数
                         self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_POS_KP, [pos_kp, pos_ki, pos_kd])
-                        
+
                         spd_kp = clamp_pid(self.spd_kp_var.get())
                         spd_ki = clamp_pid(self.spd_ki_var.get())
-                        spd_kd = clamp_pid(self.spd_kd_var.get())
+                        spd_kd = clamp_pid(self.spd_kd_var.get(), 1000)  # D项×1000, 3位小数
                         self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_SPD_KP, [spd_kp, spd_ki, spd_kd])
                         
                         self.root.after(0, lambda: self.log("应用PID参数成功"))
@@ -1021,29 +1152,29 @@ class ModbusDebuggerApp:
                         # 读取速度环PID (0x000B-0x000D)
                         spd_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_SPD_KP, 3)
                         
-                        # 16位有符号转float (精度0.01)
-                        def to_float(v):
+                        # 16位有符号转float (Kp/Ki精度0.01, Kd精度0.001)
+                        def to_float(v, scale=100.0):
                             if v >= 0x8000:
                                 v -= 0x10000
-                            return v / 100.0
-                        
+                            return v / scale
+
                         pos_kp = to_float(pos_data[0])
                         pos_ki = to_float(pos_data[1])
-                        pos_kd = to_float(pos_data[2])
+                        pos_kd = to_float(pos_data[2], 1000.0)  # D项×1000
                         spd_kp = to_float(spd_data[0])
                         spd_ki = to_float(spd_data[1])
-                        spd_kd = to_float(spd_data[2])
-                        
+                        spd_kd = to_float(spd_data[2], 1000.0)  # D项×1000
+
                         # 更新界面
                         self.root.after(0, lambda: self.pos_kp_var.set(f"{pos_kp:.2f}"))
                         self.root.after(0, lambda: self.pos_ki_var.set(f"{pos_ki:.2f}"))
-                        self.root.after(0, lambda: self.pos_kd_var.set(f"{pos_kd:.2f}"))
+                        self.root.after(0, lambda: self.pos_kd_var.set(f"{pos_kd:.3f}"))
                         self.root.after(0, lambda: self.spd_kp_var.set(f"{spd_kp:.2f}"))
                         self.root.after(0, lambda: self.spd_ki_var.set(f"{spd_ki:.2f}"))
-                        self.root.after(0, lambda: self.spd_kd_var.set(f"{spd_kd:.2f}"))
+                        self.root.after(0, lambda: self.spd_kd_var.set(f"{spd_kd:.3f}"))
                         self.root.after(0, lambda: self.log(
-                            f"读取PID: 位置环 Kp={pos_kp:.2f} Ki={pos_ki:.2f} Kd={pos_kd:.2f} | "
-                            f"速度环 Kp={spd_kp:.2f} Ki={spd_ki:.2f} Kd={spd_kd:.2f}"))
+                            f"读取PID: 位置环 Kp={pos_kp:.2f} Ki={pos_ki:.2f} Kd={pos_kd:.3f} | "
+                            f"速度环 Kp={spd_kp:.2f} Ki={spd_ki:.2f} Kd={spd_kd:.3f}"))
                     finally:
                         self.serial_lock.release()
                 else:
@@ -1461,17 +1592,22 @@ class ModbusDebuggerApp:
         dir_read_counter = 0  # 方向寄存器读取计数器，降低读取频率
         while self.monitoring:
             try:
+                # 采集数据读取中时暂停监控，避免串口冲突
+                if self.acq_reading:
+                    time.sleep(0.1)
+                    continue
+
                 # 非阻塞获取锁，获取不到就跳过本次监控
                 if not self.serial_lock.acquire(timeout=0.05):
                     time.sleep(0.05)
                     continue
                 
                 try:
-                    # 读取状态寄存器（当前位置、速度、模式、状态、PWM输出）
+                    # 读取状态寄存器（当前位置、速度、模式、状态、PWM输出、PID实时值）
                     data = self.modbus.read_holding_registers(
                         self.get_slave_addr(),
                         self.REG_CURRENT_POS_H3,
-                        9
+                        17
                     )
                     # 读取目标位置寄存器（64位）
                     target_data = self.modbus.read_holding_registers(
@@ -1550,6 +1686,23 @@ class ModbusDebuggerApp:
                         foreground="red" if p > 0.1 else ("blue" if p < -0.1 else "gray")
                     )
                 self.root.after(0, lambda p=pwm_percent: update_pwm(p))
+
+                # 解析PID实时值（32位有符号, ×100）
+                def parse_pid_32(h, l):
+                    val = (h << 16) | l
+                    if val >= 0x80000000:
+                        val -= 0x100000000
+                    return val / 100.0
+
+                pid_error = parse_pid_32(data[9], data[10])
+                pid_p = parse_pid_32(data[11], data[12])
+                pid_i = parse_pid_32(data[13], data[14])
+                pid_d = parse_pid_32(data[15], data[16])
+
+                self.root.after(0, lambda e=pid_error: self.status_labels['pid_error'].config(text=f"{e:+.2f}"))
+                self.root.after(0, lambda p=pid_p: self.status_labels['pid_p'].config(text=f"{p:+.2f}"))
+                self.root.after(0, lambda i=pid_i: self.status_labels['pid_i'].config(text=f"{i:+.2f}"))
+                self.root.after(0, lambda d=pid_d: self.status_labels['pid_d'].config(text=f"{d:+.2f}"))
                 
                 # 方向寄存器读取成功才更新
                 if dir_data is not None:
@@ -1614,6 +1767,177 @@ class ModbusDebuggerApp:
         self.raw_text.delete(1.0, tk.END)
         self.raw_text.config(state=tk.DISABLED)
         self._raw_entries = 0
+
+    # ========== 转速采集功能 ==========
+
+    def on_acq_type_changed(self, event=None):
+        """采集类型切换回调"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            # 恢复原值
+            self.acq_type_var.set("转速" if self._current_acq_type() == 0 else "PWM")
+            return
+        acq_type = 1 if self.acq_type_var.get() == "PWM" else 0
+        # 更新Y轴标签(即时响应)
+        y_label = "PWM输出" if acq_type == 1 else "转速 (脉冲/秒)"
+        self.speed_ax.set_ylabel(y_label)
+        self.speed_canvas.draw()
+        # 写寄存器放到线程中，避免阻塞UI
+        def _worker():
+            try:
+                with self.serial_lock:
+                    self.modbus.write_single_register(self.get_slave_addr(), self.REG_SPEED_ACQ_TYPE, acq_type)
+                label = "PWM输出" if acq_type == 1 else "转速"
+                self.root.after(0, lambda: self.log(f"设置采集类型: {label}"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"设置采集类型失败: {e}"))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _current_acq_type(self):
+        """当前采集类型 0=转速 1=PWM"""
+        return 1 if self.acq_type_var.get() == "PWM" else 0
+
+    def set_speed_acq_params(self):
+        """设置采集分频值和采集点数"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        try:
+            div = int(self.acq_div_var.get())
+            if div < 1:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("警告", "分频值必须为正整数")
+            return
+        try:
+            size = int(self.acq_size_var.get())
+            if size < 1 or size > self.SPEED_ACQ_BUF_SIZE:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("警告", f"采集点数必须为1~{self.SPEED_ACQ_BUF_SIZE}的整数")
+            return
+        # 写寄存器放到线程中，避免阻塞UI
+        self.acq_status_label.config(text="状态: 设置中...", foreground="blue")
+        def _worker():
+            try:
+                with self.serial_lock:
+                    self.modbus.write_single_register(self.get_slave_addr(), self.REG_SPEED_ACQ_DIV, div)
+                    self.modbus.write_single_register(self.get_slave_addr(), self.REG_SPEED_ACQ_SIZE, size)
+                self.root.after(0, lambda: self.acq_status_label.config(text="状态: 已设置", foreground="gray"))
+                self.root.after(0, lambda: self.log(f"设置采集参数: 分频={div}(周期={div*0.1}ms), 点数={size}"))
+            except Exception as e:
+                self.root.after(0, lambda: self.acq_status_label.config(text="状态: 设置失败", foreground="red"))
+                self.root.after(0, lambda: messagebox.showerror("错误", f"设置参数失败: {e}"))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_speed_acq(self):
+        """启动转速采集"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        # 写寄存器放到线程中，避免阻塞UI
+        def _worker():
+            try:
+                with self.serial_lock:
+                    self.modbus.write_single_register(self.get_slave_addr(), self.REG_SPEED_ACQ_START, 1)
+                self.root.after(0, lambda: self.acq_status_label.config(text="状态: 采集中", foreground="orange"))
+                self.root.after(0, lambda: self.log("启动转速采集"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"启动采集失败: {e}"))
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def read_and_plot_speed(self):
+        """读取转速数据并绘图（在线程中执行避免阻塞UI）"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        if self.acq_reading:
+            messagebox.showwarning("提示", "正在读取采集数据，请等待完成")
+            return
+        self.acq_status_label.config(text="状态: 读取中...", foreground="blue")
+        threading.Thread(target=self._read_and_plot_worker, daemon=True).start()
+
+    def _read_and_plot_worker(self):
+        """读取转速数据的工作线程"""
+        self.acq_reading = True  # 暂停监控线程
+        try:
+            with self.serial_lock:
+                # 读取采集状态和已采样数量
+                status_data = self.modbus.read_holding_registers(
+                    self.get_slave_addr(), self.REG_SPEED_ACQ_START, 4)
+                status = status_data[0]  # 0=空闲, 1=采集中, 2=完成
+                count = status_data[2]   # 已采样数量
+
+            if count == 0:
+                self.root.after(0, lambda: self.acq_status_label.config(
+                    text="状态: 无数据", foreground="gray"))
+                self.root.after(0, lambda: messagebox.showinfo("提示", "没有采集到数据"))
+                return
+
+            # 分批读取数据寄存器（每次最多125个），整体持锁避免监控线程干扰
+            speed_data = []
+            remaining = count
+            offset = 0
+            with self.serial_lock:  # 一次性持锁读完所有数据
+                while remaining > 0:
+                    chunk = min(remaining, 125)
+                    data = self.modbus.read_holding_registers(
+                        self.get_slave_addr(),
+                        self.REG_SPEED_DATA_BASE + offset,
+                        chunk)
+                    for v in data:
+                        # int16_t 有符号转换
+                        if v >= 0x8000:
+                            v -= 0x10000
+                        speed_data.append(float(v))  # 脉冲/秒
+                    offset += chunk
+                    remaining -= chunk
+
+            # 更新状态显示
+            status_text = {0: "空闲", 1: "采集中", 2: "完成"}.get(status, "未知")
+            status_color = {0: "gray", 1: "orange", 2: "green"}.get(status, "gray")
+            self.root.after(0, lambda: self.acq_status_label.config(
+                text=f"状态: {status_text} ({count}点)", foreground=status_color))
+
+            # 绘图
+            self.root.after(0, lambda: self._plot_speed_data(speed_data))
+            self.root.after(0, lambda: self.log(f"读取{len(speed_data)}个转速数据并绘图"))
+
+        except Exception as e:
+            self.root.after(0, lambda: self.acq_status_label.config(
+                text="状态: 读取失败", foreground="red"))
+            self.root.after(0, lambda: messagebox.showerror("错误", f"读取数据失败: {e}"))
+        finally:
+            self.acq_reading = False  # 恢复监控线程
+
+    def _plot_speed_data(self, speed_data):
+        """绘制采集曲线"""
+        is_pwm = self._current_acq_type() == 1
+        y_label = "PWM输出" if is_pwm else "转速 (脉冲/秒)"
+        title = "PWM采集曲线" if is_pwm else "转速采集曲线"
+        self.speed_ax.clear()
+        self.speed_ax.plot(range(len(speed_data)), speed_data, 'b-', linewidth=0.8)
+        self.speed_ax.set_xlabel("采样点")
+        self.speed_ax.set_ylabel(y_label)
+        self.speed_ax.set_title(f"{title} ({len(speed_data)}点)")
+        self.speed_ax.grid(True)
+        self.speed_fig.tight_layout()
+        self.speed_canvas.draw()
+
+    def clear_speed_plot(self):
+        """清空采集曲线"""
+        is_pwm = self._current_acq_type() == 1
+        y_label = "PWM输出" if is_pwm else "转速 (脉冲/秒)"
+        title = "PWM采集曲线" if is_pwm else "转速采集曲线"
+        self.speed_ax.clear()
+        self.speed_ax.set_xlabel("采样点")
+        self.speed_ax.set_ylabel(y_label)
+        self.speed_ax.set_title(title)
+        self.speed_ax.grid(True)
+        self.speed_fig.tight_layout()
+        self.speed_canvas.draw()
+        self.acq_status_label.config(text="状态: 空闲", foreground="gray")
+        self.log("清空采集曲线")
 
 if __name__ == "__main__":
     root = tk.Tk()

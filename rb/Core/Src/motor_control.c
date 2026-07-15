@@ -438,6 +438,14 @@ void MotorControl_Init(MotorControl_t *mc,
     for (int i = 0; i < SPEED_FILTER_SIZE; i++) {
         mc->speed_buf[i] = 0.0f;
     }
+    /* 转速采集初始化 */
+    mc->speed_acq_count = 0;
+    mc->speed_acq_divider = 50;  /* 默认5ms (50×100us) */
+    mc->speed_acq_div_cnt = 0;
+    mc->speed_acq_active = 0;
+    mc->speed_acq_done = 0;
+    mc->speed_acq_type = 0;      /* 默认采集转速 */
+    mc->speed_acq_size = SPEED_ACQ_BUF_SIZE;  /* 默认采满缓冲区 */
 }
 
 static void MotorControl_ClearMotionState(MotorControl_t *mc)
@@ -1270,6 +1278,35 @@ void MotorControl_PulseTick10us(void)
 void MotorControl_TimerTick100us(void)
 {
     static uint16_t pid_divider = 0;
+
+    /* 转速采集：按分频值采样到1KB缓冲区 */
+    if (motor_ctl && motor_ctl->speed_acq_active && !motor_ctl->speed_acq_done) {
+        if (motor_ctl->speed_acq_div_cnt == 0) {
+            if (motor_ctl->speed_acq_count < SPEED_ACQ_BUF_SIZE) {
+                int16_t sample;
+                if (motor_ctl->speed_acq_type == 1) {
+                    /* 采集PWM输出 (-1000~+1000) */
+                    sample = current_pwm_output;
+                } else {
+                    /* 采集转速 (脉冲/秒, int16_t范围±32767) */
+                    float spd = Encoder_GetSpeed();
+                    if (spd > 32767.0f) spd = 32767.0f;
+                    if (spd < -32767.0f) spd = -32767.0f;
+                    sample = (int16_t)spd;
+                }
+                motor_ctl->speed_acq_buffer[motor_ctl->speed_acq_count] = sample;
+                motor_ctl->speed_acq_count++;
+                if (motor_ctl->speed_acq_count >= motor_ctl->speed_acq_size) {
+                    motor_ctl->speed_acq_done = 1;
+                    motor_ctl->speed_acq_active = 0;
+                }
+            }
+        }
+        motor_ctl->speed_acq_div_cnt++;
+        if (motor_ctl->speed_acq_div_cnt >= motor_ctl->speed_acq_divider) {
+            motor_ctl->speed_acq_div_cnt = 0;
+        }
+    }
 
     pid_divider++;
     if (pid_divider >= 50) {

@@ -67,6 +67,7 @@ typedef enum {
 } PinPolarity_t;
 
 #define SPEED_FILTER_SIZE 16  /* 移动平均滤波窗口大小 */
+#define SPEED_ACQ_BUF_SIZE 5120  /* 采集缓冲区大小(16位寄存器数), 10KB */
 
 typedef struct {
     float pos_Kp;
@@ -124,6 +125,15 @@ typedef struct {
     float pid_i;
     float pid_d;
     float pid_error;
+    /* 采集缓冲区 (10KB = 5120 个 int16_t, 存储脉冲/秒) */
+    int16_t speed_acq_buffer[SPEED_ACQ_BUF_SIZE];
+    uint16_t speed_acq_count;      /* 已采集数量 (0~SPEED_ACQ_BUF_SIZE) */
+    uint16_t speed_acq_divider;    /* 分频值 (1=100us, 50=5ms, 默认50) */
+    uint16_t speed_acq_div_cnt;    /* 分频计数器 (内部使用) */
+    uint8_t  speed_acq_active;     /* 采集激活标志 */
+    uint8_t  speed_acq_done;       /* 采集完成标志 (采满speed_acq_size个样本) */
+    uint8_t  speed_acq_type;       /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000) */
+    uint16_t speed_acq_size;       /* 采集点数 (1~SPEED_ACQ_BUF_SIZE, 默认SPEED_ACQ_BUF_SIZE) */
 } MotorControl_t;
 
 void MotorControl_Init(MotorControl_t *mc,
