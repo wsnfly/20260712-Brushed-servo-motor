@@ -238,7 +238,7 @@ class ModbusDebuggerApp:
     REG_HOME_BACK_DISTANCE_L = 0x001F
     REG_HOME_TRIGGER = 0x0020      # 执行一次复位 (写1触发)
     REG_HOME_AUTO_START = 0x0021   # 开机自动复位 (0=关闭, 1=开启)
-    REG_INPUT1_FUNC = 0x0022       # PB4功能 (0=脉冲,1=方向,2=复位,3=限位,4=目标位置电平)
+    REG_INPUT1_FUNC = 0x0022       # PB4功能 (0=脉冲,1=方向,2=原点位置开关,3=限位,4=外部目标位置电平,5=外部目标速度电平,6=执行复位操作,7=无功能)
     REG_INPUT1_POLARITY = 0x0023   # PB4极性 (0=高有效,1=低有效)
     REG_INPUT1_LIMIT_DIR = 0x0024  # PB4限位方向 (0=正方向,1=负方向)
     REG_INPUT2_FUNC = 0x0025       # PB5功能
@@ -261,14 +261,11 @@ class ModbusDebuggerApp:
     REG_INPUT1_TARGET_SPEED_L = 0x0036  # PB4外部目标速度低16位
     REG_INPUT2_TARGET_SPEED_H = 0x0037  # PB5外部目标速度高16位
     REG_INPUT2_TARGET_SPEED_L = 0x0038  # PB5外部目标速度低16位
-    REG_TIM2_ARR = 0x0039               # TIM2自动重装载值(ARR), 决定脉冲采样中断周期
-                                        # 周期=(ARR+1)/64MHz, 默认639->10us
-                                        # 范围99~65535, 即约1.56us~1.024ms
     REG_SPEED_ACQ_START = 0x003A        # 转速采集启动/状态: 写1启动, 读=状态(0=空闲,1=采集中,2=完成)
     REG_SPEED_ACQ_DIV = 0x003B          # 转速采集分频值(1=100us, 50=5ms, 默认50)
     REG_SPEED_ACQ_COUNT = 0x003C        # 转速采集已采样数量(只读, 0~512)
     REG_SPEED_ACQ_STATUS = 0x003D       # 转速采集状态(只读)
-    REG_SPEED_ACQ_TYPE = 0x003E         # 采集类型: 0=转速, 1=PWM, 2=位置(相对起始偏移, ±32767脉冲)
+    REG_SPEED_ACQ_TYPE = 0x003E         # 采集类型: 0=转速, 1=PWM, 2=位置(相对起始偏移, ±32767脉冲), 3=电流(相对值, ±1000=±8.25A)
     REG_SPEED_ACQ_SIZE = 0x003F         # 采集点数(1~5120)
 
     REG_STALL_PROT_EN = 0x0040          # 堵转保护使能: 0=关闭, 1=开启
@@ -276,6 +273,48 @@ class ModbusDebuggerApp:
     REG_STALL_TIME = 0x0042             # 堵转持续时长(单位=PID周期5ms)
     REG_STALL_STATUS = 0x0043           # 堵转状态(只读): 0=正常, 1=已触发
     REG_STALL_RESET = 0x0044            # 堵转复位(写1清除)
+
+    # 电流环寄存器 0x0045~0x004D (新增)
+    # 硬件参考: INA240A1PWR(增益20V/V) + 10mΩ采样电阻
+    #   总跨阻 0.2V/A, 3.3V ADC, 零电流=1.65V(ADC=2048)
+    #   满量程 ±8.25A 对应相对电流 ±1000
+    #   1A实际 ≈ 121相对单位
+    REG_CUR_LOOP_EN = 0x0045            # 电流环使能: 0=关闭(原2环行为), 1=开启(3环级联)
+    REG_CUR_KP = 0x0046                 # 电流环Kp(×100, 有符号)
+    REG_CUR_KI = 0x0047                 # 电流环Ki(×100, 有符号)
+    REG_CUR_KD = 0x0048                 # 电流环Kd(×1000, 有符号)
+    REG_CUR_OFFSET = 0x0049             # 零电流ADC原始值(0~4095, 默认2048)
+    REG_CUR_SCALE = 0x004A              # ADC到相对电流转换系数(×10000, 默认4883≈0.4883)
+    REG_OVER_CUR_LIMIT = 0x004B         # 过流保护阈值(相对值×10, 0=关闭; 1210=1A, 6060=5A)
+    REG_OVER_CUR_STATUS = 0x004C        # 过流状态(只读): 0=正常, 1=已触发
+    REG_OVER_CUR_RESET = 0x004D         # 过流复位(写1清除)
+
+    # PC2/PC3 ADC功能寄存器 (0x004E~0x005D, 新增最小值)
+    REG_PC2_FUNC = 0x004E               # PC2功能 (0=无,1=ADC转速,2=ADC位置转速,3=ADC开环,4=ADC位置)
+    REG_PC3_FUNC = 0x004F               # PC3功能 (同上, PC2!=无时PC3被忽略)
+    REG_ADC_MAX_SPEED_H = 0x0050        # ADC最大速度高16位(脉冲/秒)
+    REG_ADC_MAX_SPEED_L = 0x0051        # ADC最大速度低16位
+    REG_ADC_MAX_PWM = 0x0052            # ADC最大PWM(-1000~1000, 有符号)
+    REG_ADC_MAX_POS_H3 = 0x0053         # ADC最大位置bit[63:48]
+    REG_ADC_MAX_POS_H2 = 0x0054         # ADC最大位置bit[47:32]
+    REG_ADC_MAX_POS_L2 = 0x0055         # ADC最大位置bit[31:16]
+    REG_ADC_MAX_POS_L1 = 0x0056         # ADC最大位置bit[15:0]
+    # ADC最小值寄存器 (0x0057~0x005D, 新增)
+    # ADC值=0时对应最小值, ADC值=1时对应最大值, 最终输出=最小值+ADC比例×(最大值-最小值)
+    REG_ADC_MIN_SPEED_H = 0x0057        # ADC最小速度高16位(脉冲/秒, 有符号)
+    REG_ADC_MIN_SPEED_L = 0x0058        # ADC最小速度低16位
+    REG_ADC_MIN_PWM = 0x0059            # ADC最小PWM(-1000~1000, 有符号)
+    REG_ADC_MIN_POS_H3 = 0x005A         # ADC最小位置bit[63:48] (有符号)
+    REG_ADC_MIN_POS_H2 = 0x005B         # ADC最小位置bit[47:32]
+    REG_ADC_MIN_POS_L2 = 0x005C         # ADC最小位置bit[31:16]
+    REG_ADC_MIN_POS_L1 = 0x005D         # ADC最小位置bit[15:0]
+    # ADC死区寄存器 (0x005E~0x0061, 新增, 两个独立死区)
+    # 每个死区可独立设置位置和宽度, ADC值落入任一死区时强制输出该位置对应的归一化值
+    # 位置: 0=最小点, 1=中位点, 2=最大点; 宽度: 0~4095, 0=关闭
+    REG_ADC_DEAD_ZONE1_POS = 0x005E     # ADC死区1位置 (0=最小点, 1=中位点, 2=最大点)
+    REG_ADC_DEAD_ZONE1_WIDTH = 0x005F   # ADC死区1宽度 (0~4095, 0=关闭)
+    REG_ADC_DEAD_ZONE2_POS = 0x0060     # ADC死区2位置 (0=最小点, 1=中位点, 2=最大点)
+    REG_ADC_DEAD_ZONE2_WIDTH = 0x0061   # ADC死区2宽度 (0~4095, 0=关闭)
 
     REG_SPEED_DATA_BASE = 0x0200        # 采集数据起始地址
     REG_SPEED_DATA_END = 0x15FF         # 采集数据结束地址 (5120个寄存器, 10KB)
@@ -298,6 +337,8 @@ class ModbusDebuggerApp:
     REG_PID_I_L = 0x010E
     REG_PID_D_H = 0x010F
     REG_PID_D_L = 0x0110
+    REG_CURRENT_ACTUAL = 0x0111          # 实际电流(相对值×10, 有符号, ±10000=±8.25A)
+    REG_CURRENT_TARGET_RO = 0x0112       # 电流目标(相对值×10, 有符号)
     
     # 模式定义
     MODE_POSITION = 0
@@ -306,6 +347,11 @@ class ModbusDebuggerApp:
     MODE_OPENLOOP = 3           # 开环模式
     MODE_EXTERNAL_TARGET = 4     # 外部目标位置模式
     MODE_EXTERNAL_TARGET_SPEED = 5  # 外部目标速度模式
+    MODE_STANDBY = 6                # 待机模式
+    MODE_ADC_SPEED = 7              # ADC转速模式
+    MODE_ADC_POSITION_SPEED = 8     # ADC位置转速模式
+    MODE_ADC_OPENLOOP = 9           # ADC开环模式
+    MODE_ADC_POSITION = 10          # ADC位置模式
     
     def __init__(self, root):
         self.root = root
@@ -386,10 +432,28 @@ class ModbusDebuggerApp:
         left_frame.bind('<Configure>', _on_left_configure)
         left_canvas.bind('<Configure>', _on_canvas_configure)
 
-        def _on_mousewheel(event):
+        def _on_left_mousewheel(event):
             left_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
-        left_canvas.bind_all('<MouseWheel>', _on_mousewheel)
+        # 鼠标进入左侧区域时绑定滚轮
+        def _bind_left_wheel(event):
+            left_canvas.bind_all('<MouseWheel>', _on_left_mousewheel)
+
+        def _unbind_left_wheel(event):
+            # 检查鼠标是否真的离开了 canvas 区域
+            # 避免进入子 widget（如 mode_frame）时误触发解绑
+            x = event.x_root
+            y = event.y_root
+            cx = left_canvas.winfo_rootx()
+            cy = left_canvas.winfo_rooty()
+            cw = left_canvas.winfo_width()
+            ch = left_canvas.winfo_height()
+            if cx <= x < cx + cw and cy <= y < cy + ch:
+                return
+            left_canvas.unbind_all('<MouseWheel>')
+
+        left_canvas.bind('<Enter>', _bind_left_wheel)
+        left_canvas.bind('<Leave>', _unbind_left_wheel)
         
         # 模式控制
         mode_frame = ttk.LabelFrame(left_frame, text="模式控制", padding=10)
@@ -401,6 +465,11 @@ class ModbusDebuggerApp:
         ttk.Button(mode_frame, text="开环模式", command=lambda: self.set_mode(self.MODE_OPENLOOP)).pack(fill=tk.X, pady=2)
         ttk.Button(mode_frame, text="外部目标位置模式", command=lambda: self.set_mode(self.MODE_EXTERNAL_TARGET)).pack(fill=tk.X, pady=2)
         ttk.Button(mode_frame, text="外部目标速度模式", command=lambda: self.set_mode(self.MODE_EXTERNAL_TARGET_SPEED)).pack(fill=tk.X, pady=2)
+        ttk.Button(mode_frame, text="待机模式", command=lambda: self.set_mode(self.MODE_STANDBY)).pack(fill=tk.X, pady=2)
+        ttk.Button(mode_frame, text="ADC转速模式", command=lambda: self.set_mode(self.MODE_ADC_SPEED)).pack(fill=tk.X, pady=2)
+        ttk.Button(mode_frame, text="ADC位置转速模式", command=lambda: self.set_mode(self.MODE_ADC_POSITION_SPEED)).pack(fill=tk.X, pady=2)
+        ttk.Button(mode_frame, text="ADC开环模式", command=lambda: self.set_mode(self.MODE_ADC_OPENLOOP)).pack(fill=tk.X, pady=2)
+        ttk.Button(mode_frame, text="ADC位置模式", command=lambda: self.set_mode(self.MODE_ADC_POSITION)).pack(fill=tk.X, pady=2)
         
         # 目标位置
         pos_frame = ttk.LabelFrame(left_frame, text="目标位置", padding=10)
@@ -426,28 +495,29 @@ class ModbusDebuggerApp:
         pid_frame = ttk.LabelFrame(left_frame, text="PID参数", padding=10)
         pid_frame.pack(fill=tk.X, pady=5)
         
+        # 启动时PID参数框全部留空，强制用户先点击"读取PID"再写入，避免误写入导致电机参数错乱
         ttk.Label(pid_frame, text="位置环 Kp:").grid(row=0, column=0, padx=5, pady=2)
-        self.pos_kp_var = tk.StringVar(value="7.0")
+        self.pos_kp_var = tk.StringVar(value="")
         ttk.Entry(pid_frame, textvariable=self.pos_kp_var, width=10).grid(row=0, column=1, padx=5, pady=2)
-        
+
         ttk.Label(pid_frame, text="位置环 Ki:").grid(row=1, column=0, padx=5, pady=2)
-        self.pos_ki_var = tk.StringVar(value="0.1")
+        self.pos_ki_var = tk.StringVar(value="")
         ttk.Entry(pid_frame, textvariable=self.pos_ki_var, width=10).grid(row=1, column=1, padx=5, pady=2)
-        
+
         ttk.Label(pid_frame, text="位置环 Kd:").grid(row=2, column=0, padx=5, pady=2)
-        self.pos_kd_var = tk.StringVar(value="0.1")
+        self.pos_kd_var = tk.StringVar(value="")
         ttk.Entry(pid_frame, textvariable=self.pos_kd_var, width=10).grid(row=2, column=1, padx=5, pady=2)
-        
+
         ttk.Label(pid_frame, text="速度环 Kp:").grid(row=3, column=0, padx=5, pady=2)
-        self.spd_kp_var = tk.StringVar(value="0.3")
+        self.spd_kp_var = tk.StringVar(value="")
         ttk.Entry(pid_frame, textvariable=self.spd_kp_var, width=10).grid(row=3, column=1, padx=5, pady=2)
-        
+
         ttk.Label(pid_frame, text="速度环 Ki:").grid(row=4, column=0, padx=5, pady=2)
-        self.spd_ki_var = tk.StringVar(value="3.0")
+        self.spd_ki_var = tk.StringVar(value="")
         ttk.Entry(pid_frame, textvariable=self.spd_ki_var, width=10).grid(row=4, column=1, padx=5, pady=2)
-        
+
         ttk.Label(pid_frame, text="速度环 Kd:").grid(row=5, column=0, padx=5, pady=2)
-        self.spd_kd_var = tk.StringVar(value="0.0")
+        self.spd_kd_var = tk.StringVar(value="")
         ttk.Entry(pid_frame, textvariable=self.spd_kd_var, width=10).grid(row=5, column=1, padx=5, pady=2)
         
         ttk.Button(pid_frame, text="应用PID", command=self.apply_pid).grid(row=6, column=0, pady=5)
@@ -457,21 +527,22 @@ class ModbusDebuggerApp:
         other_frame = ttk.LabelFrame(left_frame, text="其他参数", padding=10)
         other_frame.pack(fill=tk.X, pady=5)
         
+        # 启动时其他参数框全部留空，强制用户先点击"读取参数"再写入，避免误写入导致电机参数错乱
         ttk.Label(other_frame, text="死区:").grid(row=0, column=0, padx=5, pady=2)
-        self.dead_zone_var = tk.StringVar(value="1")
+        self.dead_zone_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.dead_zone_var, width=10).grid(row=0, column=1, padx=5, pady=2)
-        
+
         ttk.Label(other_frame, text="最大输出:").grid(row=1, column=0, padx=5, pady=2)
-        self.max_output_var = tk.StringVar(value="900")
+        self.max_output_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.max_output_var, width=10).grid(row=1, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="最大运行速度:").grid(row=2, column=0, padx=5, pady=2)
-        self.max_run_speed_var = tk.StringVar(value="0")
+        self.max_run_speed_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.max_run_speed_var, width=10).grid(row=2, column=1, padx=5, pady=2)
         ttk.Label(other_frame, text="0=无限制").grid(row=2, column=2, padx=5, pady=2)
-        
+
         ttk.Label(other_frame, text="启动方式:").grid(row=3, column=0, padx=5, pady=2)
-        self.start_mode_var = tk.StringVar(value="直接启动")
+        self.start_mode_var = tk.StringVar(value="")
         self.start_mode_combo = ttk.Combobox(other_frame, textvariable=self.start_mode_var, width=8,
                       values=["直接启动", "标志位"], state="readonly")
         self.start_mode_combo.grid(row=3, column=1, padx=5, pady=2)
@@ -481,61 +552,56 @@ class ModbusDebuggerApp:
         self._on_start_mode_changed(None)
 
         ttk.Label(other_frame, text="电机方向:").grid(row=4, column=0, padx=5, pady=2)
-        self.motor_dir_var = tk.StringVar(value="正转")
+        self.motor_dir_var = tk.StringVar(value="")
         ttk.Combobox(other_frame, textvariable=self.motor_dir_var, width=8,
                      values=["正转", "反转"], state="readonly").grid(row=4, column=1, padx=5, pady=2)
-        
+
         ttk.Label(other_frame, text="编码器方向:").grid(row=5, column=0, padx=5, pady=2)
-        self.encoder_dir_var = tk.StringVar(value="正常")
+        self.encoder_dir_var = tk.StringVar(value="")
         ttk.Combobox(other_frame, textvariable=self.encoder_dir_var, width=8,
                      values=["正常", "反转"], state="readonly").grid(row=5, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="复位模式:").grid(row=6, column=0, padx=5, pady=2)
-        self.home_mode_var = tk.StringVar(value="关闭")
+        self.home_mode_var = tk.StringVar(value="")
         ttk.Combobox(other_frame, textvariable=self.home_mode_var, width=8,
                      values=["关闭", "堵转", "精确复位"], state="readonly").grid(row=6, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="复位方向:").grid(row=7, column=0, padx=5, pady=2)
-        self.home_dir_var = tk.StringVar(value="负方向")
+        self.home_dir_var = tk.StringVar(value="")
         ttk.Combobox(other_frame, textvariable=self.home_dir_var, width=8,
                      values=["负方向", "正方向"], state="readonly").grid(row=7, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="复位电流:").grid(row=8, column=0, padx=5, pady=2)
-        self.home_current_var = tk.StringVar(value="300")
+        self.home_current_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.home_current_var, width=10).grid(row=8, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="复位速度:").grid(row=9, column=0, padx=5, pady=2)
-        self.home_speed_var = tk.StringVar(value="1000")
+        self.home_speed_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.home_speed_var, width=10).grid(row=9, column=1, padx=5, pady=2)
-        
+
         ttk.Label(other_frame, text="精确检测速度:").grid(row=10, column=0, padx=5, pady=2)
-        self.home_precision_speed_var = tk.StringVar(value="100")
+        self.home_precision_speed_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.home_precision_speed_var, width=10).grid(row=10, column=1, padx=5, pady=2)
-        
+
         ttk.Label(other_frame, text="检测次数:").grid(row=11, column=0, padx=5, pady=2)
-        self.home_precision_cycles_var = tk.StringVar(value="3")
+        self.home_precision_cycles_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.home_precision_cycles_var, width=10).grid(row=11, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="最大距离:").grid(row=12, column=0, padx=5, pady=2)
-        self.home_max_distance_var = tk.StringVar(value="10000")
+        self.home_max_distance_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.home_max_distance_var, width=10).grid(row=12, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="复位偏置:").grid(row=13, column=0, padx=5, pady=2)
-        self.home_back_distance_var = tk.StringVar(value="100")
+        self.home_back_distance_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.home_back_distance_var, width=10).grid(row=13, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="开机自复位:").grid(row=14, column=0, padx=5, pady=2)
-        self.home_auto_start_var = tk.StringVar(value="开启")
+        self.home_auto_start_var = tk.StringVar(value="")
         ttk.Combobox(other_frame, textvariable=self.home_auto_start_var, width=8,
                      values=["关闭", "开启"], state="readonly").grid(row=14, column=1, padx=5, pady=2)
 
-        ttk.Label(other_frame, text="TIM2采样周期:").grid(row=15, column=0, padx=5, pady=2)
-        self.tim2_arr_var = tk.StringVar(value="639")
-        ttk.Entry(other_frame, textvariable=self.tim2_arr_var, width=10).grid(row=15, column=1, padx=5, pady=2)
-        ttk.Label(other_frame, text="ARR值, 639=10us").grid(row=15, column=2, padx=5, pady=2)
-
-        ttk.Button(other_frame, text="应用", command=self.apply_other_params).grid(row=16, column=0, pady=5)
-        ttk.Button(other_frame, text="读取参数", command=self.read_other_params).grid(row=16, column=1, pady=5)
+        ttk.Button(other_frame, text="读取参数", command=self.read_other_params).grid(row=16, column=0, pady=5)
+        ttk.Button(other_frame, text="应用", command=self.apply_other_params).grid(row=16, column=1, pady=5)
         ttk.Button(other_frame, text="恢复默认", command=self.reset_config).grid(row=16, column=2, pady=5)
         ttk.Button(other_frame, text="执行复位", command=self.trigger_homing).grid(row=17, column=0, columnspan=3, pady=5)
 
@@ -550,34 +616,35 @@ class ModbusDebuggerApp:
         ttk.Label(pin_frame, text="电平目标位置").grid(row=0, column=4, padx=5, pady=2)
         ttk.Label(pin_frame, text="电平目标速度").grid(row=0, column=5, padx=5, pady=2)
 
+        # 启动时引脚配置框全部留空，强制用户先点击"读取引脚配置"再写入，避免误写入导致电机参数错乱
         ttk.Label(pin_frame, text="PB4").grid(row=1, column=0, padx=5, pady=2)
-        self.pin4_func_var = tk.StringVar(value="脉冲")
-        ttk.Combobox(pin_frame, textvariable=self.pin4_func_var, width=9,
-                     values=["脉冲", "方向", "复位开关", "限位开关", "目标位置速度", "无功能"], state="readonly").grid(row=1, column=1, padx=2, pady=2)
-        self.pin4_pol_var = tk.StringVar(value="高电平")
+        self.pin4_func_var = tk.StringVar(value="")
+        ttk.Combobox(pin_frame, textvariable=self.pin4_func_var, width=14,
+                     values=["脉冲", "方向", "原点位置开关", "限位开关", "外部目标位置", "外部目标速度", "执行复位操作", "无功能", "停止", "启动标志位触发"], state="readonly").grid(row=1, column=1, padx=2, pady=2)
+        self.pin4_pol_var = tk.StringVar(value="")
         ttk.Combobox(pin_frame, textvariable=self.pin4_pol_var, width=8,
                      values=["高电平", "低电平"], state="readonly").grid(row=1, column=2, padx=2, pady=2)
-        self.pin4_ldir_var = tk.StringVar(value="停止正方向")
+        self.pin4_ldir_var = tk.StringVar(value="")
         ttk.Combobox(pin_frame, textvariable=self.pin4_ldir_var, width=10,
                      values=["停止正方向", "停止负方向"], state="readonly").grid(row=1, column=3, padx=2, pady=2)
-        self.pin4_target_pos_var = tk.StringVar(value="0")
+        self.pin4_target_pos_var = tk.StringVar(value="")
         ttk.Entry(pin_frame, textvariable=self.pin4_target_pos_var, width=14).grid(row=1, column=4, padx=2, pady=2)
-        self.pin4_target_speed_var = tk.StringVar(value="0")
+        self.pin4_target_speed_var = tk.StringVar(value="")
         ttk.Entry(pin_frame, textvariable=self.pin4_target_speed_var, width=14).grid(row=1, column=5, padx=2, pady=2)
 
         ttk.Label(pin_frame, text="PB5").grid(row=2, column=0, padx=5, pady=2)
-        self.pin5_func_var = tk.StringVar(value="方向")
-        ttk.Combobox(pin_frame, textvariable=self.pin5_func_var, width=9,
-                     values=["脉冲", "方向", "复位开关", "限位开关", "目标位置速度", "无功能"], state="readonly").grid(row=2, column=1, padx=2, pady=2)
-        self.pin5_pol_var = tk.StringVar(value="高电平")
+        self.pin5_func_var = tk.StringVar(value="")
+        ttk.Combobox(pin_frame, textvariable=self.pin5_func_var, width=14,
+                     values=["脉冲", "方向", "原点位置开关", "限位开关", "外部目标位置", "外部目标速度", "执行复位操作", "无功能", "停止", "启动标志位触发"], state="readonly").grid(row=2, column=1, padx=2, pady=2)
+        self.pin5_pol_var = tk.StringVar(value="")
         ttk.Combobox(pin_frame, textvariable=self.pin5_pol_var, width=8,
                      values=["高电平", "低电平"], state="readonly").grid(row=2, column=2, padx=2, pady=2)
-        self.pin5_ldir_var = tk.StringVar(value="停止负方向")
+        self.pin5_ldir_var = tk.StringVar(value="")
         ttk.Combobox(pin_frame, textvariable=self.pin5_ldir_var, width=10,
                      values=["停止正方向", "停止负方向"], state="readonly").grid(row=2, column=3, padx=2, pady=2)
-        self.pin5_target_pos_var = tk.StringVar(value="0")
+        self.pin5_target_pos_var = tk.StringVar(value="")
         ttk.Entry(pin_frame, textvariable=self.pin5_target_pos_var, width=14).grid(row=2, column=4, padx=2, pady=2)
-        self.pin5_target_speed_var = tk.StringVar(value="0")
+        self.pin5_target_speed_var = tk.StringVar(value="")
         ttk.Entry(pin_frame, textvariable=self.pin5_target_speed_var, width=14).grid(row=2, column=5, padx=2, pady=2)
 
         btn_frame = ttk.Frame(pin_frame)
@@ -585,22 +652,101 @@ class ModbusDebuggerApp:
         ttk.Button(btn_frame, text="读取引脚配置", command=self.read_pin_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="写入引脚配置", command=self.write_pin_config).pack(side=tk.LEFT, padx=5)
 
+        # PC2/PC3 ADC功能配置
+        adc_frame = ttk.LabelFrame(left_frame, text="PC2/PC3 ADC功能配置 (冲突时PC2优先)", padding=10)
+        adc_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(adc_frame, text="引脚").grid(row=0, column=0, padx=5, pady=2)
+        ttk.Label(adc_frame, text="功能").grid(row=0, column=1, padx=5, pady=2)
+
+        ttk.Label(adc_frame, text="PC2-ADC1").grid(row=1, column=0, padx=5, pady=2)
+        self.pc2_func_var = tk.StringVar(value="")
+        ttk.Combobox(adc_frame, textvariable=self.pc2_func_var, width=14,
+                     values=["无功能", "ADC转速模式", "ADC位置转速模式", "ADC开环模式", "ADC位置模式"], state="readonly").grid(row=1, column=1, padx=2, pady=2)
+
+        ttk.Label(adc_frame, text="PC3-ADC2").grid(row=2, column=0, padx=5, pady=2)
+        self.pc3_func_var = tk.StringVar(value="")
+        ttk.Combobox(adc_frame, textvariable=self.pc3_func_var, width=14,
+                     values=["无功能", "ADC转速模式", "ADC位置转速模式", "ADC开环模式", "ADC位置模式"], state="readonly").grid(row=2, column=1, padx=2, pady=2)
+
+        # 公用预设值: 不同模式使用同一组值
+        ttk.Label(adc_frame, text="最大速度(脉冲/秒):").grid(row=3, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_max_speed_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_max_speed_var, width=14).grid(row=3, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="转速/位置转速模式有效").grid(row=3, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(adc_frame, text="最大PWM(-1000~1000):").grid(row=4, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_max_pwm_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_max_pwm_var, width=14).grid(row=4, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="开环模式有效").grid(row=4, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(adc_frame, text="最大位置(脉冲):").grid(row=5, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_max_pos_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_max_pos_var, width=14).grid(row=5, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="位置模式有效").grid(row=5, column=2, padx=5, pady=2, sticky=tk.W)
+
+        # 最小值 (ADC=0时对应, 可为负数)
+        ttk.Label(adc_frame, text="最小速度(脉冲/秒):").grid(row=6, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_min_speed_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_min_speed_var, width=14).grid(row=6, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="转速/位置转速模式有效").grid(row=6, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(adc_frame, text="最小PWM(-1000~1000):").grid(row=7, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_min_pwm_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_min_pwm_var, width=14).grid(row=7, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="开环模式有效").grid(row=7, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(adc_frame, text="最小位置(脉冲):").grid(row=8, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_min_pos_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_min_pos_var, width=14).grid(row=8, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="位置模式有效").grid(row=8, column=2, padx=5, pady=2, sticky=tk.W)
+
+        # ADC死区1配置
+        ttk.Label(adc_frame, text="死区1位置:").grid(row=9, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_dz1_pos_var = tk.StringVar(value="")
+        ttk.Combobox(adc_frame, textvariable=self.adc_dz1_pos_var, width=12,
+                     values=["最小点", "中位点", "最大点"], state="readonly").grid(row=9, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="ADC=0/2048/4095附近停转").grid(row=9, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(adc_frame, text="死区1宽度(0~4095):").grid(row=10, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_dz1_width_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_dz1_width_var, width=14).grid(row=10, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="0=关闭").grid(row=10, column=2, padx=5, pady=2, sticky=tk.W)
+
+        # ADC死区2配置
+        ttk.Label(adc_frame, text="死区2位置:").grid(row=11, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_dz2_pos_var = tk.StringVar(value="")
+        ttk.Combobox(adc_frame, textvariable=self.adc_dz2_pos_var, width=12,
+                     values=["最小点", "中位点", "最大点"], state="readonly").grid(row=11, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="ADC=0/2048/4095附近停转").grid(row=11, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(adc_frame, text="死区2宽度(0~4095):").grid(row=12, column=0, padx=5, pady=2, sticky=tk.W)
+        self.adc_dz2_width_var = tk.StringVar(value="")
+        ttk.Entry(adc_frame, textvariable=self.adc_dz2_width_var, width=14).grid(row=12, column=1, padx=2, pady=2, sticky=tk.W)
+        ttk.Label(adc_frame, text="0=关闭").grid(row=12, column=2, padx=5, pady=2, sticky=tk.W)
+
+        adc_btn_frame = ttk.Frame(adc_frame)
+        adc_btn_frame.grid(row=13, column=0, columnspan=3, pady=5)
+        ttk.Button(adc_btn_frame, text="读取ADC配置", command=self.read_adc_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(adc_btn_frame, text="写入ADC配置", command=self.write_adc_config).pack(side=tk.LEFT, padx=5)
+
         # === 堵转保护配置 ===
         stall_frame = ttk.LabelFrame(left_frame, text="堵转保护", padding=10)
         stall_frame.pack(fill=tk.X, pady=5)
 
+        # 启动时堵转保护框全部留空，强制用户先点击"读取参数"再写入，避免误写入导致电机参数错乱
         ttk.Label(stall_frame, text="使能:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
-        self.stall_en_var = tk.StringVar(value="关闭")
+        self.stall_en_var = tk.StringVar(value="")
         ttk.Combobox(stall_frame, textvariable=self.stall_en_var, width=6,
                      values=["关闭", "开启"], state="readonly").grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
 
         ttk.Label(stall_frame, text="误差阈值:").grid(row=0, column=2, padx=5, pady=2, sticky=tk.W)
-        self.stall_err_var = tk.StringVar(value="200")
+        self.stall_err_var = tk.StringVar(value="")
         ttk.Entry(stall_frame, textvariable=self.stall_err_var, width=8).grid(row=0, column=3, padx=5, pady=2, sticky=tk.W)
         ttk.Label(stall_frame, text="(脉冲/脉冲·秒⁻¹)").grid(row=0, column=4, padx=2, pady=2, sticky=tk.W)
 
         ttk.Label(stall_frame, text="持续时长:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
-        self.stall_time_var = tk.StringVar(value="200")
+        self.stall_time_var = tk.StringVar(value="")
         ttk.Entry(stall_frame, textvariable=self.stall_time_var, width=8).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
         ttk.Label(stall_frame, text="(×5ms = 1.0s)").grid(row=1, column=2, columnspan=3, padx=2, pady=2, sticky=tk.W)
 
@@ -609,6 +755,53 @@ class ModbusDebuggerApp:
         ttk.Button(stall_btn_frame, text="读取参数", command=self.read_stall_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(stall_btn_frame, text="写入参数", command=self.write_stall_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(stall_btn_frame, text="复位堵转", command=self.reset_stall).pack(side=tk.LEFT, padx=5)
+
+        # === 电流环配置 ===
+        cur_frame = ttk.LabelFrame(left_frame, text="电流环 (INA240A1PWR + 10mΩ)", padding=10)
+        cur_frame.pack(fill=tk.X, pady=5)
+
+        # 启动时电流环参数框全部留空, 强制先读取再写入, 避免误覆盖
+        ttk.Label(cur_frame, text="电流环使能:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+        self.cur_loop_en_var = tk.StringVar(value="")
+        ttk.Combobox(cur_frame, textvariable=self.cur_loop_en_var, width=8,
+                     values=["关闭", "开启"], state="readonly").grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(cur_frame, text="(关闭=2环, 开启=3环)",
+                  foreground="blue").grid(row=0, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(cur_frame, text="Kp:").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+        self.cur_kp_var = tk.StringVar(value="")
+        ttk.Entry(cur_frame, textvariable=self.cur_kp_var, width=10).grid(row=1, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(cur_frame, text="Ki:").grid(row=1, column=2, padx=5, pady=2, sticky=tk.W)
+        self.cur_ki_var = tk.StringVar(value="")
+        ttk.Entry(cur_frame, textvariable=self.cur_ki_var, width=10).grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(cur_frame, text="Kd:").grid(row=1, column=4, padx=5, pady=2, sticky=tk.W)
+        self.cur_kd_var = tk.StringVar(value="")
+        ttk.Entry(cur_frame, textvariable=self.cur_kd_var, width=10).grid(row=1, column=5, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(cur_frame, text="零点ADC:").grid(row=2, column=0, padx=5, pady=2, sticky=tk.W)
+        self.cur_offset_var = tk.StringVar(value="")
+        ttk.Entry(cur_frame, textvariable=self.cur_offset_var, width=10).grid(row=2, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(cur_frame, text="默认2048",
+                  foreground="gray").grid(row=2, column=2, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(cur_frame, text="标定系数:").grid(row=2, column=3, padx=5, pady=2, sticky=tk.W)
+        self.cur_scale_var = tk.StringVar(value="")
+        ttk.Entry(cur_frame, textvariable=self.cur_scale_var, width=10).grid(row=2, column=4, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(cur_frame, text="默认0.4883",
+                  foreground="gray").grid(row=2, column=5, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(cur_frame, text="过流阈值:").grid(row=3, column=0, padx=5, pady=2, sticky=tk.W)
+        self.over_cur_limit_var = tk.StringVar(value="")
+        ttk.Entry(cur_frame, textvariable=self.over_cur_limit_var, width=10).grid(row=3, column=1, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(cur_frame, text="A (0=关闭, 5=5A)",
+                  foreground="blue").grid(row=3, column=2, columnspan=2, padx=5, pady=2, sticky=tk.W)
+
+        cur_btn_frame = ttk.Frame(cur_frame)
+        cur_btn_frame.grid(row=4, column=0, columnspan=6, pady=5)
+        ttk.Button(cur_btn_frame, text="读取参数", command=self.read_current_loop_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(cur_btn_frame, text="写入参数", command=self.write_current_loop_config).pack(side=tk.LEFT, padx=5)
+        ttk.Button(cur_btn_frame, text="过流复位", command=self.reset_over_current).pack(side=tk.LEFT, padx=5)
+        ttk.Button(cur_btn_frame, text="标定零点", command=self.calibrate_current_offset).pack(side=tk.LEFT, padx=5)
 
         # 右侧：Canvas+滚动条 包裹 PanedWindow（可整体滚动 + 可调整各窗口大小）
         right_frame = ttk.Frame(paned)
@@ -657,6 +850,8 @@ class ModbusDebuggerApp:
 
         self.status_labels = {}
 
+        # 3列竖行布局：每列包含 label(column=N) + value(column=N+1)
+        # 第1列：位置/速度/模式相关
         ttk.Label(status_frame, text="当前位置:").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
         self.status_labels['position'] = ttk.Label(status_frame, text="0", foreground="blue", font=("Arial", 12, "bold"))
         self.status_labels['position'].grid(row=0, column=1, padx=5, pady=2, sticky=tk.W)
@@ -677,44 +872,85 @@ class ModbusDebuggerApp:
         self.status_labels['start_flag'] = ttk.Label(status_frame, text="未设置", foreground="red", font=("Arial", 12, "bold"))
         self.status_labels['start_flag'].grid(row=4, column=1, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="电机方向:").grid(row=5, column=0, padx=5, pady=2, sticky=tk.W)
+        # 第2列：方向/PWM/状态相关
+        ttk.Label(status_frame, text="电机方向:").grid(row=0, column=2, padx=15, pady=2, sticky=tk.W)
         self.status_labels['motor_dir'] = ttk.Label(status_frame, text="正转", foreground="blue", font=("Arial", 12, "bold"))
-        self.status_labels['motor_dir'].grid(row=5, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['motor_dir'].grid(row=0, column=3, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="编码器方向:").grid(row=6, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="编码器方向:").grid(row=1, column=2, padx=15, pady=2, sticky=tk.W)
         self.status_labels['encoder_dir'] = ttk.Label(status_frame, text="正常", foreground="blue", font=("Arial", 12, "bold"))
-        self.status_labels['encoder_dir'].grid(row=6, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['encoder_dir'].grid(row=1, column=3, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PWM输出:").grid(row=7, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="PWM输出:").grid(row=2, column=2, padx=15, pady=2, sticky=tk.W)
         self.status_labels['pwm'] = ttk.Label(status_frame, text="0.0%", foreground="purple", font=("Arial", 12, "bold"))
-        self.status_labels['pwm'].grid(row=7, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pwm'].grid(row=2, column=3, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="复位状态:").grid(row=8, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="复位状态:").grid(row=3, column=2, padx=15, pady=2, sticky=tk.W)
         self.status_labels['homing'] = ttk.Label(status_frame, text="空闲", foreground="gray", font=("Arial", 12, "bold"))
-        self.status_labels['homing'].grid(row=8, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['homing'].grid(row=3, column=3, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="堵转保护:").grid(row=9, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="堵转保护:").grid(row=4, column=2, padx=15, pady=2, sticky=tk.W)
         self.status_labels['stall'] = ttk.Label(status_frame, text="正常", foreground="gray", font=("Arial", 12, "bold"))
-        self.status_labels['stall'].grid(row=9, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['stall'].grid(row=4, column=3, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID误差:").grid(row=10, column=0, padx=5, pady=2, sticky=tk.W)
+        # 第4列: 电流环实时值
+        ttk.Label(status_frame, text="实际电流:").grid(row=0, column=6, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['current_actual'] = ttk.Label(status_frame, text="0.00 A", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['current_actual'].grid(row=0, column=7, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="电流目标:").grid(row=1, column=6, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['current_target'] = ttk.Label(status_frame, text="0.00 A", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['current_target'].grid(row=1, column=7, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="过流保护:").grid(row=2, column=6, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['over_current'] = ttk.Label(status_frame, text="正常", foreground="gray", font=("Arial", 12, "bold"))
+        self.status_labels['over_current'].grid(row=2, column=7, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="电流环:").grid(row=3, column=6, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['cur_loop'] = ttk.Label(status_frame, text="关闭", foreground="gray", font=("Arial", 12, "bold"))
+        self.status_labels['cur_loop'].grid(row=3, column=7, padx=5, pady=2, sticky=tk.W)
+
+        # 第3列：PID实时值
+        ttk.Label(status_frame, text="PID误差:").grid(row=0, column=4, padx=15, pady=2, sticky=tk.W)
         self.status_labels['pid_error'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_error'].grid(row=10, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_error'].grid(row=0, column=5, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID-P:").grid(row=11, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="PID-P:").grid(row=1, column=4, padx=15, pady=2, sticky=tk.W)
         self.status_labels['pid_p'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_p'].grid(row=11, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_p'].grid(row=1, column=5, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID-I:").grid(row=12, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="PID-I:").grid(row=2, column=4, padx=15, pady=2, sticky=tk.W)
         self.status_labels['pid_i'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_i'].grid(row=12, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_i'].grid(row=2, column=5, padx=5, pady=2, sticky=tk.W)
 
-        ttk.Label(status_frame, text="PID-D:").grid(row=13, column=0, padx=5, pady=2, sticky=tk.W)
+        ttk.Label(status_frame, text="PID-D:").grid(row=3, column=4, padx=15, pady=2, sticky=tk.W)
         self.status_labels['pid_d'] = ttk.Label(status_frame, text="0.00", foreground="teal", font=("Arial", 12, "bold"))
-        self.status_labels['pid_d'].grid(row=13, column=1, padx=5, pady=2, sticky=tk.W)
+        self.status_labels['pid_d'].grid(row=3, column=5, padx=5, pady=2, sticky=tk.W)
+
+        # 第5列：ADC采样值（供电电压/外部ADC1/外部ADC2）
+        ttk.Label(status_frame, text="供电电压:").grid(row=0, column=8, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['supply_voltage'] = ttk.Label(status_frame, text="0.00V", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['supply_voltage'].grid(row=0, column=9, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="PC2(ADC1):").grid(row=1, column=8, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['ext_adc1'] = ttk.Label(status_frame, text="0", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['ext_adc1'].grid(row=1, column=9, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="PC3(ADC2):").grid(row=2, column=8, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['ext_adc2'] = ttk.Label(status_frame, text="0", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['ext_adc2'].grid(row=2, column=9, padx=5, pady=2, sticky=tk.W)
+
+        # PB4/PB5 引脚电平显示(放在ADC下方)
+        ttk.Label(status_frame, text="PB4电平:").grid(row=3, column=8, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['pb4_level'] = ttk.Label(status_frame, text="低", foreground="gray", font=("Arial", 12, "bold"))
+        self.status_labels['pb4_level'].grid(row=3, column=9, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(status_frame, text="PB5电平:").grid(row=4, column=8, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['pb5_level'] = ttk.Label(status_frame, text="低", foreground="gray", font=("Arial", 12, "bold"))
+        self.status_labels['pb5_level'].grid(row=4, column=9, padx=5, pady=2, sticky=tk.W)
 
         self.monitor_btn = ttk.Button(status_frame, text="开始监控", command=self.toggle_monitor)
-        self.monitor_btn.grid(row=14, column=0, columnspan=2, pady=5)
+        self.monitor_btn.grid(row=5, column=0, columnspan=10, pady=5)
 
         # === 采集曲线图（可调高度） ===
         chart_frame = ttk.LabelFrame(right_vpaned, text="采集曲线", padding=5)
@@ -726,8 +962,8 @@ class ModbusDebuggerApp:
 
         ttk.Label(ctrl_bar, text="采集类型:").pack(side=tk.LEFT, padx=(0, 2))
         self.acq_type_var = tk.StringVar(value="转速")
-        acq_type_combo = ttk.Combobox(ctrl_bar, textvariable=self.acq_type_var, width=8,
-                                      values=["转速", "PWM", "位置"], state="readonly")
+        acq_type_combo = ttk.Combobox(ctrl_bar, textvariable=self.acq_type_var, width=12,
+                                      values=["转速", "PWM", "位置", "电流", "PC0电压ADC", "PC2外部ADC", "PC3外部ADC"], state="readonly")
         acq_type_combo.pack(side=tk.LEFT, padx=2)
         acq_type_combo.bind("<<ComboboxSelected>>", self.on_acq_type_changed)
 
@@ -1039,7 +1275,7 @@ class ModbusDebuggerApp:
             try:
                 if self.serial_lock.acquire(timeout=1.0):
                     try:
-                        mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度"}
+                        mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度", 6: "待机", 7: "ADC转速", 8: "ADC位置转速", 9: "ADC开环", 10: "ADC位置"}
                         start_mode = 1 if self.start_mode_var.get() == "标志位" else 0
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_MODE_SET, start_mode)
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_CONTROL_WORD, mode)
@@ -1137,6 +1373,24 @@ class ModbusDebuggerApp:
         """应用PID参数"""
         if not self.modbus:
             messagebox.showwarning("警告", "请先连接串口")
+            return
+
+        # 检查PID参数是否为空：为空表示用户尚未读取参数，禁止写入避免误覆盖电机参数
+        empty_fields = []
+        if not self.pos_kp_var.get().strip(): empty_fields.append("位置环Kp")
+        if not self.pos_ki_var.get().strip(): empty_fields.append("位置环Ki")
+        if not self.pos_kd_var.get().strip(): empty_fields.append("位置环Kd")
+        if not self.spd_kp_var.get().strip(): empty_fields.append("速度环Kp")
+        if not self.spd_ki_var.get().strip(): empty_fields.append("速度环Ki")
+        if not self.spd_kd_var.get().strip(): empty_fields.append("速度环Kd")
+        if empty_fields:
+            messagebox.showwarning(
+                "请先读取参数",
+                "检测到以下参数框为空，未读取过电机参数：\n  - " +
+                "\n  - ".join(empty_fields) +
+                "\n\n为避免误写入导致电机参数错乱，请先点击【读取PID】按钮，"
+                "从电机控制器读取当前PID后再修改并写入。"
+            )
             return
         
         def clamp_pid(value, scale=100):
@@ -1253,6 +1507,33 @@ class ModbusDebuggerApp:
         if not self.modbus:
             messagebox.showwarning("警告", "请先连接串口")
             return
+
+        # 检查其他参数是否为空：为空表示用户尚未读取参数，禁止写入避免误覆盖电机参数
+        empty_fields = []
+        if not self.dead_zone_var.get().strip(): empty_fields.append("死区")
+        if not self.max_output_var.get().strip(): empty_fields.append("最大输出")
+        if not self.max_run_speed_var.get().strip(): empty_fields.append("最大运行速度")
+        if not self.start_mode_var.get().strip(): empty_fields.append("启动方式")
+        if not self.motor_dir_var.get().strip(): empty_fields.append("电机方向")
+        if not self.encoder_dir_var.get().strip(): empty_fields.append("编码器方向")
+        if not self.home_mode_var.get().strip(): empty_fields.append("复位模式")
+        if not self.home_dir_var.get().strip(): empty_fields.append("复位方向")
+        if not self.home_current_var.get().strip(): empty_fields.append("复位电流")
+        if not self.home_speed_var.get().strip(): empty_fields.append("复位速度")
+        if not self.home_precision_speed_var.get().strip(): empty_fields.append("精确检测速度")
+        if not self.home_precision_cycles_var.get().strip(): empty_fields.append("检测次数")
+        if not self.home_max_distance_var.get().strip(): empty_fields.append("最大距离")
+        if not self.home_back_distance_var.get().strip(): empty_fields.append("复位偏置")
+        if not self.home_auto_start_var.get().strip(): empty_fields.append("开机自复位")
+        if empty_fields:
+            messagebox.showwarning(
+                "请先读取参数",
+                "检测到以下参数框为空，未读取过电机参数：\n  - " +
+                "\n  - ".join(empty_fields) +
+                "\n\n为避免误写入导致电机参数错乱，请先点击【读取参数】按钮，"
+                "从电机控制器读取当前参数后再修改并写入。"
+            )
+            return
         
         def do_apply_other():
             try:
@@ -1274,7 +1555,6 @@ class ModbusDebuggerApp:
                         home_auto_start = 1 if self.home_auto_start_var.get() == "开启" else 0
                         home_precision_speed = int(self.home_precision_speed_var.get())
                         home_precision_cycles = int(self.home_precision_cycles_var.get())
-                        tim2_arr = int(self.tim2_arr_var.get())
                         home_values = [
                             home_mode,
                             home_dir,
@@ -1288,7 +1568,7 @@ class ModbusDebuggerApp:
                             0,  # REG_HOME_TRIGGER=0, 不触发
                             home_auto_start,
                         ]
-                        
+
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_DEAD_ZONE, dead_zone)
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_MAX_OUTPUT, max_output)
                         self.modbus.write_multiple_registers(
@@ -1302,9 +1582,6 @@ class ModbusDebuggerApp:
                             self.get_slave_addr(), self.REG_HOME_PRECISION_SPEED_H,
                             [(home_precision_speed >> 16) & 0xFFFF, home_precision_speed & 0xFFFF])
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_HOME_PRECISION_CYCLES, home_precision_cycles)
-                        # TIM2 ARR (范围99~65535, 超界由固件拒绝)
-                        if 99 <= tim2_arr <= 65535:
-                            self.modbus.write_single_register(self.get_slave_addr(), self.REG_TIM2_ARR, tim2_arr)
 
                         hm_name = {0: "关闭", 1: "堵转", 2: "精确复位"}
                         self.root.after(0, lambda: self.log(
@@ -1313,8 +1590,7 @@ class ModbusDebuggerApp:
                             f"启动方式={'标志位' if start_mode else '直接'}, "
                             f"电机={'反转' if motor_dir else '正转'}, "
                             f"编码器={'反转' if encoder_dir else '正常'}, "
-                            f"复位={hm_name.get(home_mode, '?')}, "
-                            f"TIM2_ARR={tim2_arr}"))
+                            f"复位={hm_name.get(home_mode, '?')}"))
                     finally:
                         self.serial_lock.release()
                 else:
@@ -1344,8 +1620,6 @@ class ModbusDebuggerApp:
                             self.get_slave_addr(), self.REG_MAX_RUN_SPEED_H, 2)
                         precision_data = self.modbus.read_holding_registers(
                             self.get_slave_addr(), self.REG_HOME_PRECISION_SPEED_H, 3)
-                        tim2_arr_data = self.modbus.read_holding_registers(
-                            self.get_slave_addr(), self.REG_TIM2_ARR, 1)
                         dead_zone = data[0]
                         max_output = data[1]
                         max_run_speed = (max_run_data[0] << 16) | max_run_data[1]
@@ -1363,7 +1637,6 @@ class ModbusDebuggerApp:
                         home_auto_start = home_data[10]
                         home_precision_speed = (precision_data[0] << 16) | precision_data[1]
                         home_precision_cycles = precision_data[2]
-                        tim2_arr = tim2_arr_data[0]
 
                         hm_display = {0: "关闭", 1: "堵转", 2: "精确复位"}
                         def update_ui():
@@ -1382,15 +1655,13 @@ class ModbusDebuggerApp:
                             self.home_auto_start_var.set("开启" if home_auto_start else "关闭")
                             self.home_precision_speed_var.set(str(home_precision_speed))
                             self.home_precision_cycles_var.set(str(home_precision_cycles))
-                            self.tim2_arr_var.set(str(tim2_arr))
                             self.log(
                                 f"读取参数: 死区={dead_zone}, 最大输出={max_output}, "
                                 f"最大运行速度={max_run_speed}, "
                                 f"启动模式={'标志位' if start_mode else '直接'}, "
                                 f"电机={'反转' if motor_dir else '正转'}, "
                                 f"编码器={'反转' if encoder_dir else '正常'}, "
-                                f"复位={hm_display.get(home_mode, '?')}, "
-                                f"TIM2_ARR={tim2_arr}")
+                                f"复位={hm_display.get(home_mode, '?')}")
                         self.root.after(0, update_ui)
                     finally:
                         self.serial_lock.release()
@@ -1456,9 +1727,6 @@ class ModbusDebuggerApp:
                         self.modbus.write_multiple_registers(
                             self.get_slave_addr(), self.REG_INPUT1_TARGET_SPEED_H,
                             [0, 0, 0, 0])
-                        # TIM2 ARR 恢复默认639 (10us周期)
-                        self.modbus.write_single_register(
-                            self.get_slave_addr(), self.REG_TIM2_ARR, 639)
 
                         def update_ui():
                             self.pos_kp_var.set("7.00")
@@ -1482,7 +1750,6 @@ class ModbusDebuggerApp:
                             self.home_auto_start_var.set("开启")
                             self.home_precision_speed_var.set("100")
                             self.home_precision_cycles_var.set("3")
-                            self.tim2_arr_var.set("639")
                             self.pin4_func_var.set("脉冲")
                             self.pin4_pol_var.set("高电平")
                             self.pin4_ldir_var.set("停止正方向")
@@ -1547,7 +1814,7 @@ class ModbusDebuggerApp:
                         p5_speed = (speed_data[2] << 16) | speed_data[3]
                         if p5_speed >= 0x80000000:
                             p5_speed -= 0x100000000
-                        fm = {0:"脉冲",1:"方向",2:"复位开关",3:"限位开关",4:"目标位置速度",5:"无功能"}
+                        fm = {0:"脉冲",1:"方向",2:"原点位置开关",3:"限位开关",4:"外部目标位置",5:"外部目标速度",6:"执行复位操作",7:"无功能",8:"停止",9:"启动标志位触发"}
                         pm = {0:"高电平",1:"低电平"}
                         lm = {0:"停止正方向",1:"停止负方向"}
                         self.root.after(0, lambda: self.pin4_func_var.set(fm.get(p4f,"?")))
@@ -1573,7 +1840,30 @@ class ModbusDebuggerApp:
         if not self.modbus:
             messagebox.showwarning("警告", "请先连接串口")
             return
-        fm = {"脉冲":0,"方向":1,"复位开关":2,"限位开关":3,"目标位置速度":4,"无功能":5}
+
+        # 检查引脚参数是否为空：为空表示用户尚未读取参数，禁止写入避免误覆盖电机参数
+        empty_fields = []
+        if not self.pin4_func_var.get().strip(): empty_fields.append("PB4功能")
+        if not self.pin4_pol_var.get().strip(): empty_fields.append("PB4有效电平")
+        if not self.pin4_ldir_var.get().strip(): empty_fields.append("PB4限位方向")
+        if not self.pin4_target_pos_var.get().strip(): empty_fields.append("PB4电平目标位置")
+        if not self.pin4_target_speed_var.get().strip(): empty_fields.append("PB4电平目标速度")
+        if not self.pin5_func_var.get().strip(): empty_fields.append("PB5功能")
+        if not self.pin5_pol_var.get().strip(): empty_fields.append("PB5有效电平")
+        if not self.pin5_ldir_var.get().strip(): empty_fields.append("PB5限位方向")
+        if not self.pin5_target_pos_var.get().strip(): empty_fields.append("PB5电平目标位置")
+        if not self.pin5_target_speed_var.get().strip(): empty_fields.append("PB5电平目标速度")
+        if empty_fields:
+            messagebox.showwarning(
+                "请先读取参数",
+                "检测到以下引脚参数框为空，未读取过电机参数：\n  - " +
+                "\n  - ".join(empty_fields) +
+                "\n\n为避免误写入导致电机参数错乱，请先点击【读取引脚配置】按钮，"
+                "从电机控制器读取当前引脚配置后再修改并写入。"
+            )
+            return
+
+        fm = {"脉冲":0,"方向":1,"原点位置开关":2,"限位开关":3,"外部目标位置":4,"外部目标速度":5,"执行复位操作":6,"无功能":7,"停止":8,"启动标志位触发":9}
         pm = {"高电平":0,"低电平":1}
         lm = {"停止正方向":0,"停止负方向":1}
         try:
@@ -1603,6 +1893,163 @@ class ModbusDebuggerApp:
                     self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"写入引脚配置失败: {str(e)}"))
+        threading.Thread(target=do_write, daemon=True).start()
+
+    # ========== PC2/PC3 ADC功能配置 ==========
+
+    def read_adc_config(self):
+        """读取PC2/PC3 ADC功能配置"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        def do_read():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        # 读 PC2/PC3功能 (2个寄存器)
+                        func_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_PC2_FUNC, 2)
+                        # 读 ADC最大速度 (2个寄存器)
+                        speed_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_ADC_MAX_SPEED_H, 2)
+                        # 读 ADC最大PWM (1个寄存器)
+                        pwm_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_ADC_MAX_PWM, 1)
+                        # 读 ADC最大位置 (4个寄存器)
+                        pos_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_ADC_MAX_POS_H3, 4)
+                        # 读 ADC最小速度 (2个寄存器)
+                        min_speed_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_ADC_MIN_SPEED_H, 2)
+                        # 读 ADC最小PWM (1个寄存器)
+                        min_pwm_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_ADC_MIN_PWM, 1)
+                        # 读 ADC最小位置 (4个寄存器)
+                        min_pos_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_ADC_MIN_POS_H3, 4)
+                        # 读 ADC死区1和死区2 (4个寄存器)
+                        dz_data = self.modbus.read_holding_registers(self.get_slave_addr(), self.REG_ADC_DEAD_ZONE1_POS, 4)
+
+                        pc2_func = func_data[0]
+                        pc3_func = func_data[1]
+                        max_speed = (speed_data[0] << 16) | speed_data[1]
+                        if max_speed >= 0x80000000:
+                            max_speed -= 0x100000000
+                        max_pwm = pwm_data[0]
+                        if max_pwm >= 0x8000:
+                            max_pwm -= 0x10000
+                        max_pos = self.regs_to_int64(pos_data)
+
+                        min_speed = (min_speed_data[0] << 16) | min_speed_data[1]
+                        if min_speed >= 0x80000000:
+                            min_speed -= 0x100000000
+                        min_pwm = min_pwm_data[0]
+                        if min_pwm >= 0x8000:
+                            min_pwm -= 0x10000
+                        min_pos = self.regs_to_int64(min_pos_data)
+
+                        dz1_pos = dz_data[0]
+                        dz1_width = dz_data[1]
+                        dz2_pos = dz_data[2]
+                        dz2_width = dz_data[3]
+                        dz_fm = {0: "最小点", 1: "中位点", 2: "最大点"}
+
+                        fm = {0: "无功能", 1: "ADC转速模式", 2: "ADC位置转速模式", 3: "ADC开环模式", 4: "ADC位置模式"}
+                        self.root.after(0, lambda: self.pc2_func_var.set(fm.get(pc2_func, "无功能")))
+                        self.root.after(0, lambda: self.pc3_func_var.set(fm.get(pc3_func, "无功能")))
+                        self.root.after(0, lambda: self.adc_max_speed_var.set(str(max_speed)))
+                        self.root.after(0, lambda: self.adc_max_pwm_var.set(str(max_pwm)))
+                        self.root.after(0, lambda: self.adc_max_pos_var.set(str(max_pos)))
+                        self.root.after(0, lambda: self.adc_min_speed_var.set(str(min_speed)))
+                        self.root.after(0, lambda: self.adc_min_pwm_var.set(str(min_pwm)))
+                        self.root.after(0, lambda: self.adc_min_pos_var.set(str(min_pos)))
+                        self.root.after(0, lambda: self.adc_dz1_pos_var.set(dz_fm.get(dz1_pos, "最小点")))
+                        self.root.after(0, lambda: self.adc_dz1_width_var.set(str(dz1_width)))
+                        self.root.after(0, lambda: self.adc_dz2_pos_var.set(dz_fm.get(dz2_pos, "最小点")))
+                        self.root.after(0, lambda: self.adc_dz2_width_var.set(str(dz2_width)))
+                        self.root.after(0, lambda: self.log(f"读取ADC配置成功: PC2={fm.get(pc2_func,'?')}, PC3={fm.get(pc3_func,'?')}, 速度=[{min_speed}~{max_speed}], PWM=[{min_pwm}~{max_pwm}], 位置=[{min_pos}~{max_pos}], 死区1={dz_fm.get(dz1_pos,'?')}宽{dz1_width}, 死区2={dz_fm.get(dz2_pos,'?')}宽{dz2_width}"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"读取ADC配置失败: {str(e)}"))
+        threading.Thread(target=do_read, daemon=True).start()
+
+    def write_adc_config(self):
+        """写入PC2/PC3 ADC功能配置"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        # 空字段检查
+        empty_fields = []
+        if not self.pc2_func_var.get().strip(): empty_fields.append("PC2功能")
+        if not self.pc3_func_var.get().strip(): empty_fields.append("PC3功能")
+        if not self.adc_max_speed_var.get().strip(): empty_fields.append("最大速度")
+        if not self.adc_max_pwm_var.get().strip(): empty_fields.append("最大PWM")
+        if not self.adc_max_pos_var.get().strip(): empty_fields.append("最大位置")
+        if not self.adc_min_speed_var.get().strip(): empty_fields.append("最小速度")
+        if not self.adc_min_pwm_var.get().strip(): empty_fields.append("最小PWM")
+        if not self.adc_min_pos_var.get().strip(): empty_fields.append("最小位置")
+        if not self.adc_dz1_pos_var.get().strip(): empty_fields.append("死区1位置")
+        if not self.adc_dz1_width_var.get().strip(): empty_fields.append("死区1宽度")
+        if not self.adc_dz2_pos_var.get().strip(): empty_fields.append("死区2位置")
+        if not self.adc_dz2_width_var.get().strip(): empty_fields.append("死区2宽度")
+        if empty_fields:
+            messagebox.showwarning("警告", "以下字段为空, 请先点击\"读取ADC配置\":\n" + "\n".join(empty_fields))
+            return
+        fm = {"无功能": 0, "ADC转速模式": 1, "ADC位置转速模式": 2, "ADC开环模式": 3, "ADC位置模式": 4}
+        try:
+            pc2_func = fm[self.pc2_func_var.get()]
+            pc3_func = fm[self.pc3_func_var.get()]
+            max_speed = int(self.adc_max_speed_var.get())
+            max_pwm = int(self.adc_max_pwm_var.get())
+            max_pos = int(self.adc_max_pos_var.get())
+            min_speed = int(self.adc_min_speed_var.get())
+            min_pwm = int(self.adc_min_pwm_var.get())
+            min_pos = int(self.adc_min_pos_var.get())
+            dz_fm = {"最小点": 0, "中位点": 1, "最大点": 2}
+            dz1_pos = dz_fm[self.adc_dz1_pos_var.get()]
+            dz1_width = int(self.adc_dz1_width_var.get())
+            dz2_pos = dz_fm[self.adc_dz2_pos_var.get()]
+            dz2_width = int(self.adc_dz2_width_var.get())
+        except (ValueError, KeyError):
+            messagebox.showerror("错误", "参数格式错误, 速度/PWM/位置必须是整数, 功能必须从下拉框选择")
+            return
+        # 范围检查
+        if max_pwm > 1000 or max_pwm < -1000:
+            messagebox.showerror("错误", "最大PWM范围: -1000~+1000")
+            return
+        if min_pwm > 1000 or min_pwm < -1000:
+            messagebox.showerror("错误", "最小PWM范围: -1000~+1000")
+            return
+        if dz1_width < 0 or dz1_width > 4095:
+            messagebox.showerror("错误", "死区1宽度范围: 0~4095")
+            return
+        if dz2_width < 0 or dz2_width > 4095:
+            messagebox.showerror("错误", "死区2宽度范围: 0~4095")
+            return
+        # 构造写入值
+        func_vals = [pc2_func, pc3_func]
+        speed_vals = [(max_speed >> 16) & 0xFFFF, max_speed & 0xFFFF]
+        pwm_val = max_pwm & 0xFFFF
+        pos_vals = self.int64_to_regs(max_pos)
+        min_speed_vals = [(min_speed >> 16) & 0xFFFF, min_speed & 0xFFFF]
+        min_pwm_val = min_pwm & 0xFFFF
+        min_pos_vals = self.int64_to_regs(min_pos)
+        dz_vals = [dz1_pos, dz1_width, dz2_pos, dz2_width]
+        def do_write():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_PC2_FUNC, func_vals)
+                        self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_ADC_MAX_SPEED_H, speed_vals)
+                        self.modbus.write_single_register(self.get_slave_addr(), self.REG_ADC_MAX_PWM, pwm_val)
+                        self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_ADC_MAX_POS_H3, pos_vals)
+                        self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_ADC_MIN_SPEED_H, min_speed_vals)
+                        self.modbus.write_single_register(self.get_slave_addr(), self.REG_ADC_MIN_PWM, min_pwm_val)
+                        self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_ADC_MIN_POS_H3, min_pos_vals)
+                        self.modbus.write_multiple_registers(self.get_slave_addr(), self.REG_ADC_DEAD_ZONE1_POS, dz_vals)
+                        self.root.after(0, lambda: self.log(f"写入ADC配置成功: PC2={self.pc2_func_var.get()}, PC3={self.pc3_func_var.get()}, 速度=[{min_speed}~{max_speed}], PWM=[{min_pwm}~{max_pwm}], 位置=[{min_pos}~{max_pos}], 死区1={self.adc_dz1_pos_var.get()}宽{dz1_width}, 死区2={self.adc_dz2_pos_var.get()}宽{dz2_width}"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"写入ADC配置失败: {str(e)}"))
         threading.Thread(target=do_write, daemon=True).start()
 
     # ========== 堵转保护配置 ==========
@@ -1642,6 +2089,22 @@ class ModbusDebuggerApp:
         if not self.modbus:
             messagebox.showwarning("警告", "请先连接串口")
             return
+
+        # 检查堵转参数是否为空：为空表示用户尚未读取参数，禁止写入避免误覆盖电机参数
+        empty_fields = []
+        if not self.stall_en_var.get().strip(): empty_fields.append("使能")
+        if not self.stall_err_var.get().strip(): empty_fields.append("误差阈值")
+        if not self.stall_time_var.get().strip(): empty_fields.append("持续时长")
+        if empty_fields:
+            messagebox.showwarning(
+                "请先读取参数",
+                "检测到以下堵转参数框为空，未读取过电机参数：\n  - " +
+                "\n  - ".join(empty_fields) +
+                "\n\n为避免误写入导致电机参数错乱，请先点击【读取参数】按钮，"
+                "从电机控制器读取当前堵转保护参数后再修改并写入。"
+            )
+            return
+
         try:
             err_limit = int(self.stall_err_var.get())
             time_ticks = int(self.stall_time_var.get())
@@ -1694,6 +2157,212 @@ class ModbusDebuggerApp:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"复位堵转失败: {str(e)}"))
         threading.Thread(target=do_reset, daemon=True).start()
 
+    # ========== 电流环配置 ==========
+
+    def read_current_loop_config(self):
+        """读取电流环参数"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        def do_read():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        # 读取0x0045~0x004B (7个寄存器)
+                        data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_CUR_LOOP_EN, 7)
+                        en = data[0]
+                        # Kp/Ki ×100, Kd ×1000, 有符号
+                        def to_float_signed(v, scale):
+                            if v >= 0x8000:
+                                v -= 0x10000
+                            return v / scale
+                        kp = to_float_signed(data[1], 100.0)
+                        ki = to_float_signed(data[2], 100.0)
+                        kd = to_float_signed(data[3], 1000.0)
+                        offset = data[4]
+                        scale = data[5] / 10000.0  # ×10000
+                        # 过流阈值 ×10, 有符号
+                        ocl_raw = data[6]
+                        if ocl_raw >= 0x8000:
+                            ocl_raw -= 0x10000
+                        # 相对值 → 安培: 1A ≈ 121相对单位
+                        ocl_A = ocl_raw / 10.0 / 121.0
+
+                        def update_ui():
+                            self.cur_loop_en_var.set("开启" if en else "关闭")
+                            self.cur_kp_var.set(f"{kp:.2f}")
+                            self.cur_ki_var.set(f"{ki:.2f}")
+                            self.cur_kd_var.set(f"{kd:.3f}")
+                            self.cur_offset_var.set(str(offset))
+                            self.cur_scale_var.set(f"{scale:.4f}")
+                            self.over_cur_limit_var.set(f"{ocl_A:.2f}")
+                            self.log(
+                                f"读取电流环: 使能={'开启' if en else '关闭'}, "
+                                f"Kp={kp:.2f}, Ki={ki:.2f}, Kd={kd:.3f}, "
+                                f"零点={offset}, 系数={scale:.4f}, "
+                                f"过流={ocl_A:.2f}A")
+                        self.root.after(0, update_ui)
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"读取电流环参数失败: {str(e)}"))
+        threading.Thread(target=do_read, daemon=True).start()
+
+    def write_current_loop_config(self):
+        """写入电流环参数"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+
+        # 检查参数是否为空
+        empty_fields = []
+        if not self.cur_loop_en_var.get().strip(): empty_fields.append("电流环使能")
+        if not self.cur_kp_var.get().strip(): empty_fields.append("Kp")
+        if not self.cur_ki_var.get().strip(): empty_fields.append("Ki")
+        if not self.cur_kd_var.get().strip(): empty_fields.append("Kd")
+        if not self.cur_offset_var.get().strip(): empty_fields.append("零点ADC")
+        if not self.cur_scale_var.get().strip(): empty_fields.append("标定系数")
+        if not self.over_cur_limit_var.get().strip(): empty_fields.append("过流阈值")
+        if empty_fields:
+            messagebox.showwarning(
+                "请先读取参数",
+                "检测到以下参数框为空，未读取过电机参数：\n  - " +
+                "\n  - ".join(empty_fields) +
+                "\n\n为避免误写入导致参数错乱，请先点击【读取参数】按钮。"
+            )
+            return
+
+        try:
+            en = 1 if self.cur_loop_en_var.get() == "开启" else 0
+            kp = float(self.cur_kp_var.get())
+            ki = float(self.cur_ki_var.get())
+            kd = float(self.cur_kd_var.get())
+            offset = int(self.cur_offset_var.get())
+            scale = float(self.cur_scale_var.get())
+            ocl_A = float(self.over_cur_limit_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "参数格式错误，请检查输入")
+            return
+
+        if offset < 0 or offset > 4095:
+            messagebox.showwarning("警告", "零点ADC范围: 0~4095")
+            return
+        if scale <= 0:
+            messagebox.showwarning("警告", "标定系数必须大于0")
+            return
+
+        # 限幅到16位有符号
+        def clamp_signed(v, lo=-32768, hi=32767):
+            if v < lo: return lo
+            if v > hi: return hi
+            return int(v)
+        kp_reg = clamp_signed(round(kp * 100))
+        ki_reg = clamp_signed(round(ki * 100))
+        kd_reg = clamp_signed(round(kd * 1000))
+        scale_reg = clamp_signed(round(scale * 10000), 0, 65535)
+        # 过流阈值: A → 相对值×10, 1A ≈ 121相对单位
+        ocl_rel = ocl_A * 121.0 * 10.0
+        ocl_reg = clamp_signed(round(ocl_rel))
+
+        def do_write():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        # 注意: 使能单独写, 避免一次性写7个时顺序错乱
+                        # 先写参数, 最后写使能, 避免参数未更新就切换模式
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_CUR_KP, kp_reg & 0xFFFF)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_CUR_KI, ki_reg & 0xFFFF)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_CUR_KD, kd_reg & 0xFFFF)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_CUR_OFFSET, offset)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_CUR_SCALE, scale_reg)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_OVER_CUR_LIMIT, ocl_reg & 0xFFFF)
+                        # 最后写使能寄存器
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_CUR_LOOP_EN, en)
+                        self.root.after(0, lambda: self.log(
+                            f"写入电流环: 使能={'开启' if en else '关闭'}, "
+                            f"Kp={kp:.2f}, Ki={ki:.2f}, Kd={kd:.3f}, "
+                            f"零点={offset}, 系数={scale:.4f}, "
+                            f"过流={ocl_A:.2f}A (相对值{ocl_reg})"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"写入电流环参数失败: {str(e)}"))
+        threading.Thread(target=do_write, daemon=True).start()
+
+    def reset_over_current(self):
+        """清除过流保护触发标志"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        def do_reset():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_OVER_CUR_RESET, 1)
+                        self.root.after(0, lambda: self.log("已清除过流保护触发标志"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"过流复位失败: {str(e)}"))
+        threading.Thread(target=do_reset, daemon=True).start()
+
+    def calibrate_current_offset(self):
+        """标定零点: 读取当前ADC值作为零电流参考
+        要求电机停止且无电流流过时执行"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        if not messagebox.askyesno("确认",
+                "标定零点前请确保:\n"
+                "1. 电机已停止 (未启动)\n"
+                "2. 无电流流过采样电阻\n"
+                "3. 电流采样电路已上电\n\n"
+                "确定执行零点标定吗?"):
+            return
+        def do_calib():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        # 读取实际电流寄存器, 提取ADC原始值
+                        # 实际电流 = (ADC - offset) * scale, 我们需要反推ADC
+                        # 但更直接的方式: 读取多个值取平均作为offset
+                        # 这里简化处理: 读实际电流值, 如果接近0就用当前offset
+                        # 实际上offset需要下位机配合, 我们这里只提示用户
+                        # 当前实现: 读取一次实际电流, 显示给用户参考
+                        data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_CURRENT_ACTUAL, 1)
+                        cur_raw = data[0]
+                        if cur_raw >= 0x8000:
+                            cur_raw -= 0x10000
+                        cur_A = cur_raw / 10.0 / 121.0
+                        self.root.after(0, lambda: messagebox.showinfo("标定结果",
+                            f"当前电流读数: {cur_A:.3f} A (相对值{cur_raw/10.0:.1f})\n\n"
+                            f"如果电机已停止且电流接近0, 说明当前offset={self.cur_offset_var.get()}正确。\n"
+                            f"如果电流偏离0较多, 需要手动调整零点ADC值后写入。\n\n"
+                            f"提示: 零点ADC = 当前ADC原始读数, 但需要下位机提供原始ADC值。"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"标定失败: {str(e)}"))
+        threading.Thread(target=do_calib, daemon=True).start()
+
     def toggle_monitor(self):
         """切换监控状态"""
         if self.monitoring:
@@ -1727,11 +2396,12 @@ class ModbusDebuggerApp:
                     continue
                 
                 try:
-                    # 读取状态寄存器（当前位置、速度、模式、状态、PWM输出、PID实时值）
+                    # 读取状态寄存器（当前位置、速度、模式、状态、PWM输出、PID实时值、电流实际/目标、ADC采样）
+                    # 0x0100~0x0115 共22个寄存器 (含REG_SUPPLY_VOLTAGE/EXT_ADC1/EXT_ADC2)
                     data = self.modbus.read_holding_registers(
                         self.get_slave_addr(),
                         self.REG_CURRENT_POS_H3,
-                        17
+                        22
                     )
                     # 读取目标位置寄存器（64位）
                     target_data = self.modbus.read_holding_registers(
@@ -1742,6 +2412,17 @@ class ModbusDebuggerApp:
                     start_flag_data = self.modbus.read_holding_registers(
                         self.get_slave_addr(),
                         self.REG_START_MODE,
+                        1
+                    )
+                    # 读取电流环使能+过流状态 (0x0045和0x004C, 不连续, 分2次读)
+                    cur_en_data = self.modbus.read_holding_registers(
+                        self.get_slave_addr(),
+                        self.REG_CUR_LOOP_EN,
+                        1
+                    )
+                    over_cur_data = self.modbus.read_holding_registers(
+                        self.get_slave_addr(),
+                        self.REG_OVER_CUR_STATUS,
                         1
                     )
                     # 方向寄存器每20次才读1次（方向很少变化，减少通信占用）
@@ -1782,6 +2463,13 @@ class ModbusDebuggerApp:
                 homing_active = (status & 0x4000) != 0
                 homing_failed = (status & 0x2000) != 0
                 stall_tripped = (status & 0x1000) != 0
+                pb4_high = (status & 0x0400) != 0  # bit10 = PB4电平
+                pb5_high = (status & 0x0200) != 0  # bit9  = PB5电平
+                # ADC采样值(0x0113~0x0115 = data[19]~data[21])
+                supply_voltage_raw = data[19]   # 供电电压(单位0.01V)
+                ext_adc1_raw = data[20]         # 外部ADC1(PC2, 0~4095)
+                ext_adc2_raw = data[21]         # 外部ADC2(PC3, 0~4095)
+                supply_voltage_V = supply_voltage_raw / 100.0  # 转换为V
 
                 # 解析PWM输出 (16位有符号, 范围-1000~+1000, 转换为百分比)
                 pwm_raw = data[8]
@@ -1790,7 +2478,7 @@ class ModbusDebuggerApp:
                 pwm_percent = pwm_raw / 10.0  # -1000~+1000 -> -100.0%~+100.0%
 
                 # 更新界面
-                mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度"}
+                mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度", 6: "待机", 7: "ADC转速", 8: "ADC位置转速", 9: "ADC开环", 10: "ADC位置"}
 
                 self.root.after(0, lambda p=position: self.status_labels['position'].config(text=str(p)))
                 self.root.after(0, lambda tp=target_position: self.status_labels['target_position'].config(text=str(tp)))
@@ -1807,6 +2495,28 @@ class ModbusDebuggerApp:
                 self.root.after(0, lambda tripped=stall_tripped: self.status_labels['stall'].config(
                     text="已触发" if tripped else "正常",
                     foreground="red" if tripped else "gray"
+                ))
+                # ADC采样值标签更新
+                self.root.after(0, lambda v=supply_voltage_V: self.status_labels['supply_voltage'].config(
+                    text=f"{v:.2f}V",
+                    foreground="red" if v < 18.0 else "teal"  # <18V显示红色告警(典型24V系统)
+                ))
+                self.root.after(0, lambda v=ext_adc1_raw: self.status_labels['ext_adc1'].config(
+                    text=f"{v}",
+                    foreground="teal"
+                ))
+                self.root.after(0, lambda v=ext_adc2_raw: self.status_labels['ext_adc2'].config(
+                    text=f"{v}",
+                    foreground="teal"
+                ))
+                # PB4/PB5引脚电平标签更新(高电平=绿色"高", 低电平=灰色"低")
+                self.root.after(0, lambda h=pb4_high: self.status_labels['pb4_level'].config(
+                    text="高" if h else "低",
+                    foreground="green" if h else "gray"
+                ))
+                self.root.after(0, lambda h=pb5_high: self.status_labels['pb5_level'].config(
+                    text="高" if h else "低",
+                    foreground="green" if h else "gray"
                 ))
                 # PWM显示：带方向颜色（正=红, 负=蓝, 零=灰）
                 def update_pwm(p):
@@ -1832,6 +2542,33 @@ class ModbusDebuggerApp:
                 self.root.after(0, lambda p=pid_p: self.status_labels['pid_p'].config(text=f"{p:+.2f}"))
                 self.root.after(0, lambda i=pid_i: self.status_labels['pid_i'].config(text=f"{i:+.2f}"))
                 self.root.after(0, lambda d=pid_d: self.status_labels['pid_d'].config(text=f"{d:+.2f}"))
+
+                # 解析电流环状态 (data[17]=电流实际, data[18]=电流目标, 均为×10有符号)
+                cur_actual_raw = data[17]
+                if cur_actual_raw >= 0x8000:
+                    cur_actual_raw -= 0x10000
+                cur_target_raw = data[18]
+                if cur_target_raw >= 0x8000:
+                    cur_target_raw -= 0x10000
+                # 相对值×10 → 安培: 1A ≈ 121相对单位
+                cur_actual_A = cur_actual_raw / 10.0 / 121.0
+                cur_target_A = cur_target_raw / 10.0 / 121.0
+                cur_en = cur_en_data[0] != 0
+                over_cur_tripped = over_cur_data[0] != 0
+
+                def update_cur_actual(a):
+                    color = "red" if abs(a) > 5.0 else ("orange" if abs(a) > 2.0 else "teal")
+                    self.status_labels['current_actual'].config(
+                        text=f"{a:+.2f} A", foreground=color)
+                self.root.after(0, lambda a=cur_actual_A: update_cur_actual(a))
+                self.root.after(0, lambda a=cur_target_A: self.status_labels['current_target'].config(
+                    text=f"{a:+.2f} A", foreground="teal"))
+                self.root.after(0, lambda t=over_cur_tripped: self.status_labels['over_current'].config(
+                    text="已触发" if t else "正常",
+                    foreground="red" if t else "gray"))
+                self.root.after(0, lambda e=cur_en: self.status_labels['cur_loop'].config(
+                    text="开启" if e else "关闭",
+                    foreground="green" if e else "gray"))
                 
                 # 方向寄存器读取成功才更新
                 if dir_data is not None:
@@ -1920,11 +2657,19 @@ class ModbusDebuggerApp:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"设置采集类型失败: {e}"))
         threading.Thread(target=_worker, daemon=True).start()
 
-    # 采集类型映射表: 0=转速, 1=PWM, 2=位置
-    _ACQ_LABELS = {0: "转速", 1: "PWM输出", 2: "位置"}
-    _ACQ_Y_LABELS = {0: "转速 (脉冲/秒)", 1: "PWM输出", 2: "位置偏移 (脉冲)"}
-    _ACQ_TITLES = {0: "转速采集曲线", 1: "PWM采集曲线", 2: "位置采集曲线"}
-    _ACQ_LABEL_TO_TYPE = {"转速": 0, "PWM": 1, "位置": 2}
+    # 采集类型映射表: 0=转速, 1=PWM, 2=位置, 3=电流, 4=PC0电压ADC, 5=PC2外部ADC, 6=PC3外部ADC
+    _ACQ_LABELS = {0: "转速", 1: "PWM输出", 2: "位置", 3: "电流",
+                   4: "PC0电压ADC", 5: "PC2外部ADC", 6: "PC3外部ADC"}
+    _ACQ_Y_LABELS = {0: "转速 (脉冲/秒)", 1: "PWM输出", 2: "位置偏移 (脉冲)", 3: "电流 (A)",
+                     4: "供电电压 (V)", 5: "PC2外部ADC原始值 (0~4095)", 6: "PC3外部ADC原始值 (0~4095)"}
+    _ACQ_TITLES = {0: "转速采集曲线", 1: "PWM采集曲线", 2: "位置采集曲线", 3: "电流采集曲线",
+                   4: "供电电压采集曲线", 5: "PC2外部ADC采集曲线", 6: "PC3外部ADC采集曲线"}
+    # 数据换算系数: 原始值 × 系数 + 偏置 = 显示值
+    # 电流: 相对值±1000=±8.25A → A = 相对值 × 0.00825
+    # PC0电压: ADC 0~4095, 100K:10K分压×11, 3.3V参考 → V = ADC × 3.3×11/4095
+    _ACQ_SCALE = {3: 0.00825, 4: 3.3 * 11.0 / 4095.0}
+    _ACQ_LABEL_TO_TYPE = {"转速": 0, "PWM": 1, "位置": 2, "电流": 3,
+                          "PC0电压ADC": 4, "PC2外部ADC": 5, "PC3外部ADC": 6}
 
     def _current_acq_type(self):
         """当前采集类型 0=转速 1=PWM 2=位置"""
@@ -2061,11 +2806,17 @@ class ModbusDebuggerApp:
         acq_type = self._current_acq_type()
         y_label = self._acq_y_label(acq_type)
         title = self._acq_title(acq_type)
+        # 电流/电压类型: 将原始值换算为带物理单位的值
+        scale = self._ACQ_SCALE.get(acq_type)
+        if scale is not None:
+            plot_data = [v * scale for v in speed_data]
+        else:
+            plot_data = speed_data
         self.speed_ax.clear()
-        self.speed_ax.plot(range(len(speed_data)), speed_data, 'b-', linewidth=0.8)
+        self.speed_ax.plot(range(len(plot_data)), plot_data, 'b-', linewidth=0.8)
         self.speed_ax.set_xlabel("采样点")
         self.speed_ax.set_ylabel(y_label)
-        self.speed_ax.set_title(f"{title} ({len(speed_data)}点)")
+        self.speed_ax.set_title(f"{title} ({len(plot_data)}点)")
         self.speed_ax.grid(True)
         self.speed_fig.tight_layout()
         self.speed_canvas.draw()

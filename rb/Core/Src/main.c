@@ -42,8 +42,10 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 TIM_HandleTypeDef htim1;
-TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 
@@ -57,11 +59,12 @@ MB_Context_t mb_ctx;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM1_Init(void);
-static void MX_TIM2_Init(void);
+static void MX_ADC1_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -100,11 +103,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM3_Init();
   MX_TIM4_Init();
   MX_USART1_UART_Init();
   MX_TIM1_Init();
-  MX_TIM2_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
   /* 初始化电机控读取PID: 位置�???? Kp=7.00 Ki=10.00 Kd=0.10 | 速度�???? Kp=0.30 Ki=3.00 Kd=0.00�????? */
   MotorControl_Init(&motor, 7.0f, 10.1f, 0.1f, 0.30f, 3.0f, 0.0f, 1, 900);
@@ -124,15 +128,19 @@ int main(void)
   if (motor.home_auto_start) {
     MotorControl_StartHoming(&motor);
   }
-  /* 启动TIM1 100us中断（MODBUS帧间超时�?????�??? + PID定时器滴答，TIM2已释放可他用�??? */
+  /* 启动TIM1 100us中断（MODBUS帧间超时 + PID定时器滴答 */
   HAL_TIM_Base_Start_IT(&htim1);
+  /* TIM1固定优先级1(覆盖CubeMX在MspInit中的默认值2, 不再随脉冲模式动态切换)
+   * EXTI脉冲中断同为优先级1, 同级不互相抢占, 靠硬件PR锁存保证不丢脉冲 */
+  HAL_NVIC_SetPriority(TIM1_UP_IRQn, 1, 0);
 
-  /* 启动UART中断接收（�?�字节，由HAL_UART_RxCpltCallback处理�????? */
+  /* 启动UART中断接收（每字节，由HAL_UART_RxCpltCallback处理） */
   HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1);
 
-  /* TIM2启停和ARR由MotorControl_UpdateIrqPriority统一管理:
-   *   有脉冲输入(PB4或PB5=PIN_FUNC_PULSE)时启动TIM2
-   *   无脉冲输入时关闭TIM2, 释放CPU给USART1等 */
+  /* EXTI外部中断由MotorControl_UpdateIrqPriority统一配置:
+   *   PB4/PB5配置为PIN_FUNC_PULSE时, 启用EXTI边沿触发(优先级1, 与TIM1同级)
+   *   无脉冲输入时关闭EXTI NVIC, 释放CPU给USART1等
+   * 注: TIM2已释放可作其他用途, 由EXTI4/EXTI9_5中断直接处理脉冲边沿 */
   MotorControl_UpdateIrqPriority();
   HAL_NVIC_SetPriority(USART1_IRQn, 3, 0);
   /* USER CODE END 2 */
@@ -147,16 +155,59 @@ int main(void)
 	  int64_t now = SYS_GetTimeMs();
 	  if (now - last_500ms >= 500) {
 		  last_500ms = now;
-		  // 你的逻辑
+	  }
+
+	  /* ========== LED1 状态指示灯 ==========
+	   * 正常状态：常亮（高电平）
+	   * 异常状态（复位中/复位失败/堵转/过流）：闪烁（200ms周期，约5Hz） */
+	  {
+		  uint8_t has_fault = 0;
+		  if (MotorControl_IsHoming())           has_fault = 1;  /* 正在复位 */
+		  else if (MotorControl_HomingFailed())  has_fault = 1;  /* 复位失败 */
+		  else if (MotorControl_IsStallTripped()) has_fault = 1; /* 堵转保护 */
+		  else if (motor.over_current_tripped)   has_fault = 1;  /* 过流保护 */
+
+		  if (has_fault) {
+			  static int64_t last_led1_toggle = 0;
+			  if (now - last_led1_toggle >= 200) {
+				  last_led1_toggle = now;
+				  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+			  }
+		  } else {
+			  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);  /* 常亮（高电平） */
+		  }
+	  }
+
+	  /* ========== LED2 通讯状态指示灯 ==========
+	   * 收到MODBUS帧时点亮50ms，平时熄灭 */
+	  {
+		  static uint32_t last_rx_count = 0;
+		  static int64_t led2_on_time = 0;
+		  if (mb_ctx.rx_count != last_rx_count) {
+			  last_rx_count = mb_ctx.rx_count;
+			  led2_on_time = now;
+			  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+		  } else if (now - led2_on_time >= 50) {
+			  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+		  }
 	  }
 
 	  // 示例：每 2 秒执行一�????
 	  static int64_t last_2s = 0;
+	  static int64_t aaa = 0;
 	  if (now - last_2s >= 5000) {
 		  last_2s = now;
 		  // 你的逻辑
-		  //MotorControl_SetMode(&motor, SPEED_MODE);
-		  //MotorControl_SetSpeed(&motor, 2000.0f);  // 2000 脉冲/秒
+//		  if(aaa == 0){
+//			  MotorControl_SetTarget(&motor, 65550);
+//			  MODBUS_SyncTargetPosition(65550);
+//			  aaa=1;
+//		  }else
+//		  if(aaa == 1){
+//			  MotorControl_SetTarget(&motor, 65500);
+//			  MODBUS_SyncTargetPosition(65500);
+//			  aaa = 0;
+//		  }
 		 //Motor_Start();
 	  }
     /* USER CODE END WHILE */
@@ -240,7 +291,54 @@ int main(void)
     //         MODBUS_SyncTargetPosition(8000);      // 同步pending，上位机可见
     //     }
     // }
+	  // 实验轨迹：总时长 150ms，分为 4 段
+	          //   0～30ms  静止在 0
+	          //  30～70ms  从 0  匀速到 2000（40ms 内走 2000）
+	          //  70～110ms 从 2000 匀速到 4000
+	          // 110～150ms 从 4000 匀速回到 0
+	          // 150ms 后  停止
+	  if(1){
+		  static uint8_t exp_run = 1;
+	  static int64_t exp_start = 0;
+	  static int64_t exp_last_tgt = -1;
+	  static uint8_t exp_reset_done = 0;          /* 复位是否已执行过，保证只触发一次 */
 
+
+
+
+          if (exp_run) {
+              int64_t et = now - exp_start;
+              int64_t tgt = 0;
+
+              if (et < 30000) {
+                  tgt = 0; //小于30秒时执行一次复位
+                  if (!exp_reset_done) {
+                      exp_reset_done = 1;
+                      MotorControl_SetMode(&motor, POSITION_MODE);
+                      MotorControl_StartHoming(&motor);   /* 按 home_mode 配置启动一次回零复位 */
+                  }
+              } else if (et < 70000) {
+	                  float p = (float)(et - 30000) / 40000.0f;
+	                  tgt = (int64_t)(2000.0f * p);
+	              } else if (et < 110000) {
+	                  float p = (float)(et - 70000) / 40000.0f;
+	                  tgt = 2000 + (int64_t)(2000.0f * p);
+	              } else if (et < 150000) {
+	                  float p = (float)(et - 110000) / 40000.0f;
+	                  tgt = 4000 - (int64_t)(4000.0f * p);
+	              } else {
+	                  exp_run = 0;
+	                  tgt = 0;
+
+	              }
+
+	              if (tgt != exp_last_tgt) {
+	                  exp_last_tgt = tgt;
+	                  MotorControl_SetTarget(&motor, tgt);
+	                  MODBUS_SyncTargetPosition(tgt);
+	              }
+	          }
+	  }
     /* ============ 系统任务（勿删）============ */
 
     /* 处理PB4/PB5输入引脚 */
@@ -265,6 +363,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -293,6 +392,91 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV8;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 4;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_11;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_7CYCLES_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_10;
+  sConfig.Rank = ADC_REGULAR_RANK_2;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_12;
+  sConfig.Rank = ADC_REGULAR_RANK_3;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_13;
+  sConfig.Rank = ADC_REGULAR_RANK_4;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+  /* STM32F1的ADC必须执行校准, 否则HAL_ADC_Start_DMA会卡死或转换结果异常
+   * 校准必须在ADC关闭状态下执行, HAL_ADCEx_Calibration_Start内部会先关ADC再校准 */
+  if (HAL_ADCEx_Calibration_Start(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -338,56 +522,6 @@ static void MX_TIM1_Init(void)
   /* USER CODE BEGIN TIM1_Init 2 */
 
   /* USER CODE END TIM1_Init 2 */
-
-}
-
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 639;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 639;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -545,6 +679,22 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -561,25 +711,19 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, LED1_Pin|LED2_Pin|DE_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : ininini_Pin */
-  GPIO_InitStruct.Pin = ininini_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(ininini_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : DE_Pin */
-  GPIO_InitStruct.Pin = DE_Pin;
+  /*Configure GPIO pins : LED1_Pin LED2_Pin DE_Pin */
+  GPIO_InitStruct.Pin = LED1_Pin|LED2_Pin|DE_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(DE_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB4 PB5 */
   GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */

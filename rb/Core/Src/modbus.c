@@ -25,6 +25,10 @@ static int32_t pending_target_speed = 0;
 static uint8_t config_dirty = 0;
 static uint32_t pending_baud_rate = 0;
 
+/* 全局MODBUS上下文指针，供 MODBUS_TriggerStartFlag 等外部触发接口使用
+ * 在 MODBUS_Init 中保存，主循环与外部触发同上下文，无需额外同步 */
+static MB_Context_t *g_mb_ctx = NULL;
+
 static const uint32_t supported_baud_rates[] = {9600, 19200, 38400, 57600, 115200};
 
 uint8_t MODBUS_IsSupportedBaud(uint32_t baud_rate)
@@ -151,6 +155,7 @@ void MODBUS_Init(MB_Context_t *ctx, uint8_t slave_addr, MotorControl_t *motor)
     pending_target_speed = 0;
     config_dirty = 0;
     pending_baud_rate = 0;
+    g_mb_ctx = ctx;  /* 保存上下文指针供外部触发接口使用 */
 }
 
 /**
@@ -250,7 +255,7 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
     MotorControl_t *mc = ctx->motor;
     
     /* 状态寄存器（只读） */
-    if (addr >= 0x0100 && addr <= 0x0110) {
+    if (addr >= 0x0100 && addr <= 0x0115) {
         switch (addr) {
             case REG_CURRENT_POS_H3:
                 return (uint16_t)(Encoder_GetCount() >> 48);
@@ -266,12 +271,22 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return (uint16_t)((int32_t)Encoder_GetSpeed() & 0xFFFF);
             case REG_CURRENT_MODE:
                 return MotorControl_GetMode(mc);
-            case REG_STATUS:
-                return (start_flag_set ? 0x8000 : 0) |
-                       (MotorControl_IsHoming() ? 0x4000 : 0) |
-                       (MotorControl_HomingFailed() ? 0x2000 : 0) |
-                       (MotorControl_IsStallTripped() ? 0x1000 : 0) |
-                       (mc->mode & 0x0F);
+            case REG_STATUS: {
+                /* 状态字位定义见 modbus.h STATUS_xxx 宏
+                 * PB4/PB5电平直接读GPIOB IDR, 与引脚功能配置无关,
+                 * 上位机可实时显示引脚当前电平用于调试 */
+                uint8_t pb4 = (GPIOB->IDR & GPIO_PIN_4) ? 1 : 0;
+                uint8_t pb5 = (GPIOB->IDR & GPIO_PIN_5) ? 1 : 0;
+                uint16_t status = (start_flag_set ? STATUS_START_FLAG : 0) |
+                                  (MotorControl_IsHoming() ? STATUS_HOMING : 0) |
+                                  (MotorControl_HomingFailed() ? STATUS_HOMING_FAILED : 0) |
+                                  (MotorControl_IsStallTripped() ? STATUS_STALL_TRIPPED : 0) |
+                                  (MotorControl_IsOverCurrentTripped() ? STATUS_OVER_CUR_TRIPPED : 0) |
+                                  (pb4 ? STATUS_PB4_LEVEL : 0) |
+                                  (pb5 ? STATUS_PB5_LEVEL : 0) |
+                                  (mc->mode & CTRL_MODE_MASK);
+                return status;
+            }
             case REG_CURRENT_PWM:
                 return (uint16_t)MotorControl_GetPWM();
             case REG_PID_ERROR_H:
@@ -290,6 +305,22 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return (uint16_t)((int32_t)(mc->pid_d * 100) >> 16);
             case REG_PID_D_L:
                 return (uint16_t)((int32_t)(mc->pid_d * 100) & 0xFFFF);
+            case REG_CURRENT_ACTUAL:
+                /* 实际电流(相对值×10, 有符号) */
+                return (uint16_t)(int16_t)(mc->current_actual * 10);
+            case REG_CURRENT_TARGET_RO:
+                /* 电流目标(相对值×10, 有符号) */
+                return (uint16_t)(int16_t)(mc->current_target * 10);
+            case REG_SUPPLY_VOLTAGE:
+                /* 供电电压(单位0.01V), PC0分压100K:10K, 实际电压=ADC电压×11
+                 * 例: 3300 = 33.00V, 2400 = 24.00V, 上限约363.0V (12位ADC满量程) */
+                return (uint16_t)(MotorControl_GetSupplyVoltage() * 100.0f + 0.5f);
+            case REG_EXT_ADC1:
+                /* 外部ADC1原始值(PC2, 12位 0~4095) */
+                return MotorControl_GetExternalADC(0);
+            case REG_EXT_ADC2:
+                /* 外部ADC2原始值(PC3, 12位 0~4095) */
+                return MotorControl_GetExternalADC(1);
         }
     }
 
@@ -334,9 +365,81 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return 0;  /* 写触发型寄存器, 读取始终返回0 */
         }
     }
+
+    /* 电流环寄存器 0x0045~0x004D (新增) */
+    if (addr >= REG_CUR_LOOP_EN && addr <= REG_OVER_CUR_RESET) {
+        switch (addr) {
+            case REG_CUR_LOOP_EN:
+                return mc->current_loop_en ? 1 : 0;
+            case REG_CUR_KP:
+                return (uint16_t)(int16_t)(mc->cur_Kp * 100);
+            case REG_CUR_KI:
+                return (uint16_t)(int16_t)(mc->cur_Ki * 100);
+            case REG_CUR_KD:
+                return (uint16_t)(int16_t)(mc->cur_Kd * 1000);  /* D项×1000, 3位小数 */
+            case REG_CUR_OFFSET:
+                return mc->current_offset;
+            case REG_CUR_SCALE:
+                return (uint16_t)(mc->current_scale * 10000);  /* 4位小数 */
+            case REG_OVER_CUR_LIMIT:
+                return (uint16_t)(int16_t)(mc->over_current_limit * 10);  /* ×10, 1位小数 */
+            case REG_OVER_CUR_STATUS:
+                return mc->over_current_tripped ? 1 : 0;
+            case REG_OVER_CUR_RESET:
+                return 0;  /* 写触发型寄存器, 读取始终返回0 */
+        }
+    }
+
+    /* PC2/PC3 ADC功能寄存器 0x004E~0x0061 (新增双死区) */
+    if (addr >= REG_PC2_FUNC && addr <= REG_ADC_DEAD_ZONE2_WIDTH) {
+        switch (addr) {
+            case REG_PC2_FUNC:
+                return mc->pc2_func;
+            case REG_PC3_FUNC:
+                return mc->pc3_func;
+            case REG_ADC_MAX_SPEED_H:
+                return (uint16_t)((int32_t)mc->adc_max_speed >> 16);
+            case REG_ADC_MAX_SPEED_L:
+                return (uint16_t)((int32_t)mc->adc_max_speed & 0xFFFF);
+            case REG_ADC_MAX_PWM:
+                return (uint16_t)(int16_t)mc->adc_max_pwm;
+            case REG_ADC_MAX_POS_H3:
+                return (uint16_t)((uint64_t)mc->adc_max_position >> 48);
+            case REG_ADC_MAX_POS_H2:
+                return (uint16_t)((uint64_t)mc->adc_max_position >> 32);
+            case REG_ADC_MAX_POS_L2:
+                return (uint16_t)((uint64_t)mc->adc_max_position >> 16);
+            case REG_ADC_MAX_POS_L1:
+                return (uint16_t)((uint64_t)mc->adc_max_position & 0xFFFF);
+            /* ADC最小值寄存器(新增) */
+            case REG_ADC_MIN_SPEED_H:
+                return (uint16_t)((int32_t)mc->adc_min_speed >> 16);
+            case REG_ADC_MIN_SPEED_L:
+                return (uint16_t)((int32_t)mc->adc_min_speed & 0xFFFF);
+            case REG_ADC_MIN_PWM:
+                return (uint16_t)(int16_t)mc->adc_min_pwm;
+            case REG_ADC_MIN_POS_H3:
+                return (uint16_t)((uint64_t)mc->adc_min_position >> 48);
+            case REG_ADC_MIN_POS_H2:
+                return (uint16_t)((uint64_t)mc->adc_min_position >> 32);
+            case REG_ADC_MIN_POS_L2:
+                return (uint16_t)((uint64_t)mc->adc_min_position >> 16);
+            case REG_ADC_MIN_POS_L1:
+                return (uint16_t)((uint64_t)mc->adc_min_position & 0xFFFF);
+            /* ADC死区寄存器(新增, 双死区) */
+            case REG_ADC_DEAD_ZONE1_POS:
+                return mc->adc_dead_zone1_pos;
+            case REG_ADC_DEAD_ZONE1_WIDTH:
+                return mc->adc_dead_zone1_width;
+            case REG_ADC_DEAD_ZONE2_POS:
+                return mc->adc_dead_zone2_pos;
+            case REG_ADC_DEAD_ZONE2_WIDTH:
+                return mc->adc_dead_zone2_width;
+        }
+    }
     
     /* 控制寄存器（可读写） */
-    if (addr >= 0x0000 && addr <= 0x0039) {
+    if (addr >= 0x0000 && addr <= 0x0038) {
         switch (addr) {
             case REG_CONTROL_WORD:
                 return pending_control_word & CTRL_MODE_MASK;
@@ -452,8 +555,6 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return (uint16_t)((int32_t)mc->pin5_target_speed >> 16);
             case REG_INPUT2_TARGET_SPEED_L:
                 return (uint16_t)((int32_t)mc->pin5_target_speed & 0xFFFF);
-            case REG_TIM2_ARR:
-                return (uint16_t)mc->tim2_arr;
         }
     }
     
@@ -491,6 +592,26 @@ static void MODBUS_ApplyMode(MB_Context_t *ctx, uint8_t mode, uint8_t sync_curre
     MODBUS_ApplyTarget(ctx);
 }
 
+/* 触发启动标志位 (等同于上位机写 REG_START_MODE=1)
+ * 供 PB4/PB5 配置为 PIN_FUNC_START_FLAG 时由硬件有效边沿触发调用,
+ * 实现"上位机批量下发目标 + 硬件信号同步启动"的多电机同步启动场景:
+ *   1. 上位机向各电机(标志位启动模式)下发模式/目标位置/目标速度(仅缓存不执行)
+ *   2. 同一硬件信号接入各电机 PB4/PB5, 信号跳变时各电机同时应用缓存目标
+ * 仅当 start_mode=1 时有效; start_mode=0(直接启动)时调用本函数无动作. */
+void MODBUS_TriggerStartFlag(void)
+{
+    if (!g_mb_ctx) return;
+    MotorControl_t *mc = g_mb_ctx->motor;
+    if (mc->start_mode) {
+        MotorMode_t old_mode = mc->mode;
+        start_flag_set = 1;
+        MODBUS_ApplyMode(g_mb_ctx, pending_control_word & CTRL_MODE_MASK, 0);
+        if (mc->mode != old_mode) {
+            config_dirty = 1;
+        }
+    }
+}
+
 /**
   * @brief  写入寄存器值
   * @param  ctx: MODBUS上下文
@@ -504,7 +625,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
     uint8_t need_apply = 0;  /* 标记是否需要立即应用目标值 */
     
     /* 只读寄存器 */
-    if (addr >= 0x0100 && addr <= 0x0110) {
+    if (addr >= 0x0100 && addr <= 0x0115) {
         return;
     }
     /* 转速数据寄存器只读 0x0200~0x03FF */
@@ -513,11 +634,11 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
     }
     
     /* 控制寄存器 */
-    if (addr >= 0x0000 && addr <= 0x0039) {
+    if (addr >= 0x0000 && addr <= 0x0038) {
         switch (addr) {
             case REG_CONTROL_WORD:
                 pending_control_word = value & CTRL_MODE_MASK;
-                if ((pending_control_word & CTRL_MODE_MASK) > MODE_EXTERNAL_TARGET_SPEED) {
+                if ((pending_control_word & CTRL_MODE_MASK) > MODE_ADC_POSITION) {
                     pending_control_word = mc->mode;
                     break;
                 }
@@ -683,7 +804,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 config_dirty = 1;
                 break;
             case REG_INPUT1_FUNC:
-                if (value <= PIN_FUNC_NONE) {
+                if (value <= PIN_FUNC_START_FLAG) {
                     mc->pin4_func = (uint8_t)value;
                     config_dirty = 1;
                     MotorControl_UpdateIrqPriority();
@@ -692,13 +813,17 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
             case REG_INPUT1_POLARITY:
                 mc->pin4_polarity = (value != 0) ? 1 : 0;
                 config_dirty = 1;
+                /* 极性变更后必须重新配置EXTI触发沿(上升沿↔下降沿) */
+                if (mc->pin4_func == PIN_FUNC_PULSE) {
+                    MotorControl_UpdateIrqPriority();
+                }
                 break;
             case REG_INPUT1_LIMIT_DIR:
                 mc->pin4_limit_dir = (value != 0) ? 1 : 0;
                 config_dirty = 1;
                 break;
             case REG_INPUT2_FUNC:
-                if (value <= PIN_FUNC_NONE) {
+                if (value <= PIN_FUNC_START_FLAG) {
                     mc->pin5_func = (uint8_t)value;
                     config_dirty = 1;
                     MotorControl_UpdateIrqPriority();
@@ -707,6 +832,10 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
             case REG_INPUT2_POLARITY:
                 mc->pin5_polarity = (value != 0) ? 1 : 0;
                 config_dirty = 1;
+                /* 极性变更后必须重新配置EXTI触发沿(上升沿↔下降沿) */
+                if (mc->pin5_func == PIN_FUNC_PULSE) {
+                    MotorControl_UpdateIrqPriority();
+                }
                 break;
             case REG_INPUT2_LIMIT_DIR:
                 mc->pin5_limit_dir = (value != 0) ? 1 : 0;
@@ -784,13 +913,6 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 mc->pin5_target_speed = (int32_t)(((uint32_t)mc->pin5_target_speed & 0xFFFF0000) | value);
                 config_dirty = 1;
                 break;
-            case REG_TIM2_ARR:
-                if (value >= 99 && value <= 65535) {
-                    mc->tim2_arr = value;
-                    config_dirty = 1;
-                    MotorControl_ApplyTim2Arr();
-                }
-                break;
         }
     }
 
@@ -819,7 +941,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 }
                 break;
             case REG_SPEED_ACQ_TYPE:
-                if (value <= 2) {
+                if (value <= 6) {
                     mc->speed_acq_type = (uint8_t)value;
                 }
                 break;
@@ -840,12 +962,15 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
         switch (addr) {
             case REG_STALL_PROT_EN:
                 mc->stall_protect_en = value ? 1 : 0;
+                config_dirty = 1;
                 break;
             case REG_STALL_ERR_LIMIT:
                 mc->stall_err_limit = (int32_t)(int16_t)value;  /* 允许负值(无意义但兼容) */
+                config_dirty = 1;
                 break;
             case REG_STALL_TIME:
                 mc->stall_time_ticks = value;
+                config_dirty = 1;
                 break;
             case REG_STALL_RESET:
                 if (value == 1) {
@@ -854,6 +979,164 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 break;
             case REG_STALL_STATUS:
                 /* 只读寄存器，忽略写入 */
+                break;
+        }
+    }
+
+    /* 电流环控制寄存器 0x0045~0x004D (新增) */
+    if (addr >= REG_CUR_LOOP_EN && addr <= REG_OVER_CUR_RESET) {
+        switch (addr) {
+            case REG_CUR_LOOP_EN:
+                MotorControl_EnableCurrentLoop(mc, value ? 1 : 0);
+                config_dirty = 1;
+                break;
+            case REG_CUR_KP:
+            case REG_CUR_KI:
+            case REG_CUR_KD: {
+                float Kp = mc->cur_Kp;
+                float Ki = mc->cur_Ki;
+                float Kd = mc->cur_Kd;
+                if (addr == REG_CUR_KP) Kp = (float)(int16_t)value / 100.0f;
+                if (addr == REG_CUR_KI) Ki = (float)(int16_t)value / 100.0f;
+                if (addr == REG_CUR_KD) Kd = (float)(int16_t)value / 1000.0f;
+                MotorControl_SetCurPID(mc, Kp, Ki, Kd);
+                config_dirty = 1;
+                break;
+            }
+            case REG_CUR_OFFSET:
+                if (value <= 4095) {
+                    MotorControl_SetCurrentCalib(mc, value, mc->current_scale);
+                    config_dirty = 1;
+                }
+                break;
+            case REG_CUR_SCALE:
+                if (value > 0) {
+                    MotorControl_SetCurrentCalib(mc, mc->current_offset, (float)value / 10000.0f);
+                    config_dirty = 1;
+                }
+                break;
+            case REG_OVER_CUR_LIMIT:
+                MotorControl_SetOverCurrentLimit(mc, (float)(int16_t)value / 10.0f);
+                config_dirty = 1;
+                break;
+            case REG_OVER_CUR_RESET:
+                if (value == 1) {
+                    MotorControl_ResetOverCurrent(mc);
+                }
+                break;
+            case REG_OVER_CUR_STATUS:
+                /* 只读寄存器，忽略写入 */
+                break;
+        }
+    }
+
+    /* PC2/PC3 ADC功能寄存器 0x004E~0x0061 (新增双死区) */
+    if (addr >= REG_PC2_FUNC && addr <= REG_ADC_DEAD_ZONE2_WIDTH) {
+        switch (addr) {
+            case REG_PC2_FUNC:
+                if (value <= ADC_FUNC_POSITION) {
+                    mc->pc2_func = (uint8_t)value;
+                    config_dirty = 1;
+                }
+                break;
+            case REG_PC3_FUNC:
+                if (value <= ADC_FUNC_POSITION) {
+                    mc->pc3_func = (uint8_t)value;
+                    config_dirty = 1;
+                }
+                break;
+            case REG_ADC_MAX_SPEED_H:
+                mc->adc_max_speed = (mc->adc_max_speed & 0x0000FFFF) | ((int32_t)(int16_t)value << 16);
+                config_dirty = 1;
+                break;
+            case REG_ADC_MAX_SPEED_L:
+                mc->adc_max_speed = (mc->adc_max_speed & 0xFFFF0000) | (int32_t)value;
+                config_dirty = 1;
+                break;
+            case REG_ADC_MAX_PWM: {
+                int16_t pwm = (int16_t)value;
+                if (pwm > 1000) pwm = 1000;
+                if (pwm < -1000) pwm = -1000;
+                mc->adc_max_pwm = pwm;
+                config_dirty = 1;
+                break;
+            }
+            case REG_ADC_MAX_POS_H3:
+            case REG_ADC_MAX_POS_H2:
+            case REG_ADC_MAX_POS_L2:
+            case REG_ADC_MAX_POS_L1: {
+                /* 64位位置分4个16位寄存器写入, 使用掩码拼接 */
+                uint64_t mask = 0xFFFFULL;
+                uint8_t shift = 0;
+                switch (addr) {
+                    case REG_ADC_MAX_POS_H3: shift = 48; break;
+                    case REG_ADC_MAX_POS_H2: shift = 32; break;
+                    case REG_ADC_MAX_POS_L2: shift = 16; break;
+                    case REG_ADC_MAX_POS_L1: shift = 0;  break;
+                }
+                mc->adc_max_position = (int64_t)((((uint64_t)mc->adc_max_position) & ~(mask << shift)) |
+                                                  ((uint64_t)value << shift));
+                config_dirty = 1;
+                break;
+            }
+            /* ADC最小值寄存器写入(新增) */
+            case REG_ADC_MIN_SPEED_H:
+                mc->adc_min_speed = (mc->adc_min_speed & 0x0000FFFF) | ((int32_t)(int16_t)value << 16);
+                config_dirty = 1;
+                break;
+            case REG_ADC_MIN_SPEED_L:
+                mc->adc_min_speed = (mc->adc_min_speed & 0xFFFF0000) | (int32_t)value;
+                config_dirty = 1;
+                break;
+            case REG_ADC_MIN_PWM: {
+                int16_t pwm = (int16_t)value;
+                if (pwm > 1000) pwm = 1000;
+                if (pwm < -1000) pwm = -1000;
+                mc->adc_min_pwm = pwm;
+                config_dirty = 1;
+                break;
+            }
+            case REG_ADC_MIN_POS_H3:
+            case REG_ADC_MIN_POS_H2:
+            case REG_ADC_MIN_POS_L2:
+            case REG_ADC_MIN_POS_L1: {
+                uint64_t mask = 0xFFFFULL;
+                uint8_t shift = 0;
+                switch (addr) {
+                    case REG_ADC_MIN_POS_H3: shift = 48; break;
+                    case REG_ADC_MIN_POS_H2: shift = 32; break;
+                    case REG_ADC_MIN_POS_L2: shift = 16; break;
+                    case REG_ADC_MIN_POS_L1: shift = 0;  break;
+                }
+                mc->adc_min_position = (int64_t)((((uint64_t)mc->adc_min_position) & ~(mask << shift)) |
+                                                  ((uint64_t)value << shift));
+                config_dirty = 1;
+                break;
+            }
+            /* ADC死区寄存器写入(新增, 双死区) */
+            case REG_ADC_DEAD_ZONE1_POS:
+                if (value <= 2) {
+                    mc->adc_dead_zone1_pos = (uint8_t)value;
+                    config_dirty = 1;
+                }
+                break;
+            case REG_ADC_DEAD_ZONE1_WIDTH:
+                if (value <= 4095) {
+                    mc->adc_dead_zone1_width = (uint16_t)value;
+                    config_dirty = 1;
+                }
+                break;
+            case REG_ADC_DEAD_ZONE2_POS:
+                if (value <= 2) {
+                    mc->adc_dead_zone2_pos = (uint8_t)value;
+                    config_dirty = 1;
+                }
+                break;
+            case REG_ADC_DEAD_ZONE2_WIDTH:
+                if (value <= 4095) {
+                    mc->adc_dead_zone2_width = (uint16_t)value;
+                    config_dirty = 1;
+                }
                 break;
         }
     }
@@ -874,10 +1157,10 @@ static void MODBUS_ProcessReadHoldingRegs(MB_Context_t *ctx, uint16_t start_addr
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
-    /* 检查地址范围：控制寄存器 0x0000~0x0044, 状态寄存器 0x0100~0x0110, 数据寄存器 0x0200~0x15FF */
+    /* 检查地址范围：控制寄存器 0x0000~0x0061, 状态寄存器 0x0100~0x0115, 数据寄存器 0x0200~0x15FF */
     uint16_t end_addr = start_addr + quantity - 1;
-    if (!((start_addr <= 0x0044 && end_addr <= 0x0044) ||
-          (start_addr >= 0x0100 && end_addr <= 0x0110) ||
+    if (!((start_addr <= 0x0061 && end_addr <= 0x0061) ||
+          (start_addr >= 0x0100 && end_addr <= 0x0115) ||
           (start_addr >= REG_SPEED_DATA_BASE && end_addr <= REG_SPEED_DATA_END))) {
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
@@ -907,8 +1190,8 @@ static void MODBUS_ProcessWriteSingleReg(MB_Context_t *ctx, uint16_t addr, uint1
 {
     uint8_t old_slave_addr = ctx->slave_addr;
 
-    /* 检查地址范围 (控制寄存器 0x0000~0x0044 可写, 数据寄存器只读) */
-    if (addr > 0x0044) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x0061 可写, 状态/数据寄存器只读) */
+    if (addr > 0x0061) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_SINGLE_REG, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
@@ -936,8 +1219,8 @@ static void MODBUS_ProcessWriteMultipleRegs(MB_Context_t *ctx, uint16_t start_ad
     MotorControl_t *mc = ctx->motor;
     uint8_t old_slave_addr = ctx->slave_addr;
     pending_baud_rate = 0;
-    /* 检查地址范围 (控制寄存器 0x0000~0x0044 可写) */
-    if (quantity > 125 || start_addr + quantity > 0x0045) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x0061 可写) */
+    if (quantity > 125 || start_addr + quantity > 0x0062) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_MULTIPLE_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
