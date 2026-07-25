@@ -34,15 +34,18 @@ typedef enum {
     ADC_SPEED_MODE,          /* ADC转速模式：ADC值(0~1)×预设速度, 走速度PID */
     ADC_POSITION_SPEED_MODE, /* ADC位置转速模式：ADC值(0~1)×预设速度, 走位置速度PID */
     ADC_OPENLOOP_MODE,       /* ADC开环模式：ADC值(0~1)×预设PWM, 直接输出 */
-    ADC_POSITION_MODE        /* ADC位置模式：ADC值(0~1)×预设位置, 实时给目标位置走位置PID */
+    ADC_POSITION_MODE,       /* ADC位置模式：ADC值(0~1)×预设位置, 实时给目标位置走位置PID */
+    EXTERNAL_TARGET_POS_SPEED_MODE /* 外部目标位置速度模式：PB4/PB5电平选择目标速度, 位置按速度累加, 走位置PID(无累计误差) */
 } MotorMode_t;
 
 /* 判断模式是否基于位置PID (走位置环)
- * 包括: POSITION_MODE, VELOCITY_POSITION_MODE, EXTERNAL_TARGET_MODE, ADC_POSITION_MODE
+ * 包括: POSITION_MODE, VELOCITY_POSITION_MODE, EXTERNAL_TARGET_MODE, ADC_POSITION_MODE,
+ *       EXTERNAL_TARGET_POS_SPEED_MODE
  * 这些模式的目标位置都可通过步进加减速算法平滑 */
 static inline uint8_t MotorControl_IsPositionBasedMode(MotorMode_t mode) {
     return (mode == POSITION_MODE || mode == VELOCITY_POSITION_MODE ||
-            mode == EXTERNAL_TARGET_MODE || mode == ADC_POSITION_MODE);
+            mode == EXTERNAL_TARGET_MODE || mode == ADC_POSITION_MODE ||
+            mode == EXTERNAL_TARGET_POS_SPEED_MODE);
 }
 
 /* 电机方向: CW=正转(默认), CCW=反转 */
@@ -73,7 +76,7 @@ typedef enum {
     PIN_FUNC_HOME,              /* 原点位置开关：堵转/开关精确复位时检测此信号设定为零点 */
     PIN_FUNC_LIMIT,             /* 限位开关：停止该方向运动 */
     PIN_FUNC_TARGET_POS,        /* 外部目标位置电平：配合EXTERNAL_TARGET_MODE, 有效时到预设目标位置, 无效时回原点 */
-    PIN_FUNC_TARGET_SPEED,      /* 外部目标速度电平：配合EXTERNAL_TARGET_SPEED_MODE, 有效时到预设目标速度, 无效时停止 */
+    PIN_FUNC_TARGET_SPEED,      /* 外部目标速度电平：配合EXTERNAL_TARGET_SPEED_MODE/EXTERNAL_TARGET_POS_SPEED_MODE, 有效时到预设目标速度, 无效时停止 */
     PIN_FUNC_HOME_START,        /* 执行复位操作：按钮按下时启动一次复位流程(按home_mode配置执行) */
     PIN_FUNC_NONE,              /* 无功能：引脚不参与任何逻辑 */
     PIN_FUNC_STOP,              /* 停止功能：按钮按下时PWM输出为0，松开后恢复 */
@@ -168,7 +171,7 @@ typedef struct {
     MotorMode_t mode;
     float target_speed;
     int64_t target_position;
-    float target_pos_frac;  /* 位置速度模式：目标位置小数累加器 */
+    float target_pos_frac;  /* 位置速度模式/外部目标位置速度模式：目标位置小数累加器 */
     float integral;
     float prev_error;
     uint32_t last_tick;

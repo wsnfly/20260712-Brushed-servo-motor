@@ -735,7 +735,7 @@ static void MODBUS_ApplyTarget(MB_Context_t *ctx)
         } else {
             MotorControl_SetTarget(mc, pending_target_pos);
         }
-    } else if (mc->mode == SPEED_MODE || mc->mode == VELOCITY_POSITION_MODE || mc->mode == OPENLOOP_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE) {
+    } else if (mc->mode == SPEED_MODE || mc->mode == VELOCITY_POSITION_MODE || mc->mode == OPENLOOP_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE || mc->mode == EXTERNAL_TARGET_POS_SPEED_MODE) {
         MotorControl_SetSpeed(mc, (float)pending_target_speed);
     }
 }
@@ -752,7 +752,8 @@ static void MODBUS_ApplyMode(MB_Context_t *ctx, uint8_t mode, uint8_t sync_curre
         StepAccel_SyncPosition(Encoder_GetCount());
     }
     if (sync_current) {
-        if (mode == POSITION_MODE || mode == VELOCITY_POSITION_MODE || mode == EXTERNAL_TARGET_MODE) {
+        if (mode == POSITION_MODE || mode == VELOCITY_POSITION_MODE || mode == EXTERNAL_TARGET_MODE ||
+            mode == EXTERNAL_TARGET_POS_SPEED_MODE) {
             pending_target_pos = Encoder_GetCount();
             pending_target_speed = 0;
         } else if (mode == SPEED_MODE || mode == OPENLOOP_MODE || mode == EXTERNAL_TARGET_SPEED_MODE) {
@@ -808,7 +809,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
         switch (addr) {
             case REG_CONTROL_WORD:
                 pending_control_word = value & CTRL_MODE_MASK;
-                if ((pending_control_word & CTRL_MODE_MASK) > MODE_ADC_POSITION) {
+                if ((pending_control_word & CTRL_MODE_MASK) > MODE_EXTERNAL_TARGET_POS_SPEED) {
                     pending_control_word = mc->mode;
                     break;
                 }

@@ -264,7 +264,7 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         }
         mc->pin4_target_speed = (int32_t)cfg->pin4_target_speed;
         mc->pin5_target_speed = (int32_t)cfg->pin5_target_speed;
-        if (cfg->mode <= ADC_POSITION_MODE) {
+        if (cfg->mode <= EXTERNAL_TARGET_POS_SPEED_MODE) {
             mc->mode = (MotorMode_t)cfg->mode;
         }
         /* PB4/PB5功能枚举: 早期版本曾拆分TARGET为TARGET_POS/TARGET_SPEED,
@@ -980,13 +980,13 @@ void MotorControl_SetSpeed(MotorControl_t *mc, float speed)
 
 void MotorControl_SetMode(MotorControl_t *mc, MotorMode_t mode)
 {
-    if (mode > ADC_POSITION_MODE) {
+    if (mode > EXTERNAL_TARGET_POS_SPEED_MODE) {
         return;
     }
 
     if (mc->mode != mode) {
         if (mode == POSITION_MODE || mode == VELOCITY_POSITION_MODE || mode == EXTERNAL_TARGET_MODE ||
-            mode == ADC_POSITION_SPEED_MODE) {
+            mode == ADC_POSITION_SPEED_MODE || mode == EXTERNAL_TARGET_POS_SPEED_MODE) {
             /* 切到位置模式: 目标位置=当前实际位置, 防止位置误差导致突然运行 */
             mc->target_position = Encoder_GetCount();
             mc->target_pos_frac = 0.0f;
@@ -2097,6 +2097,35 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         }
     }
 
+    /* 外部目标位置速度模式：PB4优先于PB5；都无效时停止(速度=0)
+     * 与外部目标速度模式共用PIN_FUNC_TARGET_SPEED引脚和pin4/5_target_speed预设值,
+     * 但控制方式不同: 速度值不直接走速度PID, 而是按时间累加到目标位置
+     * (浮点小数累加器target_pos_frac, 无累计误差), 再走位置PID.
+     * 类似位置速度模式(VELOCITY_POSITION_MODE), 但速度值来自外部引脚而非寄存器下发.
+     * 直接写target_speed字段(不调SetSpeed), 避免每周期清积分导致位置环抖动 */
+    if (mc->mode == EXTERNAL_TARGET_POS_SPEED_MODE &&
+        (mc->pin4_func == PIN_FUNC_TARGET_SPEED || mc->pin5_func == PIN_FUNC_TARGET_SPEED)) {
+        uint8_t pin4 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) ? 1 : 0;
+        uint8_t pin5 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) ? 1 : 0;
+        if (mc->pin4_polarity == POLARITY_ACTIVE_LOW) pin4 = !pin4;
+        if (mc->pin5_polarity == POLARITY_ACTIVE_LOW) pin5 = !pin5;
+
+        uint8_t input = 0;
+        float target = 0.0f;
+        if (mc->pin4_func == PIN_FUNC_TARGET_SPEED && pin4) {
+            input = 4;
+            target = (float)mc->pin4_target_speed;
+        } else if (mc->pin5_func == PIN_FUNC_TARGET_SPEED && pin5) {
+            input = 5;
+            target = (float)mc->pin5_target_speed;
+        }
+
+        if (target_level_state != input || mc->target_speed != target) {
+            target_level_state = input;
+            mc->target_speed = target;
+        }
+    }
+
     /* 开环模式：目标速度直接映射到输出，受output_limit和最大运行速度限制 */
     if (mc->mode == OPENLOOP_MODE) {
         int32_t output = (int32_t)mc->target_speed;
@@ -2246,10 +2275,11 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
     }
 
     /* 基于位置的速度模式：目标位置按速度累加（浮点累加避免低速截断） */
-    if (mc->mode == VELOCITY_POSITION_MODE || mc->mode == ADC_POSITION_SPEED_MODE) {
+    if (mc->mode == VELOCITY_POSITION_MODE || mc->mode == ADC_POSITION_SPEED_MODE ||
+        mc->mode == EXTERNAL_TARGET_POS_SPEED_MODE) {
         float limited_speed = mc->target_speed;
         if (mc->max_run_speed > 0) limited_speed = clampf(limited_speed, -(float)mc->max_run_speed, (float)mc->max_run_speed);
-        if (mc->step_accel_en && mc->mode == VELOCITY_POSITION_MODE && !MotorControl_IsHoming()) {
+        if (mc->step_accel_en && (mc->mode == VELOCITY_POSITION_MODE || mc->mode == EXTERNAL_TARGET_POS_SPEED_MODE) && !MotorControl_IsHoming()) {
             /* 步进加减速: 速度累加到yudingweizhi, 算法生成平滑轨迹 */
             mc->target_pos_frac += limited_speed * dt;
             int64_t inc = (int64_t)mc->target_pos_frac;
@@ -2282,7 +2312,7 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         }
     } else {
         error = (float)(mc->target_position - current_position);
-        /* 位置模式/外部目标位置模式走死区；位置速度模式不走死区（目标持续移动，死区会导致脉冲式运动） */
+        /* 位置模式/外部目标位置模式走死区；位置速度模式/外部目标位置速度模式不走死区（目标持续移动，死区会导致脉冲式运动） */
         /* 步进加减速模式: 运动中(dangqiansudu≠0)跳过死区(目标持续移动, 清积分会导致卡顿),
          * 但到位后(dangqiansudu=0)必须应用死区, 否则残余位置误差→PWM饱和→极限环振荡.
          *
@@ -2699,10 +2729,15 @@ static int16_t MotorControl_GetAcqSample(MotorControl_t *mc, uint8_t acq_type)
         if (diff < -32767) diff = -32767;
         sample = (int16_t)diff;
     } else if (acq_type == 3) {
-        /* 采集电流(A×1000, 1A=1000, 满量程±8.25A=±8250) */
+        /* 采集电流(A×1000, 1A=1000, 满量程±8.25A=±8250)
+         * MotorControl_ReadCurrent返回相对值(relative = ADC_diff × current_scale)
+         * 硬件关系固定: 2048 ADC步 = 8.25A (INA240增益×采样电阻=0.2V/A)
+         * 因此 A = relative × 8.25 / (current_scale × 2048)
+         *      A×1000 = relative × 8250 / (current_scale × 2048)
+         * 不能用硬编码×8.25, 那只在current_scale=1000/2048(默认)时正确 */
         float cur = MotorControl_ReadCurrent(mc);
         mc->current_actual = cur;
-        float cur_A1000 = cur * 8.25f;
+        float cur_A1000 = cur * 8250.0f / (mc->current_scale * 2048.0f);
         if (cur_A1000 > 32767.0f) cur_A1000 = 32767.0f;
         if (cur_A1000 < -32767.0f) cur_A1000 = -32767.0f;
         sample = (int16_t)cur_A1000;

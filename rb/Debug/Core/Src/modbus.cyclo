@@ -1,4 +1,4 @@
-../Core/Inc/motor_control.h:43:23:MotorControl_IsPositionBasedMode	5
+../Core/Inc/motor_control.h:45:23:MotorControl_IsPositionBasedMode	6
 ../Core/Src/modbus.c:42:9:MODBUS_IsSupportedBaud	3
 ../Core/Src/modbus.c:52:10:MODBUS_EncodeBaud	1
 ../Core/Src/modbus.c:57:10:MODBUS_DecodeBaud	2
@@ -13,11 +13,11 @@
 ../Core/Src/modbus.c:234:6:MODBUS_SendResponse	4
 ../Core/Src/modbus.c:257:13:MODBUS_SendException	1
 ../Core/Src/modbus.c:270:17:MODBUS_ReadRegister	191
-../Core/Src/modbus.c:712:13:MODBUS_ApplyTarget	10
-../Core/Src/modbus.c:743:13:MODBUS_ApplyMode	10
-../Core/Src/modbus.c:771:6:MODBUS_TriggerStartFlag	4
-../Core/Src/modbus.c:792:13:MODBUS_WriteRegister	226
-../Core/Src/modbus.c:1509:13:MODBUS_ProcessReadHoldingRegs	9
-../Core/Src/modbus.c:1547:13:MODBUS_ProcessWriteSingleReg	3
-../Core/Src/modbus.c:1577:13:MODBUS_ProcessWriteMultipleRegs	13
-../Core/Src/modbus.c:1624:6:MODBUS_Process	12
+../Core/Src/modbus.c:712:13:MODBUS_ApplyTarget	11
+../Core/Src/modbus.c:743:13:MODBUS_ApplyMode	11
+../Core/Src/modbus.c:772:6:MODBUS_TriggerStartFlag	4
+../Core/Src/modbus.c:793:13:MODBUS_WriteRegister	226
+../Core/Src/modbus.c:1510:13:MODBUS_ProcessReadHoldingRegs	9
+../Core/Src/modbus.c:1548:13:MODBUS_ProcessWriteSingleReg	3
+../Core/Src/modbus.c:1578:13:MODBUS_ProcessWriteMultipleRegs	13
+../Core/Src/modbus.c:1625:6:MODBUS_Process	12

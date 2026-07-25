@@ -373,6 +373,7 @@
 #define MODE_ADC_POSITION_SPEED      8  /* ADC位置转速模式 (ADC_POSITION_SPEED_MODE) */
 #define MODE_ADC_OPENLOOP            9  /* ADC开环模式 (ADC_OPENLOOP_MODE) */
 #define MODE_ADC_POSITION            10 /* ADC位置模式 (ADC_POSITION_MODE) */
+#define MODE_EXTERNAL_TARGET_POS_SPEED 11 /* 外部目标位置速度模式 (EXTERNAL_TARGET_POS_SPEED_MODE) */
 
 /* MODBUS接收缓冲区大小 */
 #define MB_RX_BUF_SIZE               128

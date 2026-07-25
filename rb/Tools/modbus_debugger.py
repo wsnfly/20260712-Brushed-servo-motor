@@ -402,12 +402,13 @@ class ModbusDebuggerApp:
     MODE_ADC_POSITION_SPEED = 8     # ADC位置转速模式
     MODE_ADC_OPENLOOP = 9           # ADC开环模式
     MODE_ADC_POSITION = 10          # ADC位置模式
+    MODE_EXTERNAL_TARGET_POS_SPEED = 11  # 外部目标位置速度模式
 
     # 寄存器描述表（用于"寄存器列表"窗口显示）
     # 格式: (地址, 寄存器名, 描述, 格式/单位)
     # 覆盖 0x0000~0x0068 全部控制寄存器
     REGISTER_LIST = [
-        (0x0000, "REG_CONTROL_WORD", "模式设置", "0=位置,1=速度,2=位置速度,3=开环,4=外部位置,5=外部速度,6=待机,7=ADC转速,8=ADC位置转速,9=ADC开环,10=ADC位置"),
+        (0x0000, "REG_CONTROL_WORD", "模式设置", "0=位置,1=速度,2=位置速度,3=开环,4=外部位置,5=外部速度,6=待机,7=ADC转速,8=ADC位置转速,9=ADC开环,10=ADC位置,11=外部目标位置速度"),
         (0x0001, "REG_MODE_SET", "启动方式", "0=直接启动,1=标志位启动"),
         (0x0002, "REG_TARGET_POS_H3", "目标位置[63:48]", "int64高位"),
         (0x0003, "REG_TARGET_POS_H2", "目标位置[47:32]", "int64"),
@@ -583,6 +584,11 @@ class ModbusDebuggerApp:
         self.monitor_thread = None
         self.serial_lock = threading.Lock()  # 串口互斥锁
         self.acq_reading = False  # 采集数据读取标志（读取时暂停监控）
+        # 电流标定系数缓存(从固件REG_CUR_SCALE读取), 默认1000/2048≈0.4883
+        # 用于动态计算相对值→安培转换系数, 替代硬编码的121.0
+        # rel_per_amp = cur_scale * 2048 / 8.25 (默认≈121.2)
+        self.cur_scale_cached = 1000.0 / 2048.0
+        self.cur_scale_read_counter = 0  # 监控循环中周期性读取cur_scale的计数器
         self.device_baud_var = tk.StringVar(value="115200")
         self.baud_window = None
         self._raw_entries = 0
@@ -733,6 +739,7 @@ class ModbusDebuggerApp:
         ttk.Button(mode_frame, text="开环模式", command=lambda: self.set_mode(self.MODE_OPENLOOP)).pack(fill=tk.X, pady=2)
         ttk.Button(mode_frame, text="外部目标位置模式", command=lambda: self.set_mode(self.MODE_EXTERNAL_TARGET)).pack(fill=tk.X, pady=2)
         ttk.Button(mode_frame, text="外部目标速度模式", command=lambda: self.set_mode(self.MODE_EXTERNAL_TARGET_SPEED)).pack(fill=tk.X, pady=2)
+        ttk.Button(mode_frame, text="外部目标位置速度模式", command=lambda: self.set_mode(self.MODE_EXTERNAL_TARGET_POS_SPEED)).pack(fill=tk.X, pady=2)
         ttk.Button(mode_frame, text="待机模式", command=lambda: self.set_mode(self.MODE_STANDBY)).pack(fill=tk.X, pady=2)
         ttk.Button(mode_frame, text="ADC转速模式", command=lambda: self.set_mode(self.MODE_ADC_SPEED)).pack(fill=tk.X, pady=2)
         ttk.Button(mode_frame, text="ADC位置转速模式", command=lambda: self.set_mode(self.MODE_ADC_POSITION_SPEED)).pack(fill=tk.X, pady=2)
@@ -1887,7 +1894,7 @@ class ModbusDebuggerApp:
             try:
                 if self.serial_lock.acquire(timeout=1.0):
                     try:
-                        mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度", 6: "待机", 7: "ADC转速", 8: "ADC位置转速", 9: "ADC开环", 10: "ADC位置"}
+                        mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度", 6: "待机", 7: "ADC转速", 8: "ADC位置转速", 9: "ADC开环", 10: "ADC位置", 11: "外部目标位置速度"}
                         start_mode = 1 if self.start_mode_var.get() == "标志位" else 0
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_MODE_SET, start_mode)
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_CONTROL_WORD, mode)
@@ -2908,8 +2915,8 @@ class ModbusDebuggerApp:
                         ocl_raw = data[6]
                         if ocl_raw >= 0x8000:
                             ocl_raw -= 0x10000
-                        # 相对值 → 安培: 1A ≈ 121相对单位
-                        ocl_A = ocl_raw / 10.0 / 121.0
+                        # 相对值 → 安培: 使用动态计算的每安培相对值数
+                        ocl_A = ocl_raw / 10.0 / self._cur_rel_per_amp()
 
                         # 读取电流限幅 (0x0062, 与电流环不连续, 单独读)
                         mc_data = self.modbus.read_holding_registers(
@@ -2917,8 +2924,8 @@ class ModbusDebuggerApp:
                         mc_raw = mc_data[0]
                         if mc_raw >= 0x8000:
                             mc_raw -= 0x10000
-                        # 相对值 → 安培: 1A ≈ 121相对单位
-                        mc_A = mc_raw / 10.0 / 121.0
+                        # 相对值 → 安培: 使用动态计算的每安培相对值数
+                        mc_A = mc_raw / 10.0 / self._cur_rel_per_amp()
 
                         # 读取电流死区 (0x0069, 单独读)
                         cdz_data = self.modbus.read_holding_registers(
@@ -2926,8 +2933,8 @@ class ModbusDebuggerApp:
                         cdz_raw = cdz_data[0]
                         if cdz_raw >= 0x8000:
                             cdz_raw -= 0x10000
-                        # 相对值 → 安培: 1A ≈ 121相对单位
-                        cdz_A = cdz_raw / 10.0 / 121.0
+                        # 相对值 → 安培: 使用动态计算的每安培相对值数
+                        cdz_A = cdz_raw / 10.0 / self._cur_rel_per_amp()
 
                         # 读取电流环使能时的速度环/位置环PID参数 (0x0063~0x0068, 连续6个寄存器)
                         # Kp/Ki ×100, Kd ×1000, 有符号16位
@@ -3052,14 +3059,14 @@ class ModbusDebuggerApp:
         ki_reg = clamp_signed(round(ki * 100))
         kd_reg = clamp_signed(round(kd * 1000))
         scale_reg = clamp_signed(round(scale * 10000), 0, 65535)
-        # 过流阈值: A → 相对值×10, 1A ≈ 121相对单位
-        ocl_rel = ocl_A * 121.0 * 10.0
+        # 过流阈值: A → 相对值×10, 使用动态计算的每安培相对值数
+        ocl_rel = ocl_A * self._cur_rel_per_amp() * 10.0
         ocl_reg = clamp_signed(round(ocl_rel))
-        # 电流限幅: A → 相对值×10, 1A ≈ 121相对单位
-        mc_rel = mc_A * 121.0 * 10.0
+        # 电流限幅: A → 相对值×10, 使用动态计算的每安培相对值数
+        mc_rel = mc_A * self._cur_rel_per_amp() * 10.0
         mc_reg = clamp_signed(round(mc_rel))
-        # 电流死区: A → 相对值×10, 1A ≈ 121相对单位
-        cdz_rel = cdz_A * 121.0 * 10.0
+        # 电流死区: A → 相对值×10, 使用动态计算的每安培相对值数
+        cdz_rel = cdz_A * self._cur_rel_per_amp() * 10.0
         cdz_reg = clamp_signed(round(cdz_rel))
         # 电流环使能时的速度环PID (Kp/Ki ×100, Kd ×1000, 有符号16位)
         spd_kp_cur_reg = clamp_signed(round(spd_kp_cur * 100))
@@ -3183,7 +3190,7 @@ class ModbusDebuggerApp:
                         cur_raw = data2[0]
                         if cur_raw >= 0x8000:
                             cur_raw -= 0x10000
-                        cur_A = cur_raw / 10.0 / 121.0
+                        cur_A = cur_raw / 10.0 / self._cur_rel_per_amp()
                         def show_result(off, ca):
                             self.cur_offset_var.set(str(off))
                             msg = (f"零点标定完成!\n\n"
@@ -3368,6 +3375,17 @@ class ModbusDebuggerApp:
                             self.get_slave_addr(), self.REG_CUR_LOOP_EN, 1)
                         over_cur_data = self.modbus.read_holding_registers(
                             self.get_slave_addr(), self.REG_OVER_CUR_STATUS, 1)
+                        # 周期性读取电流标定系数(每20次读1次), 用于动态计算相对值→安培转换
+                        self.cur_scale_read_counter += 1
+                        if self.cur_scale_read_counter >= 20:
+                            self.cur_scale_read_counter = 0
+                            try:
+                                cs_data = self.modbus.read_holding_registers(
+                                    self.get_slave_addr(), self.REG_CUR_SCALE, 1)
+                                if cs_data and cs_data[0] > 0:
+                                    self.cur_scale_cached = cs_data[0] / 10000.0
+                            except Exception:
+                                pass  # 读取失败保留上次缓存值
 
                     # 第5批: 方向寄存器 (仅io勾选时, 每20次读1次)
                     dir_data = None
@@ -3488,13 +3506,13 @@ class ModbusDebuggerApp:
                 supply_voltage_V = supply_voltage_raw / 100.0  # 转换为V
                 pwm_percent = pwm_raw / 10.0  # -1000~+1000 -> -100.0%~+100.0%
                 # 相对值×10 → 安培: 1A ≈ 121相对单位
-                cur_actual_A = cur_actual_raw / 10.0 / 121.0
-                cur_target_A = cur_target_raw / 10.0 / 121.0
+                cur_actual_A = cur_actual_raw / 10.0 / self._cur_rel_per_amp()
+                cur_target_A = cur_target_raw / 10.0 / self._cur_rel_per_amp()
                 cur_en = cur_en_data[0] != 0 if cur_en_data is not None else False
                 over_cur_tripped = over_cur_data[0] != 0 if over_cur_data is not None else False
 
                 # === UI更新（根据复选框状态+数据可用性决定是否更新） ===
-                mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度", 6: "待机", 7: "ADC转速", 8: "ADC位置转速", 9: "ADC开环", 10: "ADC位置"}
+                mode_names = {0: "位置", 1: "速度", 2: "位置速度", 3: "开环", 4: "外部目标位置", 5: "外部目标速度", 6: "待机", 7: "ADC转速", 8: "ADC位置转速", 9: "ADC开环", 10: "ADC位置", 11: "外部目标位置速度"}
 
                 # position
                 if self.monitor_options['position'].get() and data is not None:
@@ -3757,6 +3775,12 @@ class ModbusDebuggerApp:
     def _current_acq_type(self):
         """当前采集类型 0=转速 1=PWM 2=位置"""
         return self._ACQ_LABEL_TO_TYPE.get(self.acq_type_var.get(), 0)
+
+    def _cur_rel_per_amp(self):
+        """计算每安培对应的相对值数: rel_per_amp = cur_scale * 2048 / 8.25
+        硬件固定关系: 2048 ADC步 = 8.25A (INA240增益20×采样电阻10mΩ=0.2V/A)
+        默认cur_scale=1000/2048时 rel_per_amp≈121.2"""
+        return self.cur_scale_cached * 2048.0 / 8.25
 
     def _acq_label(self, acq_type):
         """类型代号转中文标签"""
@@ -4775,7 +4799,7 @@ class ModbusDebuggerApp:
                 sv = s16(val)
                 if sv == 0:
                     return "关闭 (0=关闭)"
-                return f"{sv / 10.0 / 121.0:.2f}A (原始值:{val})"
+                return f"{sv / 10.0 / self._cur_rel_per_amp():.2f}A (原始值:{val})"
             elif addr == 0x004C:  # REG_OVER_CUR_STATUS - 过流状态(只读)
                 return "正常" if val == 0 else "已触发"
             elif addr == 0x004D:  # REG_OVER_CUR_RESET - 过流复位
@@ -4830,7 +4854,7 @@ class ModbusDebuggerApp:
                 sv = s16(val)
                 if sv == 0:
                     return "不限制 (0=不限)"
-                return f"{sv / 10.0 / 121.0:.2f}A (原始值:{val})"
+                return f"{sv / 10.0 / self._cur_rel_per_amp():.2f}A (原始值:{val})"
             elif addr == 0x0063:  # 电流模式速度Kp ×100
                 return f"Kp={s16(val) / 100.0:.2f} (原始值:{val})"
             elif addr == 0x0064:  # 电流模式速度Ki ×100
@@ -4844,8 +4868,8 @@ class ModbusDebuggerApp:
             elif addr == 0x0068:  # 电流模式位置Kd ×1000
                 return f"Kd={s16(val) / 1000.0:.3f} (原始值:{val})"
             elif addr == 0x0069:  # REG_CUR_DEAD_ZONE - 电流死区 相对值×10
-                # 相对值 → 安培: 1A ≈ 121相对单位
-                return f"死区={s16(val) / 10.0 / 121.0:.3f}A (原始值:{val})"
+                # 相对值 → 安培: 使用动态计算的每安培相对值数
+                return f"死区={s16(val) / 10.0 / self._cur_rel_per_amp():.3f}A (原始值:{val})"
             elif addr == 0x006A:  # REG_ADC_FILTER_SIZE - 外部ADC滤波窗口
                 # 显示窗口大小和对应的近似延迟(主循环5ms周期)
                 delay_ms = val * 5 if val > 1 else 0
@@ -5074,7 +5098,7 @@ class ModbusDebuggerApp:
                 (0x0048, 'cur_kd_var', lambda v: f"{s16(v) / 1000.0:.3f}"),
                 (0x0049, 'cur_offset_var', lambda v: str(v)),
                 (0x004A, 'cur_scale_var', lambda v: f"{s16(v) / 10000.0:.4f}"),
-                (0x004B, 'over_cur_limit_var', lambda v: f"{s16(v) / 10.0 / 121.0:.2f}"),
+                (0x004B, 'over_cur_limit_var', lambda v: f"{s16(v) / 10.0 / self._cur_rel_per_amp():.2f}"),
                 (0x004E, 'pc2_func_var', lambda v: PC_FUNC_MAP.get(v, str(v))),
                 (0x004F, 'pc3_func_var', lambda v: PC_FUNC_MAP.get(v, str(v))),
                 (0x0052, 'adc_max_pwm_var', lambda v: str(s16(v))),
@@ -5083,15 +5107,15 @@ class ModbusDebuggerApp:
                 (0x005F, 'adc_dz1_width_var', lambda v: str(v)),
                 (0x0060, 'adc_dz2_pos_var', lambda v: DZ_POS_MAP.get(v, str(v))),
                 (0x0061, 'adc_dz2_width_var', lambda v: str(v)),
-                (0x0062, 'max_current_var', lambda v: f"{s16(v) / 10.0 / 121.0:.2f}"),
+                (0x0062, 'max_current_var', lambda v: f"{s16(v) / 10.0 / self._cur_rel_per_amp():.2f}"),
                 (0x0063, 'spd_kp_cur_var', lambda v: f"{s16(v) / 100.0:.2f}"),
                 (0x0064, 'spd_ki_cur_var', lambda v: f"{s16(v) / 100.0:.2f}"),
                 (0x0065, 'spd_kd_cur_var', lambda v: f"{s16(v) / 1000.0:.3f}"),
                 (0x0066, 'pos_kp_cur_var', lambda v: f"{s16(v) / 100.0:.2f}"),
                 (0x0067, 'pos_ki_cur_var', lambda v: f"{s16(v) / 100.0:.2f}"),
                 (0x0068, 'pos_kd_cur_var', lambda v: f"{s16(v) / 1000.0:.3f}"),
-                # 电流死区(0x0069): 相对值×10 → 安培, 1A ≈ 121相对单位
-                (0x0069, 'cur_dead_zone_var', lambda v: f"{s16(v) / 10.0 / 121.0:.3f}"),
+                # 电流死区(0x0069): 相对值×10 → 安培, 使用动态计算的每安培相对值数
+                (0x0069, 'cur_dead_zone_var', lambda v: f"{s16(v) / 10.0 / self._cur_rel_per_amp():.3f}"),
                 # 外部ADC滤波窗口(0x006A): 直接是窗口大小0~128
                 (0x006A, 'adc_filter_size_var', lambda v: str(v)),
             ]
