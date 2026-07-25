@@ -1,4 +1,4 @@
-/**
+﻿/**
   ******************************************************************************
   * @file    modbus.c
   * @brief   MODBUS RTU协议实现
@@ -6,6 +6,8 @@
   */
 
 #include "modbus.h"
+#include "input.h"   /* MotorControl_UpdateIrqPriority (PB4/PB5 EXTI配置) */
+#include "ajiajiansu.h"  /* bujindianji[] 步进电机加减速参数 (0x006B~0x0090寄存器) */
 #include <string.h>
 
 extern UART_HandleTypeDef huart1;
@@ -20,6 +22,12 @@ static uint16_t pending_control_word = 0;
 /* 目标位置/速度缓存（MODBUS写入时暂存，ApplyTarget时读取） */
 static int64_t pending_target_pos = 0;
 static int32_t pending_target_speed = 0;
+
+/* 加速表参数缓存(新增): 上位机写入参数时暂存, 触发计算时读取 */
+static uint32_t pending_acc_timc = 32000000;
+static uint32_t pending_acc_u = 500;
+static uint32_t pending_acc_a = 320000;
+static uint16_t pending_acc_len = 10015;
 
 /* 脏标记：本次帧写入了需要保存的参数，帧处理后统一存Flash */
 static uint8_t config_dirty = 0;
@@ -158,6 +166,14 @@ void MODBUS_Init(MB_Context_t *ctx, uint8_t slave_addr, MotorControl_t *motor)
     g_mb_ctx = ctx;  /* 保存上下文指针供外部触发接口使用 */
 }
 
+/* 开机后同步加速表参数: 从ajiajiansu模块读取当前表参数(可能来自Flash),
+ * 同步到MODBUS的pending缓存, 使上位机读取0x0092~0x0097时能读到实际参数,
+ * 而非默认值. 解决重启后上位机显示默认参数的问题. */
+void MODBUS_SyncAccParams(void)
+{
+    AccTable_GetParams(&pending_acc_timc, &pending_acc_u, &pending_acc_a, &pending_acc_len);
+}
+
 /**
   * @brief  UART中断中调用：存入一个字节并重置超时计数
   */
@@ -240,7 +256,8 @@ void MODBUS_SendResponse(MB_Context_t *ctx, uint8_t *data, uint8_t len)
   */
 static void MODBUS_SendException(MB_Context_t *ctx, uint8_t func, uint8_t exception)
 {
-    uint8_t response[3];
+    /* 3字节数据 + 2字节CRC, 数组必须预留CRC空间 */
+    uint8_t response[5];
     response[0] = ctx->slave_addr;
     response[1] = func | 0x80;  /* 异常标志 */
     response[2] = exception;
@@ -255,7 +272,7 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
     MotorControl_t *mc = ctx->motor;
     
     /* 状态寄存器（只读） */
-    if (addr >= 0x0100 && addr <= 0x0115) {
+    if (addr >= 0x0100 && addr <= 0x0124) {
         switch (addr) {
             case REG_CURRENT_POS_H3:
                 return (uint16_t)(Encoder_GetCount() >> 48);
@@ -316,11 +333,49 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                  * 例: 3300 = 33.00V, 2400 = 24.00V, 上限约363.0V (12位ADC满量程) */
                 return (uint16_t)(MotorControl_GetSupplyVoltage() * 100.0f + 0.5f);
             case REG_EXT_ADC1:
-                /* 外部ADC1原始值(PC2, 12位 0~4095) */
-                return MotorControl_GetExternalADC(0);
+                /* 外部ADC1(PC2, 12位 0~4095) - 返回滤波后的值
+                 * 滤波窗口由mc->adc_filter_size控制(0或1=关闭, 2~128=滑动平均)
+                 * 上位机实时状态和采集折线图直接读取此寄存器, 显示的就是滤波后值 */
+                return MotorControl_GetExternalADCFiltered(mc, 0);
             case REG_EXT_ADC2:
-                /* 外部ADC2原始值(PC3, 12位 0~4095) */
-                return MotorControl_GetExternalADC(1);
+                /* 外部ADC2(PC3, 12位 0~4095) - 返回滤波后的值
+                 * 滤波窗口由mc->adc_filter_size控制(0或1=关闭, 2~128=滑动平均)
+                 * 上位机实时状态和采集折线图直接读取此寄存器, 显示的就是滤波后值 */
+                return MotorControl_GetExternalADCFiltered(mc, 1);
+
+            /* 三环PID调试寄存器(只读) 0x0116~0x0124 (新增)
+             * 上位机可批量读取0x0116~0x0124共15个寄存器, 一次性获取三环PID状态.
+             * 所有值乘以100后转为int16(有符号), 上位机读取后除以100恢复原值. */
+            case REG_POS_LOOP_ERR:
+                return (uint16_t)(int16_t)(mc->pid_error * 100.0f);
+            case REG_POS_LOOP_P:
+                return (uint16_t)(int16_t)(mc->pid_p * 100.0f);
+            case REG_POS_LOOP_I:
+                return (uint16_t)(int16_t)(mc->pid_i * 100.0f);
+            case REG_POS_LOOP_D:
+                return (uint16_t)(int16_t)(mc->pid_d * 100.0f);
+            case REG_SPD_LOOP_ERR:
+                return (uint16_t)(int16_t)(mc->spd_loop_error * 100.0f);
+            case REG_SPD_LOOP_P:
+                return (uint16_t)(int16_t)(mc->spd_loop_p * 100.0f);
+            case REG_SPD_LOOP_I:
+                return (uint16_t)(int16_t)(mc->spd_loop_i * 100.0f);
+            case REG_SPD_LOOP_D:
+                return (uint16_t)(int16_t)(mc->spd_loop_d * 100.0f);
+            case REG_CUR_LOOP_ERR:
+                return (uint16_t)(int16_t)(mc->cur_loop_error * 100.0f);
+            case REG_CUR_LOOP_P:
+                return (uint16_t)(int16_t)(mc->cur_loop_p * 100.0f);
+            case REG_CUR_LOOP_I:
+                return (uint16_t)(int16_t)(mc->cur_loop_i * 100.0f);
+            case REG_CUR_LOOP_D:
+                return (uint16_t)(int16_t)(mc->cur_loop_d * 100.0f);
+            case REG_TARGET_VELOCITY_RO:
+                return (uint16_t)(int16_t)(mc->target_velocity * 100.0f);
+            case REG_CURRENT_TARGET_DISP:
+                return (uint16_t)(int16_t)(mc->current_target * 10.0f);
+            case REG_CURRENT_ACTUAL_DISP:
+                return (uint16_t)(int16_t)(mc->current_actual * 10.0f);
         }
     }
 
@@ -347,6 +402,20 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return mc->speed_acq_type;
             case REG_SPEED_ACQ_SIZE:
                 return mc->speed_acq_size;
+        }
+    }
+
+    /* 多通道采集寄存器 0x009C~0x009F (新增) */
+    if (addr >= REG_SPEED_ACQ_CHANNELS && addr <= REG_SPEED_ACQ_TYPE4) {
+        switch (addr) {
+            case REG_SPEED_ACQ_CHANNELS:
+                return mc->speed_acq_channels;
+            case REG_SPEED_ACQ_TYPE2:
+                return mc->speed_acq_type2;
+            case REG_SPEED_ACQ_TYPE3:
+                return mc->speed_acq_type3;
+            case REG_SPEED_ACQ_TYPE4:
+                return mc->speed_acq_type4;
         }
     }
 
@@ -377,6 +446,8 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return (uint16_t)(int16_t)(mc->cur_Ki * 100);
             case REG_CUR_KD:
                 return (uint16_t)(int16_t)(mc->cur_Kd * 1000);  /* D项×1000, 3位小数 */
+            case REG_CUR_KFF:
+                return (uint16_t)(int16_t)(mc->cur_Kff * 10000);  /* 前馈×10000, 4位小数 */
             case REG_CUR_OFFSET:
                 return mc->current_offset;
             case REG_CUR_SCALE:
@@ -437,7 +508,80 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return mc->adc_dead_zone2_width;
         }
     }
-    
+
+    /* 电流限幅寄存器(新增) */
+    if (addr == REG_MAX_CURRENT) {
+        return (uint16_t)(int16_t)(mc->max_current * 10);  /* ×10, 1位小数 */
+    }
+
+    /* 电流环使能时的PID参数(双套PID, 新增) */
+    if (addr == REG_SPD_KP_CUR) return (uint16_t)(int16_t)(mc->spd_Kp_cur * 100);
+    if (addr == REG_SPD_KI_CUR) return (uint16_t)(int16_t)(mc->spd_Ki_cur * 100);
+    if (addr == REG_SPD_KD_CUR) return (uint16_t)(int16_t)(mc->spd_Kd_cur * 1000);
+    if (addr == REG_POS_KP_CUR) return (uint16_t)(int16_t)(mc->pos_Kp_cur * 100);
+    if (addr == REG_POS_KI_CUR) return (uint16_t)(int16_t)(mc->pos_Ki_cur * 100);
+    if (addr == REG_POS_KD_CUR) return (uint16_t)(int16_t)(mc->pos_Kd_cur * 1000);
+
+    /* 电流死区寄存器(新增): 相对值×10, 1位小数 */
+    if (addr == REG_CUR_DEAD_ZONE) {
+        return (uint16_t)(int16_t)(mc->current_dead_zone * 10);
+    }
+
+    /* 外部ADC滤波窗口寄存器(新增): 直接返回0~16 */
+    if (addr == REG_ADC_FILTER_SIZE) {
+        return (uint16_t)mc->adc_filter_size;
+    }
+
+    /* 步进电机加减速参数寄存器 bujindianji[0] 0x006B~0x0090 (新增)
+     * 每4个连续寄存器映射一个int64字段(H3=bit[63:48]...L1=bit[15:0]),
+     * 字段在定时器中断中更新, 64位读非原子操作, 需关中断保护防止读到撕裂值 */
+    if (addr >= REG_STEP_BASE && addr <= REG_STEP_CUR_POS_L1) {
+        const volatile int64_t *fields[] = {
+            &bujindianji[0].zuidasudu,       /* 0x006B 最大运行速度 */
+            &bujindianji[0].zuixiaosudu,     /* 0x006F 最小/启动速度 */
+            &bujindianji[0].yudingweizhi,    /* 0x0073 预定目标位置 */
+            &bujindianji[0].dangqiansudu,    /* 0x0077 当前运行速度 */
+            &bujindianji[0].yudingsudu,      /* 0x007B 预定运行速度 */
+            &bujindianji[0].sudukongzhi,     /* 0x007F 加减速控制 */
+            &bujindianji[0].tingzhiweizhi,   /* 0x0083 停止位置 */
+            &bujindianji[0].jiluweizhi,      /* 0x0087 外部中断记录位置 */
+            &bujindianji[0].dangqianweizhi   /* 0x008B 当前步位置 */
+        };
+        uint16_t off = addr - REG_STEP_BASE;
+        uint8_t shift = 48 - (off & 3) * 16;  /* H3→48, H2→32, L2→16, L1→0 */
+        int64_t v;
+        __disable_irq();
+        v = *fields[off >> 2];
+        __enable_irq();
+        return (uint16_t)((uint64_t)v >> shift);
+    }
+    if (addr == REG_STEP_DIRECTION) {
+        return (uint16_t)bujindianji[0].shijifangxiang;
+    }
+    if (addr == REG_STEP_TIMING) {
+        return bujindianji[0].dingshi;
+    }
+    if (addr == REG_STEP_ACCEL_EN) {
+        return (uint16_t)mc->step_accel_en;
+    }
+
+    /* 加速表计算寄存器读取(新增) */
+    if (addr >= REG_ACC_TABLE_TIMC_L && addr <= REG_ACC_TABLE_PROGRESS) {
+        switch (addr) {
+            case REG_ACC_TABLE_TIMC_L: return (uint16_t)(pending_acc_timc & 0xFFFF);
+            case REG_ACC_TABLE_TIMC_H: return (uint16_t)(pending_acc_timc >> 16);
+            case REG_ACC_TABLE_U:      return (uint16_t)pending_acc_u;
+            case REG_ACC_TABLE_A_L:    return (uint16_t)(pending_acc_a & 0xFFFF);
+            case REG_ACC_TABLE_A_H:    return (uint16_t)(pending_acc_a >> 16);
+            case REG_ACC_TABLE_LEN:    return pending_acc_len;
+            case REG_ACC_TABLE_STATUS: {
+                if (AccTable_GetProgress() < 1000) return 1;
+                return AccTable_IsCustom() ? 2 : 0;
+            }
+            case REG_ACC_TABLE_PROGRESS: return AccTable_GetProgress();
+        }
+    }
+
     /* 控制寄存器（可读写） */
     if (addr >= 0x0000 && addr <= 0x0038) {
         switch (addr) {
@@ -570,7 +714,27 @@ static void MODBUS_ApplyTarget(MB_Context_t *ctx)
     MotorControl_t *mc = ctx->motor;
 
     if (mc->mode == POSITION_MODE || mc->mode == EXTERNAL_TARGET_MODE) {
-        MotorControl_SetTarget(mc, pending_target_pos);
+        if (mc->step_accel_en) {
+            /* 步进加减速模式: 目标位置送入算法的yudingweizhi,
+             * 算法在TIM2中断中生成平滑轨迹dangqianweizhi,
+             * 主循环负责将dangqianweizhi写入电机目标位置.
+             * 若TIM2已停止(到位后), 重新启动以响应新目标
+             * 支持POSITION_MODE和EXTERNAL_TARGET_MODE */
+            int64_t cur_pos;
+            __disable_irq();
+            cur_pos = bujindianji[0].dangqianweizhi;
+            __enable_irq();
+            if (cur_pos == 0 && bujindianji[0].yudingweizhi == 0) {
+                /* 首次: 用当前编码器位置初始化算法 */
+                StepAccel_SyncPosition(Encoder_GetCount());
+            }
+            __disable_irq();
+            bujindianji[0].yudingweizhi = pending_target_pos;
+            __enable_irq();
+            StepAccel_Restart();
+        } else {
+            MotorControl_SetTarget(mc, pending_target_pos);
+        }
     } else if (mc->mode == SPEED_MODE || mc->mode == VELOCITY_POSITION_MODE || mc->mode == OPENLOOP_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE) {
         MotorControl_SetSpeed(mc, (float)pending_target_speed);
     }
@@ -581,6 +745,12 @@ static void MODBUS_ApplyMode(MB_Context_t *ctx, uint8_t mode, uint8_t sync_curre
     MotorControl_t *mc = ctx->motor;
 
     MotorControl_SetMode(mc, mode);
+    /* 切换到位置类模式且步进加减速使能时, 同步算法位置到当前编码器位置(新增),
+     * 防止dangqianweizhi残留旧值导致目标位置跳变.
+     * 支持所有基于位置PID的模式 */
+    if (mc->step_accel_en && MotorControl_IsPositionBasedMode(mode)) {
+        StepAccel_SyncPosition(Encoder_GetCount());
+    }
     if (sync_current) {
         if (mode == POSITION_MODE || mode == VELOCITY_POSITION_MODE || mode == EXTERNAL_TARGET_MODE) {
             pending_target_pos = Encoder_GetCount();
@@ -642,9 +812,19 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                     pending_control_word = mc->mode;
                     break;
                 }
-                if (mc->start_mode == 0) {
+                {
                     MotorMode_t old_mode = mc->mode;
-                    MODBUS_ApplyMode(ctx, pending_control_word & CTRL_MODE_MASK, 1);
+                    if (mc->start_mode == 0) {
+                        /* 直接启动模式: 切换模式 + 同步当前位置 + 立即应用目标 */
+                        MODBUS_ApplyMode(ctx, pending_control_word & CTRL_MODE_MASK, 1);
+                    } else {
+                        /* 标志位启动模式: 立即切换模式(电机停转), 但不应用目标
+                         * 目标位置/速度仍缓存于 pending_target_pos/speed,
+                         * 等待触发标志位(REG_START_MODE=1 或 PB4/PB5硬件触发)时
+                         * 由 MODBUS_ApplyTarget 应用.
+                         * 这样切换模式时电机立即停转, 而非继续按旧模式旋转. */
+                        MotorControl_SetMode(mc, (MotorMode_t)(pending_control_word & CTRL_MODE_MASK));
+                    }
                     if (mc->mode != old_mode) {
                         config_dirty = 1;
                     }
@@ -851,35 +1031,52 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 config_dirty = 1;
                 break;
             case REG_INPUT1_TARGET_POS_H3:
+                /* 关TIM1中断保护: 64位写非原子操作, TIM1中断(外部输入触发)读取此值 */
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin4_target_pos = (int64_t)(((uint64_t)mc->pin4_target_pos & 0x0000FFFFFFFFFFFFULL) | ((uint64_t)value << 48));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_INPUT1_TARGET_POS_H2:
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin4_target_pos = (int64_t)(((uint64_t)mc->pin4_target_pos & 0xFFFF0000FFFFFFFFULL) | ((uint64_t)value << 32));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_INPUT1_TARGET_POS_L2:
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin4_target_pos = (int64_t)(((uint64_t)mc->pin4_target_pos & 0xFFFFFFFF0000FFFFULL) | ((uint64_t)value << 16));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_INPUT1_TARGET_POS_L1:
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin4_target_pos = (int64_t)(((uint64_t)mc->pin4_target_pos & 0xFFFFFFFFFFFF0000ULL) | (uint64_t)value);
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_INPUT2_TARGET_POS_H3:
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin5_target_pos = (int64_t)(((uint64_t)mc->pin5_target_pos & 0x0000FFFFFFFFFFFFULL) | ((uint64_t)value << 48));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_INPUT2_TARGET_POS_H2:
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin5_target_pos = (int64_t)(((uint64_t)mc->pin5_target_pos & 0xFFFF0000FFFFFFFFULL) | ((uint64_t)value << 32));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_INPUT2_TARGET_POS_L2:
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin5_target_pos = (int64_t)(((uint64_t)mc->pin5_target_pos & 0xFFFFFFFF0000FFFFULL) | ((uint64_t)value << 16));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_INPUT2_TARGET_POS_L1:
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->pin5_target_pos = (int64_t)(((uint64_t)mc->pin5_target_pos & 0xFFFFFFFFFFFF0000ULL) | (uint64_t)value);
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             case REG_HOME_PRECISION_SPEED_H:
@@ -926,8 +1123,10 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                     mc->speed_acq_div_cnt = 0;
                     mc->speed_acq_active = 1;
                     mc->speed_acq_done = 0;
-                    /* 位置采样(type=2)启动时记录当前位置作为基准 */
-                    if (mc->speed_acq_type == 2) {
+                    /* 位置采样(type=2)启动时记录当前位置作为基准
+                     * 多通道时任一通道为type=2都需要记录 */
+                    if (mc->speed_acq_type == 2 || mc->speed_acq_type2 == 2 ||
+                        mc->speed_acq_type3 == 2 || mc->speed_acq_type4 == 2) {
                         mc->speed_acq_pos_start = Encoder_GetCount();
                     }
                 } else if (value == 0) {
@@ -938,21 +1137,50 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
             case REG_SPEED_ACQ_DIV:
                 if (value >= 1) {
                     mc->speed_acq_divider = value;
+                    /* 采集参数为运行时调试参数, 不写Flash(避免擦写阻塞中断导致电机停顿) */
                 }
                 break;
             case REG_SPEED_ACQ_TYPE:
-                if (value <= 6) {
+                if (value <= 23) {
                     mc->speed_acq_type = (uint8_t)value;
+                    /* 采集参数为运行时调试参数, 不写Flash(避免擦写阻塞中断导致电机停顿) */
                 }
                 break;
             case REG_SPEED_ACQ_SIZE:
                 if (value >= 1 && value <= SPEED_ACQ_BUF_SIZE) {
                     mc->speed_acq_size = value;
+                    /* 采集参数为运行时调试参数, 不写Flash(避免擦写阻塞中断导致电机停顿) */
                 }
                 break;
             case REG_SPEED_ACQ_COUNT:
             case REG_SPEED_ACQ_STATUS:
                 /* 只读寄存器，忽略写入 */
+                break;
+        }
+    }
+
+    /* 多通道采集控制寄存器 0x009C~0x009F (新增) */
+    if (addr >= REG_SPEED_ACQ_CHANNELS && addr <= REG_SPEED_ACQ_TYPE4) {
+        switch (addr) {
+            case REG_SPEED_ACQ_CHANNELS:
+                if (value >= 1 && value <= 4) {
+                    mc->speed_acq_channels = (uint8_t)value;
+                }
+                break;
+            case REG_SPEED_ACQ_TYPE2:
+                if (value <= 23) {
+                    mc->speed_acq_type2 = (uint8_t)value;
+                }
+                break;
+            case REG_SPEED_ACQ_TYPE3:
+                if (value <= 23) {
+                    mc->speed_acq_type3 = (uint8_t)value;
+                }
+                break;
+            case REG_SPEED_ACQ_TYPE4:
+                if (value <= 23) {
+                    mc->speed_acq_type4 = (uint8_t)value;
+                }
                 break;
         }
     }
@@ -1003,8 +1231,17 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                 config_dirty = 1;
                 break;
             }
+            case REG_CUR_KFF:
+                mc->cur_Kff = (float)(int16_t)value / 10000.0f;
+                config_dirty = 1;
+                break;
             case REG_CUR_OFFSET:
-                if (value <= 4095) {
+                if (value == 0xFFFF) {
+                    /* 特殊值0xFFFF: 触发自动零点标定
+                     * 固件读取64次ADC平均作为新offset, 要求电机已停止 */
+                    uint16_t new_offset = MotorControl_AutoCalibrateCurrentOffset(mc);
+                    config_dirty = 1;
+                } else if (value <= 4095) {
                     MotorControl_SetCurrentCalib(mc, value, mc->current_scale);
                     config_dirty = 1;
                 }
@@ -1065,7 +1302,9 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
             case REG_ADC_MAX_POS_H2:
             case REG_ADC_MAX_POS_L2:
             case REG_ADC_MAX_POS_L1: {
-                /* 64位位置分4个16位寄存器写入, 使用掩码拼接 */
+                /* 64位位置分4个16位寄存器写入, 使用掩码拼接
+                 * 关TIM1中断保护: 64位写不是原子操作(ARM Cortex-M3需2次STR),
+                 * TIM1中断(ADC模式)读取此值做控制律, 不保护会读到半新半旧值导致位置跳变 */
                 uint64_t mask = 0xFFFFULL;
                 uint8_t shift = 0;
                 switch (addr) {
@@ -1074,8 +1313,10 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                     case REG_ADC_MAX_POS_L2: shift = 16; break;
                     case REG_ADC_MAX_POS_L1: shift = 0;  break;
                 }
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->adc_max_position = (int64_t)((((uint64_t)mc->adc_max_position) & ~(mask << shift)) |
                                                   ((uint64_t)value << shift));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             }
@@ -1100,6 +1341,7 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
             case REG_ADC_MIN_POS_H2:
             case REG_ADC_MIN_POS_L2:
             case REG_ADC_MIN_POS_L1: {
+                /* 关TIM1中断保护: 64位写非原子操作, 同REG_ADC_MAX_POS */
                 uint64_t mask = 0xFFFFULL;
                 uint8_t shift = 0;
                 switch (addr) {
@@ -1108,8 +1350,10 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
                     case REG_ADC_MIN_POS_L2: shift = 16; break;
                     case REG_ADC_MIN_POS_L1: shift = 0;  break;
                 }
+                HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
                 mc->adc_min_position = (int64_t)((((uint64_t)mc->adc_min_position) & ~(mask << shift)) |
                                                   ((uint64_t)value << shift));
+                HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
                 config_dirty = 1;
                 break;
             }
@@ -1141,6 +1385,116 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
         }
     }
 
+    /* 电流限幅寄存器(新增) */
+    if (addr == REG_MAX_CURRENT) {
+        MotorControl_SetMaxCurrent(mc, (float)(int16_t)value / 10.0f);
+        config_dirty = 1;
+    }
+
+    /* 电流环使能时的PID参数(双套PID, 新增) */
+    if (addr == REG_SPD_KP_CUR) {
+        HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+        mc->spd_Kp_cur = (float)(int16_t)value / 100.0f;
+        HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+        config_dirty = 1;
+    } else if (addr == REG_SPD_KI_CUR) {
+        HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+        mc->spd_Ki_cur = (float)(int16_t)value / 100.0f;
+        mc->speed_loop_integral = 0.0f;
+        HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+        config_dirty = 1;
+    } else if (addr == REG_SPD_KD_CUR) {
+        HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+        mc->spd_Kd_cur = (float)(int16_t)value / 1000.0f;
+        HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+        config_dirty = 1;
+    } else if (addr == REG_POS_KP_CUR) {
+        HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+        mc->pos_Kp_cur = (float)(int16_t)value / 100.0f;
+        HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+        config_dirty = 1;
+    } else if (addr == REG_POS_KI_CUR) {
+        HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+        mc->pos_Ki_cur = (float)(int16_t)value / 100.0f;
+        mc->integral = 0;
+        HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+        config_dirty = 1;
+    } else if (addr == REG_POS_KD_CUR) {
+        HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+        mc->pos_Kd_cur = (float)(int16_t)value / 1000.0f;
+        HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+        config_dirty = 1;
+    } else if (addr == REG_CUR_DEAD_ZONE) {
+        /* 电流死区(新增): 相对值×10, 负值无意义强制为0 */
+        MotorControl_SetCurrentDeadZone(mc, (float)(int16_t)value / 10.0f);
+        config_dirty = 1;
+    } else if (addr == REG_ADC_FILTER_SIZE) {
+        /* 外部ADC滤波窗口(新增): 范围0~128, 超出视为128 */
+        HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+        mc->adc_filter_size = (value > 128) ? 128 : (uint8_t)value;
+        HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+        config_dirty = 1;
+    }
+
+    /* 步进电机加减速参数寄存器写入 bujindianji[0] 0x006B~0x0076 (新增)
+     * 仅前3个字段(最大速度/最小速度/预定目标位置)可写, 其余为运行状态只读(落入此范围直接忽略).
+     * 每次写16位片段, 4次写满一个int64; 字段在中断中使用, 关中断保护防止撕裂.
+     * 最大速度(zuidasudu)和最小速度(zuixiaosudu)需要保存到Flash, 设置config_dirty.
+     * 预定目标位置(yudingweizhi)是运行参数, 不保存. */
+    if (addr >= REG_STEP_BASE && addr <= REG_STEP_TARGET_POS_L1) {
+        volatile int64_t *fields[] = {
+            &bujindianji[0].zuidasudu,       /* 0x006B 最大运行速度 */
+            &bujindianji[0].zuixiaosudu,     /* 0x006F 最小/启动速度 */
+            &bujindianji[0].yudingweizhi     /* 0x0073 预定目标位置 */
+        };
+        uint16_t off = addr - REG_STEP_BASE;
+        uint8_t shift = 48 - (off & 3) * 16;  /* H3→48, H2→32, L2→16, L1→0 */
+        volatile int64_t *field = fields[off >> 2];
+        __disable_irq();
+        *field = (int64_t)((((uint64_t)*field) & ~(0xFFFFULL << shift)) |
+                           ((uint64_t)value << shift));
+        __enable_irq();
+        /* 最大速度/最小速度需要Flash保存, 目标位置不需要 */
+        if (off < 8) config_dirty = 1;
+    }
+
+    /* 步进加减速使能寄存器写入(新增): 开启时初始化算法并启动TIM2,
+     * 关闭时停止TIM2. 保存到Flash */
+    if (addr == REG_STEP_ACCEL_EN) {
+        uint8_t en = (value != 0) ? 1 : 0;
+        if (en != mc->step_accel_en) {
+            mc->step_accel_en = en;
+            StepAccel_Enable(en, Encoder_GetCount());
+        }
+        config_dirty = 1;
+    }
+
+    /* 加速表参数写入(新增): 更新pending缓存, 触发时读取 */
+    if (addr >= REG_ACC_TABLE_TIMC_L && addr <= REG_ACC_TABLE_LEN) {
+        switch (addr) {
+            case REG_ACC_TABLE_TIMC_L: pending_acc_timc = (pending_acc_timc & 0xFFFF0000) | value; break;
+            case REG_ACC_TABLE_TIMC_H: pending_acc_timc = (pending_acc_timc & 0x0000FFFF) | ((uint32_t)value << 16); break;
+            case REG_ACC_TABLE_U:      pending_acc_u = value; break;
+            case REG_ACC_TABLE_A_L:    pending_acc_a = (pending_acc_a & 0xFFFF0000) | value; break;
+            case REG_ACC_TABLE_A_H:    pending_acc_a = (pending_acc_a & 0x0000FFFF) | ((uint32_t)value << 16); break;
+            case REG_ACC_TABLE_LEN:    pending_acc_len = (value > ACC_TABLE_MAX_LEN) ? ACC_TABLE_MAX_LEN : value; break;
+        }
+    }
+    if (addr == REG_ACC_TABLE_TRIGGER) {
+        if (value == 1) {
+            /* 触发计算: 用pending缓存参数 */
+            uint8_t ret = AccTable_Calculate(pending_acc_timc, pending_acc_u, pending_acc_a, pending_acc_len);
+            (void)ret;
+        } else if (value == 2) {
+            AccTable_RestoreROM();
+            /* 同步pending参数为ROM默认值 */
+            pending_acc_timc = 32000000;
+            pending_acc_u = 500;
+            pending_acc_a = 320000;
+            pending_acc_len = 10015;
+        }
+    }
+
     /* 如果需要立即应用目标值 */
     if (need_apply) {
         MODBUS_ApplyTarget(ctx);
@@ -1157,10 +1511,12 @@ static void MODBUS_ProcessReadHoldingRegs(MB_Context_t *ctx, uint16_t start_addr
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
-    /* 检查地址范围：控制寄存器 0x0000~0x0061, 状态寄存器 0x0100~0x0115, 数据寄存器 0x0200~0x15FF */
+    /* 检查地址范围：控制寄存器 0x0000~0x0090, 状态寄存器 0x0100~0x0124, 数据寄存器 0x0200~0x15FF
+     * 注: 0x006A=REG_ADC_FILTER_SIZE(外部ADC滤波), 0x006B~0x0090=步进加减速参数, 必须包含在可读范围内
+     * 状态区扩展至0x0124: 包含三环PID调试寄存器(0x0116~0x0121)和级联目标速度(0x0122~0x0124) */
     uint16_t end_addr = start_addr + quantity - 1;
-    if (!((start_addr <= 0x0061 && end_addr <= 0x0061) ||
-          (start_addr >= 0x0100 && end_addr <= 0x0115) ||
+    if (!((start_addr <= REG_STEP_END && end_addr <= REG_STEP_END) ||
+          (start_addr >= 0x0100 && end_addr <= 0x0124) ||
           (start_addr >= REG_SPEED_DATA_BASE && end_addr <= REG_SPEED_DATA_END))) {
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
@@ -1190,8 +1546,10 @@ static void MODBUS_ProcessWriteSingleReg(MB_Context_t *ctx, uint16_t addr, uint1
 {
     uint8_t old_slave_addr = ctx->slave_addr;
 
-    /* 检查地址范围 (控制寄存器 0x0000~0x0061 可写, 状态/数据寄存器只读) */
-    if (addr > 0x0061) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x0090 可写, 状态/数据寄存器只读)
+     * 注: 0x006A=REG_ADC_FILTER_SIZE(外部ADC滤波), 0x006B~0x0090=步进加减速参数,
+     *     其中0x0077~0x0090为只读运行状态, 写入会被忽略 */
+    if (addr > REG_STEP_END) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_SINGLE_REG, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
@@ -1199,15 +1557,15 @@ static void MODBUS_ProcessWriteSingleReg(MB_Context_t *ctx, uint16_t addr, uint1
     /* 写入寄存器（单寄存器写入，is_multiple=0） */
     MODBUS_WriteRegister(ctx, addr, value, 0);
     
-    /* 响应：原样返回 */
-    uint8_t response[6];
+    /* 响应：原样返回 (6字节数据 + 2字节CRC, 数组必须预留CRC空间) */
+    uint8_t response[8];
     response[0] = (addr == REG_SLAVE_ADDR) ? old_slave_addr : ctx->slave_addr;
     response[1] = MB_FUNC_WRITE_SINGLE_REG;
     response[2] = (addr >> 8) & 0xFF;
     response[3] = addr & 0xFF;
     response[4] = (value >> 8) & 0xFF;
     response[5] = value & 0xFF;
-    
+
     MODBUS_SendResponse(ctx, response, 6);
 }
 
@@ -1219,8 +1577,8 @@ static void MODBUS_ProcessWriteMultipleRegs(MB_Context_t *ctx, uint16_t start_ad
     MotorControl_t *mc = ctx->motor;
     uint8_t old_slave_addr = ctx->slave_addr;
     pending_baud_rate = 0;
-    /* 检查地址范围 (控制寄存器 0x0000~0x0061 可写) */
-    if (quantity > 125 || start_addr + quantity > 0x0062) {
+    /* 检查地址范围 (控制寄存器 0x0000~0x0090 可写) */
+    if (quantity > 125 || start_addr + quantity > REG_STEP_END + 1) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_MULTIPLE_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
@@ -1246,15 +1604,15 @@ static void MODBUS_ProcessWriteMultipleRegs(MB_Context_t *ctx, uint16_t start_ad
         }
     }
     
-    /* 响应 */
-    uint8_t response[6];
+    /* 响应 (6字节数据 + 2字节CRC, 数组必须预留CRC空间) */
+    uint8_t response[8];
     response[0] = (start_addr <= REG_SLAVE_ADDR && start_addr + quantity > REG_SLAVE_ADDR) ? old_slave_addr : ctx->slave_addr;
     response[1] = MB_FUNC_WRITE_MULTIPLE_REGS;
     response[2] = (start_addr >> 8) & 0xFF;
     response[3] = start_addr & 0xFF;
     response[4] = (quantity >> 8) & 0xFF;
     response[5] = quantity & 0xFF;
-    
+
     MODBUS_SendResponse(ctx, response, 6);
 }
 
@@ -1339,3 +1697,4 @@ void MODBUS_Process(MB_Context_t *ctx)
         pending_baud_rate = 0;
     }
 }
+

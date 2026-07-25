@@ -21,6 +21,7 @@
 #define __MOTOR_CONTROL_H
 
 #include "main.h"
+#include "encoder.h"   /* 编码器模块: Encoder_GetCount/GetSpeed/Reset/Synthesize 等 */
 
 typedef enum {
     POSITION_MODE = 0,
@@ -35,6 +36,14 @@ typedef enum {
     ADC_OPENLOOP_MODE,       /* ADC开环模式：ADC值(0~1)×预设PWM, 直接输出 */
     ADC_POSITION_MODE        /* ADC位置模式：ADC值(0~1)×预设位置, 实时给目标位置走位置PID */
 } MotorMode_t;
+
+/* 判断模式是否基于位置PID (走位置环)
+ * 包括: POSITION_MODE, VELOCITY_POSITION_MODE, EXTERNAL_TARGET_MODE, ADC_POSITION_MODE
+ * 这些模式的目标位置都可通过步进加减速算法平滑 */
+static inline uint8_t MotorControl_IsPositionBasedMode(MotorMode_t mode) {
+    return (mode == POSITION_MODE || mode == VELOCITY_POSITION_MODE ||
+            mode == EXTERNAL_TARGET_MODE || mode == ADC_POSITION_MODE);
+}
 
 /* 电机方向: CW=正转(默认), CCW=反转 */
 typedef enum {
@@ -133,6 +142,27 @@ typedef struct {
     uint16_t adc_dead_zone1_width;/* ADC死区1宽度(ADC原始值, 0~4095, 0=关闭死区1) */
     uint8_t  adc_dead_zone2_pos;  /* ADC死区2位置: 0=最小点, 1=中位点, 2=最大点 */
     uint16_t adc_dead_zone2_width;/* ADC死区2宽度(ADC原始值, 0~4095, 0=关闭死区2) */
+
+    /* 外部ADC滤波参数(新增)
+     * 采用滑动平均(Moving Average), 窗口大小可调:
+     *   0或1 = 关闭滤波(直接用原始ADC值)
+     *   2~128 = 滑动平均窗口大小, 越大越平滑但滞后越大
+     * 主循环5ms周期下延迟对照:
+     *   4点≈20ms, 8点≈40ms, 16点≈80ms, 32点≈160ms, 64点≈320ms, 100点≈500ms, 128点≈640ms(最大)
+     * 推荐值: 4~32 (兼顾平滑与响应)
+     * 算法说明: 维护一个size大小的环形缓冲区, 每次读取ADC求平均.
+     *   - 优点: 实现简单, 抗高频噪声效果好, 与电流环滤波风格一致
+     *   - 缺点: 对尖峰毛刺抑制一般(若需抗毛刺可后续加中值滤波)
+     * 应用位置: ADC_SPEED_MODE/ADC_POSITION_SPEED_MODE/ADC_OPENLOOP_MODE/ADC_POSITION_MODE
+     *   模式下, 读取外部ADC后立即滤波, 滤波后值送死区处理和归一化 */
+    uint8_t  adc_filter_size;      /* 滤波窗口大小(0或1=关闭, 2~128=滑动平均) */
+
+    /* ========== 步进加减速位置模式（新增）==========
+     * 使能后, 位置模式下目标位置不直接给PID, 而是经过步进加减速算法
+     * (TIM2中断驱动梯形速度规划)生成平滑的中间位置轨迹dangqianweizhi,
+     * 再实时写入电机目标位置, 实现加减速控制.
+     * 关闭时保持原行为: 目标位置直接给PID. */
+    uint8_t  step_accel_en;        /* 步进加减速使能: 0=关闭(原行为), 1=开启 */
     MotorMode_t mode;
     float target_speed;
     int64_t target_position;
@@ -152,6 +182,18 @@ typedef struct {
     float pid_i;
     float pid_d;
     float pid_error;
+    /* 速度环PID调试字段(级联模式1ms周期, 新增)
+     * 与pid_p/i_d区分: pid_*记录的是位置环输出, spd_loop_*记录速度环输出
+     * 上位机可同时读取三环数据, 用于级联调参 */
+    float spd_loop_error;       /* 速度环误差 = target_velocity - velocity */
+    float spd_loop_p;           /* 速度环P项输出 */
+    float spd_loop_i;           /* 速度环I项输出 */
+    float spd_loop_d;           /* 速度环D项输出 */
+    /* 电流环PID调试字段(100us周期, 新增) */
+    float cur_loop_error;       /* 电流环误差 = current_target - current_actual */
+    float cur_loop_p;           /* 电流环P项输出 */
+    float cur_loop_i;           /* 电流环I项输出 */
+    float cur_loop_d;           /* 电流环D项输出 */
     /* 采集缓冲区 (10KB = 5120 个 int16_t, 存储脉冲/秒) */
     int16_t speed_acq_buffer[SPEED_ACQ_BUF_SIZE];
     uint16_t speed_acq_count;      /* 已采集数量 (0~SPEED_ACQ_BUF_SIZE) */
@@ -159,8 +201,19 @@ typedef struct {
     uint16_t speed_acq_div_cnt;    /* 分频计数器 (内部使用) */
     uint8_t  speed_acq_active;     /* 采集激活标志 */
     uint8_t  speed_acq_done;       /* 采集完成标志 (采满speed_acq_size个样本) */
-    uint8_t  speed_acq_type;       /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000), 2=位置(相对起始位置偏移, ±32767脉冲), 3=电流(相对值, ±1000=±8.25A), 4=PC0电压ADC(0~4095), 5=PC2外部ADC(0~4095), 6=PC3外部ADC(0~4095) */
-    uint16_t speed_acq_size;       /* 采集点数 (1~SPEED_ACQ_BUF_SIZE, 默认SPEED_ACQ_BUF_SIZE) */
+    uint8_t  speed_acq_type;       /* 通道1采集类型: 0=转速, 1=PWM, 2=位置, 3=电流, 4=PC0电压ADC, 5=PC2外部ADC, 6=PC3外部ADC,
+                                    * 7~15=电流环开启时PID输出(7位置P/8位置I/9位置D/10速度P/11速度I/12速度D/13电流P/14电流I/15电流D),
+                                    * 16~21=电流环关闭时PID输出(16位置P/17位置I/18位置D/19速度P/20速度I/21速度D),
+                                    * 22=位置误差(目标位置-当前位置), 23=速度误差(目标速度-当前速度) */
+    uint8_t  speed_acq_channels;   /* 采集通道数: 1~4, 默认1(单通道兼容原行为).
+                                    * 多通道时每个采样周期依次采集所有通道, 缓冲区数据交错存储:
+                                    * [ch1_t0, ch2_t0, ..., chN_t0, ch1_t1, ch2_t1, ..., chN_t1, ...]
+                                    * 类似STM32 ADC扫描模式, 采样率不变但缓冲区填充快N倍 */
+    uint8_t  speed_acq_type2;      /* 通道2采集类型(编码同speed_acq_type, channels>=2时使用) */
+    uint8_t  speed_acq_type3;      /* 通道3采集类型(编码同speed_acq_type, channels>=3时使用) */
+    uint8_t  speed_acq_type4;      /* 通道4采集类型(编码同speed_acq_type, channels>=4时使用) */
+    uint16_t speed_acq_size;       /* 采集总点数 (1~SPEED_ACQ_BUF_SIZE, 默认SPEED_ACQ_BUF_SIZE)
+                                    * 多通道时每通道实际点数 = size / channels */
     int64_t  speed_acq_pos_start;  /* 位置采样起始位置(仅type=2使用, 启动采集时记录) */
 
     /* 堵转保护 */
@@ -185,6 +238,10 @@ typedef struct {
     float cur_Kp;                 /* 电流环比例 */
     float cur_Ki;                 /* 电流环积分 */
     float cur_Kd;                 /* 电流环微分 */
+    float cur_Kff;                /* 电流环前馈系数(速度→PWM, 反电动势补偿, 0=关闭)
+                                   * PWM += Kff * velocity, 补偿高速反电动势
+                                   * 解决限流时电流目标被截顶→P项不足→PWM偏低→速度下降
+                                   * 典型值0.015~0.025, ×10000寄存器=150~250 */
     float current_target;         /* 电流目标值(由速度环/位置环输出, -1000~+1000) */
     float current_actual;         /* 实际电流值(ADC标定后, -1000~+1000) */
     float current_integral;       /* 电流环积分项 */
@@ -197,6 +254,30 @@ typedef struct {
     uint8_t  over_current_tripped;/* 过流保护已触发: 0=正常, 1=已触发 */
     float over_current_limit;     /* 过流保护阈值(相对值, 0=关闭)
                                    * 实际电流绝对值超过此值时触发保护, 关闭输出 */
+    float max_current;            /* 电流限幅(相对值, 0=不限制)
+                                   * 电流环运行时电流目标(current_target)绝对值
+                                   * 不超过此值, 平滑限幅, 不触发保护.
+                                   * 与over_current_limit区别: 限幅限制电流目标,
+                                   *   过流保护检测实际电流超限后关闭输出(需复位). */
+    float current_dead_zone;      /* 电流死区(相对值, 0=关闭)
+                                   * 实际电流绝对值<此值时强制PWM=0, 防止静止时
+                                   * 因ADC失调/噪声/H桥漏电流产生细微电流.
+                                   * 单位与电流相对值一致(±1000=±8.25A),
+                                   * 例: 3≈25mA, 10≈83mA. 0=关闭此功能. */
+
+    /* ========== 电流环使能时的速度环/位置环PID参数（双套PID自动切换）==========
+     * 电流环改变被控对象特性: 关闭=电压控制(一阶系统), 使能=电流控制(积分对象).
+     * 同一套PID参数无法同时适应两种模式, 因此保存两套参数:
+     *   - 电流环关闭: 使用 spd_Kp/Ki/Kd, pos_Kp/Ki/Kd (电压模式参数)
+     *   - 电流环使能: 使用 spd_Kp_cur/Ki_cur/Kd_cur, pos_Kp_cur/Ki_cur/Kd_cur (电流模式参数)
+     * PID运算时根据current_loop_en自动选择对应参数集.
+     * 典型调参: 电流模式Kp约为电压模式的1/3~1/5, Ki约为1/5~1/10 */
+    float spd_Kp_cur;             /* 电流环使能时速度环Kp */
+    float spd_Ki_cur;             /* 电流环使能时速度环Ki */
+    float spd_Kd_cur;             /* 电流环使能时速度环Kd */
+    float pos_Kp_cur;             /* 电流环使能时位置环Kp */
+    float pos_Ki_cur;             /* 电流环使能时位置环Ki */
+    float pos_Kd_cur;             /* 电流环使能时位置环Kd */
 
     /* ========== 速度环独立周期参数（1ms周期, 新增）==========
      * 级联模式(POSITION_MODE+max_run_speed>0)下, 位置环5ms输出target_velocity,
@@ -206,6 +287,17 @@ typedef struct {
     float speed_loop_integral;    /* 速度环积分项(1ms周期累加) */
     float speed_loop_prev_vel;    /* 速度环上次速度值(用于D项) */
     uint8_t  speed_loop_active;   /* 速度环激活标志(内部使用): 1=级联模式速度环运行中 */
+
+    /* ========== 位置环速度前馈(新增) ==========
+     * 步进加减速模式下, 目标位置持续移动. 原D项用-velocity做阻尼,
+     * 在目标移动时产生不必要制动力(-234), 积分必须windup到+772来克服,
+     * 导致~3秒周期性速度抖动.
+     *
+     * 修复1: D项改用误差导数 D=Kd*(target_vel-actual_vel), 目标匀速时D≈0
+     * 修复2: 显式前馈 FF=pos_Kff*target_vel, 提供维持速度所需的基础输出
+     * 效果: 积分不再需要windup, 消除周期性抖动 */
+    int64_t prev_target_position; /* 上次目标位置(用于计算目标速度) */
+    float   pos_Kff;              /* 位置环速度前馈系数(脉冲/秒→输出, 0=关闭) */
 } MotorControl_t;
 
 void MotorControl_Init(MotorControl_t *mc,
@@ -237,16 +329,13 @@ int16_t MotorControl_GetPWM(void);  /* 获取当前PWM输出(-1000~+1000, 即-10
 void MotorControl_SaveConfig(MotorControl_t *mc);
 void MotorControl_LoadConfig(MotorControl_t *mc);
 
-void MotorControl_ProcessInputs(void);  /* 主循环中调用, 处理PB4/PB5输入 */
-void MotorControl_UpdateIrqPriority(void);  /* 根据PB4/PB5功能配置EXTI外部中断, 仅脉冲模式启用 */
-void MotorControl_OnPulseExti(uint8_t pin);  /* EXTI中断中调用, pin=4或5, 累加脉冲到目标位置 */
+/* PB4/PB5输入处理已拆分至 input 模块(见 input.h):
+ *   MotorControl_ProcessInputs / MotorControl_UpdateIrqPriority / MotorControl_OnPulseExti
+ * 编码器接口已拆分至 encoder 模块(见 encoder.h):
+ *   Encoder_GetCount / Encoder_GetSpeed / Encoder_Reset / Encoder_OverflowHandler / Encoder_Synthesize */
 void Motor_Start(void);
 void Motor_Stop(void);
 void Motor_SetPWM(int16_t output);
-int64_t Encoder_GetCount(void);
-float Encoder_GetSpeed(void);
-void Encoder_Reset(void);
-void Encoder_OverflowHandler(void);
 
 /* 堵转保护 */
 uint8_t MotorControl_IsStallTripped(void);          /* 查询是否已触发堵转保护 */
@@ -257,6 +346,8 @@ void MotorControl_SetCurPID(MotorControl_t *mc, float Kp, float Ki, float Kd);
 void MotorControl_EnableCurrentLoop(MotorControl_t *mc, uint8_t en);  /* 0=关闭, 1=开启 */
 void MotorControl_SetCurrentCalib(MotorControl_t *mc, uint16_t offset, float scale);  /* 电流标定 */
 void MotorControl_SetOverCurrentLimit(MotorControl_t *mc, float limit);  /* 过流阈值, 0=关闭 */
+void MotorControl_SetMaxCurrent(MotorControl_t *mc, float max_current);  /* 电流限幅, 0=不限制 */
+void MotorControl_SetCurrentDeadZone(MotorControl_t *mc, float dead_zone);  /* 电流死区, 0=关闭 */
 uint8_t MotorControl_IsOverCurrentTripped(void);
 void MotorControl_ResetOverCurrent(MotorControl_t *mc);
 float MotorControl_GetCurrent(void);        /* 获取实际电流(相对值) */
@@ -264,5 +355,8 @@ float MotorControl_GetCurrentTarget(void);  /* 获取电流目标(相对值) */
 float MotorControl_GetSupplyVoltage(void);  /* 获取供电电压(V), PC0分压100K:10K */
 uint16_t MotorControl_GetSupplyVoltageADC(void);  /* 获取供电电压ADC原始值(0~4095, PC0) */
 uint16_t MotorControl_GetExternalADC(uint8_t channel);  /* 外部ADC原始值, 0=PC2, 1=PC3 */
+uint16_t MotorControl_GetExternalADCFiltered(MotorControl_t *mc, uint8_t channel);  /* 外部ADC滤波后值(受adc_filter_size控制) */
+uint16_t MotorControl_GetCurrentADC(void);  /* 获取电流ADC原始值(0~4095, PC1) */
+uint16_t MotorControl_AutoCalibrateCurrentOffset(MotorControl_t *mc);  /* 自动零点标定, 返回新offset */
 
 #endif

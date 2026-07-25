@@ -1,0 +1,4 @@
+../Core/Src/input.c:44:6:Input_Init	3
+../Core/Src/input.c:65:6:MotorControl_ProcessInputs	37
+../Core/Src/input.c:195:6:MotorControl_UpdateIrqPriority	10
+../Core/Src/input.c:266:6:MotorControl_OnPulseExti	12

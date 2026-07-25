@@ -47,6 +47,8 @@
  */
 
 #include "motor_control.h"
+#include "input.h"   /* Input_Init + 共享状态 pulse_accumulator/stop_override */
+#include "ajiajiansu.h"  /* 步进加减速: bujindianji[]/StepAccel_Restart() */
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
@@ -54,7 +56,7 @@
 #include "stm32f1xx_hal_flash_ex.h"
 
 extern void MODBUS_SyncTargetPosition(int64_t position);
-extern void MODBUS_TriggerStartFlag(void);  /* PB4/PB5启动标志位触发时调用 */
+/* MODBUS_TriggerStartFlag 已随PB4/PB5输入处理迁至 input.c */
 
 extern TIM_HandleTypeDef htim3;
 extern TIM_HandleTypeDef htim4;
@@ -130,10 +132,38 @@ typedef struct {
     uint32_t adc_dead_zone1_width;
     uint32_t adc_dead_zone2_pos;
     uint32_t adc_dead_zone2_width;
+    /* 外部ADC滤波窗口大小(新增, 加在末尾) */
+    uint32_t adc_filter_size;
     /* 堵转保护参数 */
     uint32_t stall_protect_en;
     uint32_t stall_err_limit;
     uint32_t stall_time_ticks;
+    /* 电流限幅参数(新增, 加在末尾不破坏已有Flash偏移) */
+    uint32_t max_current;
+    /* 电流死区参数(新增, 加在末尾)
+     * 实际电流绝对值<此值时强制PWM=0, 防止静止时细微电流 */
+    uint32_t current_dead_zone;
+    /* 电流环使能时的速度环/位置环PID参数(双套PID自动切换)
+     * 电流环改变被控对象特性(电压控制→电流控制), 需要不同PID参数.
+     * 电流环关闭时使用 spd_Kp/Ki/Kd, pos_Kp/Ki/Kd
+     * 电流环使能时使用 spd_Kp_cur/Ki_cur/Kd_cur, pos_Kp_cur/Ki_cur/Kd_cur */
+    uint32_t spd_kp_cur;
+    uint32_t spd_ki_cur;
+    uint32_t spd_kd_cur;
+    uint32_t pos_kp_cur;
+    uint32_t pos_ki_cur;
+    uint32_t pos_kd_cur;
+    /* 步进加减速使能(新增, 加在末尾不破坏已有Flash偏移) */
+    uint32_t step_accel_en;
+    /* 步进最大速度索引(新增): zuidasudu是int64_t, 拆为高/低32位存储.
+     * 断电后zuidasudu默认为0, ajiajiansu.c会自动设为63(对应6400步/秒),
+     * 导致用户设置的最大速度丢失. 保存到Flash后开机恢复用户设置值. */
+    uint32_t step_max_speed_h;  /* int64高32位 */
+    uint32_t step_max_speed_l;  /* int64低32位 */
+    /* 电流环前馈系数(新增, 加在末尾不破坏已有Flash偏移) */
+    uint32_t cur_kff;
+    /* 位置环速度前馈系数(新增): 步进加减速模式消除积分windup抖动 */
+    uint32_t pos_kff;
 } FlashConfig_t;
 
 typedef enum {
@@ -273,6 +303,31 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         mc->current_loop_en = (cfg->current_loop_en != 0) ? 1 : 0;
         f = u32_to_float(cfg->over_current_limit);
         if (f == f && f >= 0.0f) mc->over_current_limit = f;
+        /* 加载电流限幅(新增): NaN检查+范围检查, 无效时保留默认值0(不限制) */
+        f = u32_to_float(cfg->max_current);
+        if (f == f && f >= 0.0f) mc->max_current = f;
+        /* 加载电流死区(新增): NaN检查+范围检查, 无效时保留默认值0(关闭) */
+        f = u32_to_float(cfg->current_dead_zone);
+        if (f == f && f >= 0.0f) mc->current_dead_zone = f;
+        /* 加载电流环使能时的PID参数(双套PID): 无效时默认为电压模式参数的1/3 */
+        f = u32_to_float(cfg->spd_kp_cur);
+        if (f == f && f > 0.0f) mc->spd_Kp_cur = f;
+        f = u32_to_float(cfg->spd_ki_cur);
+        if (f == f && f >= 0.0f) mc->spd_Ki_cur = f;
+        f = u32_to_float(cfg->spd_kd_cur);
+        if (f == f && f >= 0.0f) mc->spd_Kd_cur = f;
+        f = u32_to_float(cfg->pos_kp_cur);
+        if (f == f && f > 0.0f) mc->pos_Kp_cur = f;
+        f = u32_to_float(cfg->pos_ki_cur);
+        if (f == f && f >= 0.0f) mc->pos_Ki_cur = f;
+        f = u32_to_float(cfg->pos_kd_cur);
+        if (f == f && f >= 0.0f) mc->pos_Kd_cur = f;
+        /* 加载电流环前馈系数(新增): NaN检查+范围检查, 无效时默认0(关闭) */
+        f = u32_to_float(cfg->cur_kff);
+        if (f == f && f >= 0.0f) mc->cur_Kff = f;
+        /* 加载位置环速度前馈系数(新增): NaN检查, 无效时默认0(关闭) */
+        f = u32_to_float(cfg->pos_kff);
+        if (f == f && f >= 0.0f) mc->pos_Kff = f;
 
         if (cfg->target_pos_magic == FLASH_TARGET_MAGIC) {
             mc->pin4_target_pos = (int64_t)(((uint64_t)cfg->pin4_target_pos_h << 32) | cfg->pin4_target_pos_l);
@@ -314,10 +369,27 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         if (cfg->adc_dead_zone2_width <= 4095) {
             mc->adc_dead_zone2_width = (uint16_t)cfg->adc_dead_zone2_width;
         }
+        /* 加载外部ADC滤波窗口(新增): 范围0~128, 超出视为无效保留默认0 */
+        if (cfg->adc_filter_size <= 128) {
+            mc->adc_filter_size = (uint8_t)cfg->adc_filter_size;
+        }
         /* 加载堵转保护参数 */
         mc->stall_protect_en = (cfg->stall_protect_en != 0) ? 1 : 0;
         mc->stall_err_limit = (int32_t)cfg->stall_err_limit;
         mc->stall_time_ticks = (uint16_t)cfg->stall_time_ticks;
+        /* 加载步进加减速使能(新增) */
+        mc->step_accel_en = (cfg->step_accel_en != 0) ? 1 : 0;
+        /* 加载步进最大速度索引(新增): 从Flash恢复zuidasudu, 避免断电后变为默认值63.
+         * 注意: 此时bujindianji[0]已经初始化, 直接写入;
+         * 如果Flash中值为0(未保存过), ajiajiansu.c的默认检查会设为63 */
+        if (cfg->step_max_speed_h != 0xFFFFFFFF || cfg->step_max_speed_l != 0xFFFFFFFF) {
+            int64_t saved_speed = ((int64_t)cfg->step_max_speed_h << 32) | cfg->step_max_speed_l;
+            if (saved_speed > 0) {
+                __disable_irq();
+                bujindianji[0].zuidasudu = saved_speed;
+                __enable_irq();
+            }
+        }
     }
     /* magic不匹配时保留Init中设置的默认值，不覆盖 */
 }
@@ -400,10 +472,44 @@ void MotorControl_SaveConfig(MotorControl_t *mc)
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 224, (uint32_t)mc->adc_dead_zone1_width);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 228, (uint32_t)mc->adc_dead_zone2_pos);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 232, (uint32_t)mc->adc_dead_zone2_width);
+    /* 保存外部ADC滤波窗口(新增)
+     * 注意: 偏移必须与FlashConfig_t结构体字段顺序严格一致!
+     * 之前错写到280, 导致与结构体偏移236不匹配, LoadConfig通过字段名访问时
+     * 读到的是stall_protect_en的值, 后续所有字段全部错位4字节.
+     * 受影响字段: adc_filter_size/stall_max_current/current_dead_zone/双套PID
+     * 这正是"电流环设置断电不保存"问题的根因: 保存到错位, 加载读到错误值.
+     * 修正: 按结构体顺序, adc_filter_size在偏移236, stall_protect_en在240, 以此类推 */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 236, (uint32_t)mc->adc_filter_size);
     /* 保存堵转保护参数 */
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 236, (uint32_t)mc->stall_protect_en);
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 240, (uint32_t)mc->stall_err_limit);
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 244, (uint32_t)mc->stall_time_ticks);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 240, (uint32_t)mc->stall_protect_en);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 244, (uint32_t)mc->stall_err_limit);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 248, (uint32_t)mc->stall_time_ticks);
+    /* 保存电流限幅参数(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 252, float_to_u32(mc->max_current));
+    /* 保存电流死区参数(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 256, float_to_u32(mc->current_dead_zone));
+    /* 保存电流环使能时的PID参数(双套PID, 新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 260, float_to_u32(mc->spd_Kp_cur));
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 264, float_to_u32(mc->spd_Ki_cur));
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 268, float_to_u32(mc->spd_Kd_cur));
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 272, float_to_u32(mc->pos_Kp_cur));
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 276, float_to_u32(mc->pos_Ki_cur));
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 280, float_to_u32(mc->pos_Kd_cur));
+    /* 保存步进加减速使能(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 284, (uint32_t)mc->step_accel_en);
+    /* 保存步进最大速度索引(新增): int64拆为高/低32位 */
+    {
+        int64_t zuidasudu;
+        __disable_irq();
+        zuidasudu = bujindianji[0].zuidasudu;
+        __enable_irq();
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 288, (uint32_t)(zuidasudu >> 32));
+        HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 292, (uint32_t)(zuidasudu & 0xFFFFFFFF));
+    }
+    /* 保存电流环前馈系数(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 296, float_to_u32(mc->cur_Kff));
+    /* 保存位置环速度前馈系数(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 300, float_to_u32(mc->pos_Kff));
 
     HAL_FLASH_Lock();
 }
@@ -412,18 +518,10 @@ static uint8_t motor_running = 0;
 static float current_velocity = 0.0f;
 static float ramped_target_speed = 0.0f;
 
-/* ========== 64位编码器累计计数(在TIM1 100μs中断中合成) ==========
- * 设计原理: TIM3的16位CNT在0~65535之间循环, 跨越65535↔0时方向不定.
- * 旧方案依赖TIM3溢出中断修正wrap, 但中断响应有几条指令的窗口,
- * 在该窗口内主程序读CNT+wrap会合成出错误值(如1*65536+65535=131071).
- *
- * 新方案: 关闭TIM3溢出中断, 在TIM1 100μs中断里主动读CNT做差分累加.
- *   delta = (int16_t)(cnt_curr - cnt_prev)  // 补码自动处理65536模回绕
- *   total_count += delta
- * 物理约束: 100μs内编码器不可能走32768步(需327MHz编码器频率),
- * 因此int16_t差分绝不会歧义, 彻底消除"中断未执行"窗口的累计误差. */
-static volatile int64_t encoder_total_count = 0;  /* 64位累计位置(不含方向取反) */
-static uint16_t encoder_cnt_prev = 0;             /* 上次读到的CNT值(仅TIM1 ISR访问) */
+/* ========== 64位编码器累计计数已拆分至 encoder 模块(encoder.c) ==========
+ * 原理: TIM1 100μs中断里对TIM3->CNT做int16_t差分累加, 合成64位无歧义位置.
+ * 方向反转/速度源通过 Encoder_BindDirection/Encoder_BindVelocity 绑定,
+ * 由 MotorControl_Init 在加载配置后同步. */
 
 static MotorControl_t *motor_ctl = NULL;
 static volatile int16_t current_pwm_output = 0;  /* 当前PWM输出(-1000~+1000) */
@@ -435,14 +533,30 @@ static int64_t homing_start_position = 0;
 static MotorMode_t mode_before_homing = POSITION_MODE;
 static float speed_limit_integral = 0.0f;
 static float speed_limit_prev_velocity = 0.0f;
-/* ADC DMA采样缓冲区(4通道, DMA循环模式持续刷新)
- * 数组元素按ADC规则通道Rank顺序对应:
- *   [0] = Rank1 = ADC_CHANNEL_11 = PC1 (电流采样)
- *   [1] = Rank2 = ADC_CHANNEL_10 = PC0 (供电电压检测, 100K:10K分压, ×11)
- *   [2] = Rank3 = ADC_CHANNEL_12 = PC2 (外部ADC输入1, 电位器调速等)
- *   [3] = Rank4 = ADC_CHANNEL_13 = PC3 (外部ADC输入2, 电位器调速等)
- * 使用uint16_t匹配DMA的HALFWORD传输配置, 4次传输正好填满4个元素 */
-static volatile uint16_t adc_values[4] = {0, 0, 0, 0};
+/* ADC DMA采样缓冲区(4通道×25组, DMA循环模式持续刷新)
+ * 数组元素按ADC规则通道Rank顺序循环对应:
+ *   [0,4,8...] = Rank1 = ADC_CHANNEL_11 = PC1 (电流采样)
+ *   [1,5,9...] = Rank2 = ADC_CHANNEL_10 = PC0 (供电电压检测, 100K:10K分压, ×11)
+ *   [2,6,10...] = Rank3 = ADC_CHANNEL_12 = PC2 (外部ADC输入1, 电位器调速等)
+ *   [3,7,11...] = Rank4 = ADC_CHANNEL_13 = PC3 (外部ADC输入2, 电位器调速等)
+ * 使用uint16_t匹配DMA的HALFWORD传输配置, 每通道25个样本用于平均滤波 */
+#define ADC_CHANNEL_COUNT 4u
+#define ADC_AVG_SAMPLE_COUNT 25u
+#define ADC_DMA_VALUE_COUNT (ADC_CHANNEL_COUNT * ADC_AVG_SAMPLE_COUNT)
+static volatile uint16_t adc_values[ADC_DMA_VALUE_COUNT];
+
+/* 外部ADC滑动平均滤波器状态(新增)
+ * 2个独立通道(PC2=channel0, PC3=channel1), 各自维护一个环形缓冲区.
+ * 当mc.adc_filter_size<=1时不启用滤波, 直接返回原始ADC值.
+ * 缓冲区大小128对应最大窗口128, 主循环5ms周期下最大延迟约640ms,
+ * 满足用户"最大延迟500ms"的需求(100点≈500ms, 留余量到128).
+ * 内存占用: 2通道 × 128 × 2字节 = 512字节 SRAM */
+#define ADC_FILTER_MAX_SIZE 128
+static uint16_t adc_filter_buf[2][ADC_FILTER_MAX_SIZE];
+static uint8_t  adc_filter_idx[2] = {0, 0};    /* 环形缓冲区写索引(0~127, uint8_t足够) */
+static uint8_t  adc_filter_count[2] = {0, 0};  /* 已填充样本数(启动阶段<窗口大小) */
+static uint32_t adc_filter_sum[2] = {0, 0};    /* 当前窗口累加和(避免每次重算) */
+static uint8_t  adc_filter_prev_size[2] = {0, 0}; /* 上次窗口大小(检测size变化触发重置) */
 
 #define SPEED_RAMP_ACCEL 10000.0f  /* 速度模式目标变化斜坡: 脉冲/秒^2 */
 
@@ -451,30 +565,14 @@ static int64_t switch_edge_pos = 0;       /* 开关边缘触发位置 */
 static uint8_t precision_cycle_idx = 0;   /* 当前精确检测循环次数 */
 static int64_t switch_edge_sum = 0;       /* 边缘位置累加（用于求平均） */
 
-/* PB4/PB5 输入状态跟踪 */
-static uint8_t prev_pin4_state = 0;
-static uint8_t prev_pin5_state = 0;
-static volatile int32_t pulse_accumulator = 0;
+/* 外部目标电平模式状态(本模块 MotorControl_Update 内部使用, 保留于此) */
 static uint8_t target_level_state = 0;
 
-/* "执行复位操作"按钮(PIN_FUNC_HOME_START)边沿检测与去抖
- * 按下瞬间触发一次 MotorControl_StartHoming, 期间不重复触发
- * 防抖冷却: 上次触发后 HOME_START_COOLDOWN_MS 内的边沿被忽略 */
-#define HOME_START_COOLDOWN_MS  300   /* 触发冷却时间, 兼作防抖 */
-static uint8_t home_start_btn4_prev = 0;   /* PB4上次稳定电平(已按极性归一化) */
-static uint8_t home_start_btn5_prev = 0;   /* PB5上次稳定电平 */
-static uint32_t home_start_last_trigger_tick = 0;  /* 上次触发时刻(HAL_GetTick ms) */
-
-/* "启动标志位触发"(PIN_FUNC_START_FLAG)边沿检测与去抖
- * 引脚有效边沿(上升沿/下降沿由极性决定)触发一次启动标志位,
- * 用于多电机同步启动: 上位机批量下发目标后, 硬件信号同步触发各电机启动.
- * 冷却复用 HOME_START_COOLDOWN_MS 防抖, 与HOME_START共享冷却计数器避免抖动叠加 */
-static uint8_t startflag_btn4_prev = 0;   /* PB4上次稳定电平(已按极性归一化) */
-static uint8_t startflag_btn5_prev = 0;   /* PB5上次稳定电平 */
-static uint32_t startflag_last_trigger_tick = 0;  /* 上次触发时刻(HAL_GetTick ms) */
-
-/* 停止功能：按钮按下时PWM强制输出0，松开后恢复 */
-static uint8_t stop_override = 0;  /* 0=正常, 1=停止(PWM=0) */
+/* PB4/PB5输入处理(停止/复位/启动标志位/脉冲/方向)已拆分至 input 模块(input.c):
+ *   - prev_pin4_state/prev_pin5_state, home_start_btn*, startflag_btn* 状态变量
+ *   - HOME_START_COOLDOWN_MS 宏
+ *   - pulse_accumulator / stop_override (在 input.h 中 extern 声明, 由 input.c 定义,
+ *     本模块 MotorControl_Update 消费) */
 
 /* 前向声明: MotorControl_SetOutput 在 MotorControl_FinishHoming 之后定义,
  * 但 FinishHoming 需要调用它, 因此提前声明 */
@@ -490,6 +588,21 @@ static float clampf(float v, float min_v, float max_v)
     if (v > max_v) return max_v;
     if (v < min_v) return min_v;
     return v;
+}
+
+static uint16_t MotorControl_ReadADCAverage(uint8_t channel)
+{
+    uint32_t sum = 0;
+
+    if (channel >= ADC_CHANNEL_COUNT) {
+        return 0;
+    }
+
+    for (uint8_t i = 0; i < ADC_AVG_SAMPLE_COUNT; i++) {
+        sum += (uint32_t)(adc_values[channel + ((uint16_t)i * ADC_CHANNEL_COUNT)] & 0x0FFFu);
+    }
+
+    return (uint16_t)(sum / ADC_AVG_SAMPLE_COUNT);
 }
 
 static float MotorControl_UpdateSpeedRamp(float target, float dt)
@@ -577,14 +690,51 @@ void MotorControl_Init(MotorControl_t *mc,
     mc->adc_dead_zone1_width = 0;    /* 默认死区1宽度=0(关闭) */
     mc->adc_dead_zone2_pos = 0;      /* 默认死区2位置=最小点 */
     mc->adc_dead_zone2_width = 0;    /* 默认死区2宽度=0(关闭) */
+    mc->adc_filter_size = 0;         /* 默认关闭ADC滤波(直接用原始值, 兼容旧固件) */
     mc->mode = POSITION_MODE;
+    /* ===== 堵转保护配置默认值(需在LoadConfig前设置, 否则会被默认值覆盖Flash值) ===== */
+    mc->stall_protect_en = 0;
+    mc->stall_err_limit = 200;       /* 默认200脉冲 / 200脉冲/秒 */
+    mc->stall_time_ticks = 200;      /* 默认200个tick = 1秒持续 */
+    /* ===== 电流环配置默认值(需在LoadConfig前设置, 否则会被默认值覆盖Flash值) =====
+     * 默认关闭电流环(current_loop_en=0), 行为与原代码完全一致.
+     * 用户需配置电流采样硬件后, 通过MotorControl_EnableCurrentLoop开启.
+     * 默认PID: Kp=15, Ki=0, Kd=0 (纯P控制)
+     *   新算法(电流限幅不截顶target): target可达900, error=888, P=13320→PWM截顶900(满量程)
+     *   电流超限时PWM按比例缩小: PWM *= max_current/actual
+     *   Ki=0: PID输出已满量程(900), 无需积分消除静差. 纯P控制稳定无windup.
+     * 默认标定: offset=2048(12位ADC中点), scale=1000/2048≈0.488
+     *   即 ADC值 0→电流-1000, ADC值 2048→电流0, ADC值 4095→电流+1000
+     * 默认过流保护: 关闭(over_current_limit=0)
+     * 默认电流限幅: 不限制(max_current=0) */
+    mc->cur_Kp = 15.0f;
+    mc->cur_Ki = 0.0f;
+    mc->cur_Kd = 0.0f;
+    mc->cur_Kff = 0.0f;  /* 默认关闭前馈, 用户通过Modbus(0x009B)设置, 建议150~250(=0.015~0.025) */
+    mc->pos_Kff = 0.0f;  /* 默认关闭位置环速度前馈, 用户通过Modbus(0x009C)设置 */
+    mc->prev_target_position = 0;
+    mc->current_offset = 2048;
+    mc->current_scale = 1000.0f / 2048.0f;
+    mc->current_loop_en = 0;
+    mc->over_current_limit = 0.0f;
+    mc->max_current = 0.0f;  /* 默认不限制电流 */
+    mc->current_dead_zone = 0.0f;  /* 默认关闭电流死区(为兼容旧固件, 用户按需开启) */
+    /* 电流环使能时的PID参数默认值(电压模式参数的1/3, 仅占位, 需用户实际调参)
+     * LoadConfig时如Flash有有效值则覆盖 */
+    mc->spd_Kp_cur = mc->spd_Kp / 3.0f;
+    mc->spd_Ki_cur = mc->spd_Ki / 5.0f;
+    mc->spd_Kd_cur = mc->spd_Kd;
+    mc->pos_Kp_cur = mc->pos_Kp / 3.0f;
+    mc->pos_Ki_cur = mc->pos_Ki / 5.0f;
+    mc->pos_Kd_cur = mc->pos_Kd;
     /* 从Flash加载保存的配置，覆盖默认值（无有效数据时保留默认值） */
     MotorControl_LoadConfig(mc);
-    /* 初始化边沿检测状态（加载配置后根据极性初始化，避免首次触发虚假脉冲） */
-    prev_pin4_state = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET ? 1 : 0;
-    prev_pin5_state = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET ? 1 : 0;
-    if (mc->pin4_polarity == POLARITY_ACTIVE_LOW) prev_pin4_state = !prev_pin4_state;
-    if (mc->pin5_polarity == POLARITY_ACTIVE_LOW) prev_pin5_state = !prev_pin5_state;
+    /* 同步编码器方向/速度源到 encoder 模块(配置加载完成后方向已知) */
+    Encoder_BindDirection(mc->encoder_dir == ENCODER_DIR_REVERSED ? 1 : 0);
+    Encoder_BindVelocity(&current_velocity);
+    /* 初始化输入模块: 绑定实例指针并根据极性初始化PB4/PB5边沿检测状态
+     * (避免首次触发虚假脉冲) */
+    Input_Init(mc);
     mc->target_position = 0;
     mc->target_speed = 0.0f;
     ramped_target_speed = 0.0f;
@@ -608,34 +758,24 @@ void MotorControl_Init(MotorControl_t *mc,
     mc->speed_acq_active = 0;
     mc->speed_acq_done = 0;
     mc->speed_acq_type = 0;      /* 默认采集转速 */
+    mc->speed_acq_channels = 1;  /* 默认单通道(兼容原行为) */
+    mc->speed_acq_type2 = 0;     /* 通道2默认转速 */
+    mc->speed_acq_type3 = 0;     /* 通道3默认转速 */
+    mc->speed_acq_type4 = 0;     /* 通道4默认转速 */
     mc->speed_acq_size = SPEED_ACQ_BUF_SIZE;  /* 默认采满缓冲区 */
 
-    /* 堵转保护初始化(默认关闭, 需用户启用) */
-    mc->stall_protect_en = 0;
-    mc->stall_err_limit = 200;       /* 默认200脉冲 / 200脉冲/秒 */
-    mc->stall_time_ticks = 200;      /* 默认200个tick = 1秒持续 */
+    /* 堵转保护运行时状态(配置参数已在LoadConfig前设置默认值并从Flash加载) */
     mc->stall_tick_cnt = 0;
     mc->stall_tripped = 0;
 
-    /* ===== 电流环参数初始化(新增) =====
-     * 默认关闭电流环(current_loop_en=0), 行为与原代码完全一致.
-     * 用户需配置电流采样硬件后, 通过MotorControl_EnableCurrentLoop开启.
-     * 默认PID: Kp=0.5, Ki=50, Kd=0 (电流环Ki可较大, 因100μs周期积分慢)
-     * 默认标定: offset=2048(12位ADC中点), scale=1000/2048≈0.488
-     *   即 ADC值 0→电流-1000, ADC值 2048→电流0, ADC值 4095→电流+1000
-     * 默认过流保护: 关闭(over_current_limit=0) */
-    mc->cur_Kp = 0.5f;
-    mc->cur_Ki = 50.0f;
-    mc->cur_Kd = 0.0f;
+    /* ===== 电流环运行时状态初始化 =====
+     * 配置参数(cur_Kp/Ki/Kd, offset, scale, current_loop_en, over_current_limit,
+     * max_current)已在LoadConfig前设置默认值并从Flash加载, 此处仅清零运行时状态. */
     mc->current_target = 0.0f;
     mc->current_actual = 0.0f;
     mc->current_integral = 0.0f;
     mc->current_prev_error = 0.0f;
-    mc->current_offset = 2048;
-    mc->current_scale = 1000.0f / 2048.0f;
-    mc->current_loop_en = 0;
     mc->over_current_tripped = 0;
-    mc->over_current_limit = 0.0f;
 
     /* ===== 速度环独立周期参数初始化(新增) ===== */
     mc->target_velocity = 0.0f;
@@ -668,6 +808,7 @@ static void MotorControl_ClearMotionState(MotorControl_t *mc)
     mc->target_velocity = 0.0f;
     mc->speed_loop_integral = 0.0f;
     mc->speed_loop_active = 0;
+    mc->prev_target_position = 0;  /* 同步目标位置, 防止D项/FF计算出现速度尖峰 */
 }
 
 static void MotorControl_FinishHoming(MotorControl_t *mc, uint8_t failed)
@@ -679,6 +820,11 @@ static void MotorControl_FinishHoming(MotorControl_t *mc, uint8_t failed)
     mc->speed_loop_active = 0;
     mc->current_target = 0.0f;
     mc->mode = mode_before_homing;
+    /* 步进加减速: 复位完成后编码器已清零, 同步算法位置到0,
+     * 防止yudingweizhi残留导致复位后电机突然转动 */
+    if (mc->step_accel_en) {
+        StepAccel_SyncPosition(0);
+    }
     MotorControl_SetOutput(mc, 0);
 }
 
@@ -756,7 +902,21 @@ void MotorControl_SetTarget(MotorControl_t *mc, int64_t target)
 
 void MotorControl_SetSpeed(MotorControl_t *mc, float speed)
 {
+    /* 速度目标变化时清零积分, 防止积分饱和(windup)导致减速延迟.
+     * 典型场景: 电机达不到目标速度时积分持续累积, 设速度为0后
+     *   积分仍为大的正值, current_target保持正向, 电机继续运行数秒.
+     * 清零积分后, 速度误差直接反映在P项, 电机能立即响应减速.
+     * 仅在目标变化较大(>200脉冲/秒)或目标为0(停止)时清零,
+     *   避免ADC/外部模式的小幅抖动导致稳态误差.
+     * 关TIM1中断保证原子性(积分在100us中断中被读写). */
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+    float old_speed = mc->target_speed;
     mc->target_speed = speed;
+    if (speed == 0.0f || fabsf(speed - old_speed) > 200.0f) {
+        mc->integral = 0.0f;
+        mc->speed_loop_integral = 0.0f;
+    }
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
 }
 
 void MotorControl_SetMode(MotorControl_t *mc, MotorMode_t mode)
@@ -768,16 +928,26 @@ void MotorControl_SetMode(MotorControl_t *mc, MotorMode_t mode)
     if (mc->mode != mode) {
         if (mode == POSITION_MODE || mode == VELOCITY_POSITION_MODE || mode == EXTERNAL_TARGET_MODE ||
             mode == ADC_POSITION_SPEED_MODE) {
+            /* 切到位置模式: 目标位置=当前实际位置, 防止位置误差导致突然运行 */
             mc->target_position = Encoder_GetCount();
             mc->target_pos_frac = 0.0f;
             mc->target_speed = 0.0f;
+            ramped_target_speed = 0.0f;  /* 清零速度斜坡, 确保电机停转 */
         } else if (mode == SPEED_MODE || mode == OPENLOOP_MODE || mode == EXTERNAL_TARGET_SPEED_MODE ||
                    mode == ADC_SPEED_MODE) {
+            /* 切到速度模式: 目标速度清零, 电机停转 */
             mc->target_speed = 0.0f;
-            ramped_target_speed = mc->velocity;
+            ramped_target_speed = 0.0f;  /* 清零速度斜坡, 立即停转而非从当前速度缓慢减速 */
         } else if (mode == ADC_POSITION_MODE) {
             mc->target_position = 0;
             mc->target_pos_frac = 0.0f;
+            ramped_target_speed = 0.0f;
+        }
+        /* 步进加减速: 模式切换时同步算法位置到当前编码器位置,
+         * 防止yudingweizhi/dangqianweizhi残留旧值导致切换后目标位置跳变、电机突然转动.
+         * 对所有模式切换都执行(包括切到非位置模式), 确保下次切回位置模式时算法位置是新鲜的 */
+        if (mc->step_accel_en) {
+            StepAccel_SyncPosition(Encoder_GetCount());
         }
     }
     mc->mode = mode;
@@ -792,6 +962,10 @@ void MotorControl_SetMode(MotorControl_t *mc, MotorMode_t mode)
     mc->target_velocity = 0.0f;
     mc->speed_loop_integral = 0.0f;
     mc->speed_loop_active = 0;
+    /* 立即停止PWM输出, 确保模式切换瞬间电机停转
+     * 电流环使能时: current_target=0, 电流环PID下次中断输出PWM=0
+     * 电流环关闭时: 直接Motor_SetPWM(0) */
+    MotorControl_SetOutput(mc, 0);
 }
 
 void MotorControl_SetDirection(MotorControl_t *mc, MotorDir_t dir)
@@ -802,19 +976,28 @@ void MotorControl_SetDirection(MotorControl_t *mc, MotorDir_t dir)
 void MotorControl_SetEncoderDirection(MotorControl_t *mc, EncoderDir_t dir)
 {
     mc->encoder_dir = dir;
+    /* 同步到 encoder 模块, 使 Encoder_GetCount/GetSpeed 的方向取反立即生效 */
+    Encoder_BindDirection(dir == ENCODER_DIR_REVERSED ? 1 : 0);
 }
 
 void MotorControl_SetPosPID(MotorControl_t *mc, float Kp, float Ki, float Kd)
 {
+    /* 关TIM1中断保护: PID参数在主循环被修改, TIM1中断读取使用.
+     * 若不保护, 中断可能在Ki已更新但integral尚未清零时触发, 用新Ki×旧积分导致输出突变.
+     * 与MotorControl_SetCurPID保持一致的并发保护策略. */
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
     mc->pos_Kp = Kp;
     mc->pos_Ki = Ki;
     mc->pos_Kd = Kd;
     mc->integral = 0;
     mc->prev_error = 0;
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
 }
 
 void MotorControl_SetSpdPID(MotorControl_t *mc, float Kp, float Ki, float Kd)
 {
+    /* 关TIM1中断保护: 同SetPosPID, 防止PID参数与积分状态不一致导致输出突变 */
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
     mc->spd_Kp = Kp;
     mc->spd_Ki = Ki;
     mc->spd_Kd = Kd;
@@ -822,6 +1005,7 @@ void MotorControl_SetSpdPID(MotorControl_t *mc, float Kp, float Ki, float Kd)
     mc->prev_error = 0;
     mc->speed_loop_integral = 0.0f;  /* 清零1ms速度环独立积分 */
     mc->speed_loop_prev_vel = mc->velocity;
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
 }
 
 void MotorControl_SetMaxOutput(MotorControl_t *mc, int16_t max_output)
@@ -874,6 +1058,11 @@ void MotorControl_SetOrigin(MotorControl_t *mc)
     mc->speed_loop_integral = 0.0f;
     mc->speed_loop_active = 0;
 
+    /* 步进加减速: 设置零点时同步算法位置到0, 防止yudingweizhi残留导致切换后突然转动 */
+    if (mc->step_accel_en) {
+        StepAccel_SyncPosition(0);
+    }
+
     HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
 }
 
@@ -902,19 +1091,18 @@ static int16_t MotorControl_ApplyLimitSwitches(MotorControl_t *mc, int32_t outpu
  * 电流环关闭时: 电流环函数返回current_target作为PWM(透传, 等效于原无电流环行为). */
 
 /* 读取ADC电流采样值并转换为相对电流(-1000~+1000)
- * DMA循环模式下, adc_values[0]由DMA持续刷新, 直接读取即可 */
+ * DMA循环模式下, adc_values由DMA持续刷新, 读取对应通道25个样本取平均 */
 static float MotorControl_ReadCurrent(MotorControl_t *mc)
 {
-    uint16_t adc_val = (uint16_t)(adc_values[0] & 0x0FFFu);  /* 12位ADC, 屏蔽高4位 */
-    float current = ((float)adc_val - (float)mc->current_offset) * mc->current_scale;
-    return current;
+    uint16_t adc_val = MotorControl_ReadADCAverage(0);  /* 12位ADC, 屏蔽高4位 */
+    return ((float)adc_val - (float)mc->current_offset) * mc->current_scale;
 }
 
 /* 读取供电电压(单位:V), PC0分压100K:10K, 实际电压=ADC电压×11
  * ADC 12位, 参考电压3.3V, Vsupply = adc/4095 × 3.3 × 11 ≈ adc × 0.00886 */
 float MotorControl_GetSupplyVoltage(void)
 {
-    uint16_t adc_val = (uint16_t)(adc_values[1] & 0x0FFFu);
+    uint16_t adc_val = MotorControl_ReadADCAverage(1);
     return (float)adc_val * 3.3f * 11.0f / 4095.0f;
 }
 
@@ -922,7 +1110,7 @@ float MotorControl_GetSupplyVoltage(void)
  * 供数据采集使用, 避免重复浮点运算 */
 uint16_t MotorControl_GetSupplyVoltageADC(void)
 {
-    return (uint16_t)(adc_values[1] & 0x0FFFu);
+    return MotorControl_ReadADCAverage(1);
 }
 
 /* 读取外部ADC原始值(12位, 0~4095)
@@ -930,41 +1118,119 @@ uint16_t MotorControl_GetSupplyVoltageADC(void)
 uint16_t MotorControl_GetExternalADC(uint8_t channel)
 {
     if (channel == 0) {
-        return (uint16_t)(adc_values[2] & 0x0FFFu);
+        return MotorControl_ReadADCAverage(2);
     } else if (channel == 1) {
-        return (uint16_t)(adc_values[3] & 0x0FFFu);
+        return MotorControl_ReadADCAverage(3);
     }
     return 0;
 }
 
+/* 读取外部ADC带滤波值(新增)
+ * 采用滑动平均: 维护size大小环形缓冲区, 每次用新值替换最老值, 返回窗口平均.
+ * channel: 0=PC2, 1=PC3
+ * size: 0或1=关闭滤波(直接返回原始值), 2~128=滑动平均窗口大小
+ *       主循环5ms周期下, 100点≈500ms延迟, 128点≈640ms延迟(最大)
+ * 注意:
+ *   - size变化时会自动重置该通道的滤波器(清空缓冲区), 避免窗口不匹配错乱
+ *   - 内部维护adc_filter_count, 启动阶段(count<size)用已填充样本数求平均
+ *   - 累加和adc_filter_sum避免每次遍历求和, 复杂度O(1)
+ *   - 调用频率: 主循环5ms一次(ADC模式), 性能完全足够
+ *   - 注意: 此函数非static, 供modbus.c读取REG_EXT_ADC1/2时调用, 使上位机
+ *     实时状态和采集折线图显示的也是滤波后值, 保持一致性 */
+uint16_t MotorControl_GetExternalADCFiltered(MotorControl_t *mc, uint8_t channel)
+{
+    uint16_t raw = MotorControl_GetExternalADC(channel);
+    uint8_t size = mc->adc_filter_size;
+
+    /* 滤波关闭: 直接返回原始值 */
+    if (size <= 1 || channel > 1) return raw;
+
+    /* 窗口大小超限保护(2~ADC_FILTER_MAX_SIZE=128) */
+    if (size > ADC_FILTER_MAX_SIZE) size = ADC_FILTER_MAX_SIZE;
+
+    /* 关TIM1中断保护共享状态:
+     * 此函数被3处调用: 主循环(MODBUS读REG_EXT_ADC1/2)、TIM1中断(ADC模式控制)、
+     *   TIM1中断(采集speed_acq type=5/6). 主循环与TIM1中断并发访问同一通道的
+     *   idx/count/sum会导致状态损坏(数据撕裂). 关中断保证原子性.
+     * 关中断时间<10μs(仅几次内存操作), 对PID实时性无影响. */
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+
+    /* 窗口大小变化时重置滤波器(检测size增大和减小两种情况)
+     * 之前用 count>size 只能检测size减小, size增大时(count<size)会进入启动分支
+     * 错误覆盖有效数据, 导致sum与buf不一致. 改用prev_size跟踪任意变化. */
+    if (adc_filter_prev_size[channel] != size) {
+        adc_filter_idx[channel] = 0;
+        adc_filter_count[channel] = 0;
+        adc_filter_sum[channel] = 0;
+        adc_filter_prev_size[channel] = size;
+    }
+
+    /* 环形缓冲区: 新值覆盖最老值, 维护累加和 */
+    uint8_t idx = adc_filter_idx[channel];
+    if (adc_filter_count[channel] < size) {
+        /* 启动阶段: 缓冲区未填满, 直接添加 */
+        adc_filter_buf[channel][idx] = raw;
+        adc_filter_sum[channel] += raw;
+        adc_filter_count[channel]++;
+    } else {
+        /* 稳态: 替换最老值, 更新累加和 */
+        adc_filter_sum[channel] -= adc_filter_buf[channel][idx];
+        adc_filter_buf[channel][idx] = raw;
+        adc_filter_sum[channel] += raw;
+    }
+    adc_filter_idx[channel] = (idx + 1) % size;
+
+    /* 返回窗口平均 */
+    uint16_t result = (uint16_t)(adc_filter_sum[channel] / adc_filter_count[channel]);
+
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+    return result;
+}
+
 /* 电流环PID: 返回PWM输出(-1000~+1000)
- * 由MotorControl_TimerTick100us每100μs调用一次 */
+ * 由MotorControl_TimerTick100us每100μs调用一次
+ * 电流采集和过流检测始终运行(无论current_loop_en是否使能):
+ *   - current_loop_en=0: 读ADC + 过流检测 + max_current软件斩波 + current_target作为PWM
+ *   - current_loop_en=1: 读ADC + 过流检测 + PID + 输出PWM */
 static int16_t MotorControl_CurrentLoop(MotorControl_t *mc)
 {
-    /* 电机未运行: 清积分, 输出0 */
+    /* 电机未运行: 清积分, 输出0, 但仍读ADC更新current_actual
+     * 加电流死区: 电机停止时PWM=0, 理论上无电流, 残余读数来自
+     * INA240A失调电压+ADC噪声+H桥漏电流, 属正常现象.
+     * 死区阈值3相对单位≈25mA, 低于此值视为0, 使显示干净.
+     * 注意: 死区仅用于停止状态显示, 不影响运行时PID精度. */
     if (!motor_running) {
         mc->current_integral = 0.0f;
         mc->current_prev_error = 0.0f;
+        float raw = MotorControl_ReadCurrent(mc);
+        mc->current_actual = (fabsf(raw) < 3.0f) ? 0.0f : raw;
         return 0;
     }
 
-    /* 过流保护已触发: 持续关闭输出, 等待用户复位 */
+    /* 过流保护已触发: 持续关闭输出, 等待用户复位, 但仍读ADC
+     * 同样加死区, 过流状态下PWM=0, 残余为噪声 */
     if (mc->over_current_tripped) {
         mc->current_integral = 0.0f;
+        float raw = MotorControl_ReadCurrent(mc);
+        mc->current_actual = (fabsf(raw) < 3.0f) ? 0.0f : raw;
         return 0;
     }
 
-    /* 电流环关闭: current_target直接作为PWM输出(向后兼容) */
-    if (!mc->current_loop_en) {
-        int16_t pwm = (int16_t)mc->current_target;
-        if (pwm > mc->max_output) pwm = mc->max_output;
-        if (pwm < -mc->max_output) pwm = -mc->max_output;
-        return pwm;
+    /* 堵转保护已触发: 持续关闭输出, 等待用户复位
+     * 与过流保护同样处理: 清积分 + 读ADC(加死区) + 返回0
+     * 注意: 速度环MotorControl_SpeedLoop已检查stall_tripped并清current_target,
+     *       但电流环此前漏检stall_tripped, 会导致堵转后current_target虽为0,
+     *       电流环PID仍因残余电流(actual≠0)产生非零error并累加积分,
+     *       输出非零PWM形成零目标附近震荡(如图中±60波形) */
+    if (mc->stall_tripped) {
+        mc->current_integral = 0.0f;
+        mc->current_prev_error = 0.0f;
+        float raw = MotorControl_ReadCurrent(mc);
+        mc->current_actual = (fabsf(raw) < 3.0f) ? 0.0f : raw;
+        return 0;
     }
 
-    /* ===== 电流环PID运算 ===== */
-    const float dt = 0.0001f;  /* 100μs */
-
+    /* ===== 电流采集(始终运行, 无论电流环是否使能) ===== */
     float actual = MotorControl_ReadCurrent(mc);
     mc->current_actual = actual;
 
@@ -975,10 +1241,141 @@ static int16_t MotorControl_CurrentLoop(MotorControl_t *mc)
         return 0;
     }
 
-    float error = mc->current_target - actual;
+    uint8_t pwm_passthrough = !mc->current_loop_en;
 
-    /* 积分累加 */
-    mc->current_integral += error * dt;
+    /* 电流限幅: 电流环开启时限制电流目标; PWM直通模式做100us软件斩波限流.
+     * 与 over_current_limit 区别: 限幅会自动恢复, 不触发保护;
+     *   over_current_limit 是检测实际电流超限后关闭输出(需复位).
+     *   - 电流环使能: current_target是电流目标, max_current限制电流目标
+     *   - PWM直通: current_target是PWM, actual超过max_current且仍同方向驱动时,
+     *     本100us周期PWM置0; 电流降回限制内后自动恢复PWM, 形成软件斩波削峰. */
+    float target = mc->current_target;
+    /* 不截顶current_target: 电流限幅改为在PID输出后按比例缩小PWM, 不改变PID目标
+     * 原逻辑: target被max_current截顶(36)→error=24→P=360(40%)→PWM偏低→速度下降
+     * 新逻辑: target保持原值(可达900)→error=888→P=13320→PWM截顶900(满量程!)
+     *         当实际电流超过max_current时, 按比例缩小PWM输出, 维持电流在限值
+     * 这正是用户期望: 电流未达限制前PID与不限流时一致, 电流超限后直接削减PWM */
+
+    /* ===== 电流死区(新增): 防止静止时细微电流 =====
+     * 仅在电流目标近0(电机应该静止)且实际电流绝对值<死区阈值时生效:
+     *   - 直接返回PWM=0, 跳过PID运算
+     *   - 清零电流环积分和上次误差, 防止残留积分产生非零PWM
+     *   - 将current_actual钳制为0, 使上位机显示干净(无残余电流读数)
+     * 电机运行时(target明显非0)不受死区影响, 保证正常驱动能力.
+     * 死区阈值current_dead_zone=0时关闭此功能, 保持原行为.
+     *
+     * 注意: 判断条件用 fabsf(target) < 1.0f 而非 target == 0.0f:
+     *   - 位置模式到达死区时, 位置环虽然调用 SetOutput(0) 把 current_target 置0,
+     *     但电流环每100μs运行一次, 位置环5ms才运行一次, 期间 current_target
+     *     可能因浮点累加误差残留极小非0值(如1e-6), 严格相等判断会失效.
+     *   - 1.0相对单位≈8.25mA, 远小于任何实际驱动电流, 作为"应该静止"的阈值安全.
+     *   - 级联模式位置死区内速度环也已清 current_target=0, 同样满足此条件. */
+    if (mc->current_dead_zone > 0.0f && fabsf(target) < 1.0f &&
+        fabsf(actual) < mc->current_dead_zone) {
+        /* 渐变衰减积分而非硬清零, 避免到位瞬间积分突变导致速度骤变.
+         * 保留prev_error更新, D项可正常响应. */
+        mc->current_integral *= 0.9f;
+        if (fabsf(mc->current_integral) < 0.01f) {
+            mc->current_integral = 0.0f;
+        }
+        mc->current_actual = 0.0f;
+        return 0;
+    }
+
+    /* PWM直通: current_target作为PWM输出, max_current用作软件斩波削峰.
+     * 只切断继续增大同方向电流的PWM; 反向PWM允许输出, 用于主动减小电流。 */
+    if (pwm_passthrough) {
+        int16_t pwm = (int16_t)target;
+        if (pwm > mc->max_output) pwm = mc->max_output;
+        if (pwm < -mc->max_output) pwm = -mc->max_output;
+        if (mc->max_current > 0.0f && fabsf(actual) > mc->max_current &&
+            ((actual > 0.0f && pwm > 0) || (actual < 0.0f && pwm < 0))) {
+            return 0;
+        }
+        return pwm;
+    }
+
+    /* ===== 电流环PID运算 ===== */
+    const float dt = 0.0001f;  /* 100μs */
+
+    /* 注意: 电流限幅(max_current)不再截顶target, 而是在PID输出后按比例缩小PWM.
+     * 电流环PID内部的积分分离带/积分限幅/输出限幅均基于max_output(PWM满量程),
+     * 不能用max_current限制PWM输出 —— PWM是驱动量, 需要到满量程才能驱动足够电流.
+     * 电流未达限制前PID与不限流时完全一致, 电流超限后PWM *= max_current/|actual| */
+    float error = target - actual;
+
+    /* 渐变式积分分离 + 积分限幅: 修复"加Ki电流不缓慢上升"问题
+     *
+     * 问题现象: 电流环Ki>0时, 大误差(error>分离带)下电流不缓慢上升, 永远达不到目标.
+     * 根因: 原逻辑是硬分离带(|error|<band才积分), error=316>band=225时积分完全不累加,
+     *   current_integral恒为0, I项恒为0, 纯P控制无法消除稳态误差, 电流锁死在低值.
+     *   用户调大cur_Kp到3会引发高频振荡(电机啸叫), 因为P项过大且无积分阻尼.
+     *
+     * 修复: 改为渐变式积分(与速度环MotorControl_SpeedLoop一致):
+     *   gain = band / (band + |error|)
+     *   - |error|<<band: gain≈1, 全积分(消除稳态误差)
+     *   - |error|≈band:  gain≈0.5, 半积分(温和参与)
+     *   - |error|>>band: gain≈0, 几乎不积分(防windup, 但仍缓慢累积)
+     * 这样大误差时积分按比例衰减累加, 电流会缓慢上升至目标, 最终靠积分消除稳态误差.
+     * 同时保留抗启动抖动能力: 启动瞬间大误差时int_gain小, 积分缓慢累积不会瞬间饱和. */
+    /* BUG修复(2026-07-22): 原代码 integral_sep_band = max_output * 0.25 = 225(PWM单位)
+     *   但 error 是电流单位(0~max_current, 如0~60), 225 >> 60,
+     *   int_gain = 225/(225+55) = 0.80, 积分80%强度激活→永久windup→PWM振荡.
+     * 修复: 分离带改用电流单位, 与error同量级.
+     *   max_current=60时 sep_band=30, error=55时 int_gain=30/85=0.35 (原0.80)
+     *   不限流时仍用max_output比例(此时电流目标可达max_output量级) */
+    float integral_sep_band;
+    if (mc->max_current > 0.0f) {
+        integral_sep_band = mc->max_current * 0.5f;
+    } else {
+        integral_sep_band = (float)mc->max_output * 0.25f;
+    }
+
+    /* 误差过零清积分: 修复Ki较大时到达位置不停止的BUG(积分饱和windup)
+     *
+     * 问题现象: Ki=22时, 点击到达预定位置后电机不停止, 来回振荡.
+     * 根因: Ki大时积分限幅 = max_output/Ki = 900/22 = 40.9, 运动中积分快速饱和到40.9,
+     *   I = 22×40.9 = 900(满PWM). 到达目标时current_target反向(从+363变负值),
+     *   error从+316变-316, 但积分仍为+40.9. 放电需 40.9/(316×0.0001×0.416)≈311ms,
+     *   期间I=+900而P=-316, 输出=+584(方向错误!), 电机被反向驱动过冲→振荡→永不停止.
+     *   这是经典积分饱和(windup)问题.
+     *
+     * 修复: 检测error符号变化(过零), 立即清零积分. 位置环已有此逻辑(见MotorControl_Update
+     *   1939-1944行), 电流环原本缺失. 添加后误差反向时积分立即归零, 仅靠P项快速响应新方向,
+     *   避免饱和积分导致方向错误输出.
+     *
+     * BUG修复(2026-07-21): 原代码用 current_prev_error(=actual) 与 error 比较符号,
+     *   但 actual 和 error 含义不同. 当 actual 因噪声/换向在0附近波动变负时,
+     *   prev_error<0 而 error=target-actual>0, 误判过零→积分清零→PWM突降→电机停顿.
+     *   现象: 运行中突然停止, 然后慢慢继续转动(积分重新累积).
+     *   修复: 新增 prev_error_for_zero 专门存上次的error, 用于过零检测.
+     *   current_prev_error 继续存 actual, 供D项微分使用. 两者职责分离.
+     *   注: 本工程为单电机系统, static变量安全; MotorControl_CurrentLoop仅由TIM1中断调用. */
+    /* [已关闭] 电流环误差过零清零积分:
+     * 原逻辑在电流 error 变号时把 current_integral 硬置0, 导致 I=cur_Ki*current_integral
+     * 突然跌落, PWM骤变, 电机运行中突然停顿再缓慢恢复(积分重新累积).
+     * 现禁用此硬清零. 抗 windup 由渐变式积分分离+积分限幅+输出饱和回退承担.
+     * 保留 prev_error_for_zero 变量更新, 便于后续按需重新启用. */
+    static float prev_error_for_zero = 0.0f;  /* 上次error, 专用于过零检测(已停用, 备用) */
+    /* if (prev_error_for_zero != 0.0f &&
+        ((prev_error_for_zero > 0.0f && error < 0.0f) ||
+         (prev_error_for_zero < 0.0f && error > 0.0f))) {
+        mc->current_integral = 0.0f;
+    } */
+    (void)prev_error_for_zero;
+    prev_error_for_zero = error;
+
+    float abs_err = fabsf(error);
+    float int_gain = integral_sep_band / (integral_sep_band + abs_err);
+    mc->current_integral += error * dt * int_gain;
+    /* 积分限幅: |I| ≤ max_output / Ki, 使I项最大=max_output(满PWM)
+     * 抗饱和靠渐变式积分分离 + 积分限幅 + 输出饱和回退, 不靠缩小积分限幅
+     * (原"过零清积分"已禁用, 避免积分突变导致电机转速骤变) */
+    if (mc->cur_Ki > 1e-6f) {
+        float int_limit = (float)mc->max_output / mc->cur_Ki;
+        if (mc->current_integral > int_limit) mc->current_integral = int_limit;
+        if (mc->current_integral < -int_limit) mc->current_integral = -int_limit;
+    }
 
     float P = mc->cur_Kp * error;
     float I = mc->cur_Ki * mc->current_integral;
@@ -988,17 +1385,72 @@ static int16_t MotorControl_CurrentLoop(MotorControl_t *mc)
     }
     mc->current_prev_error = actual;
 
-    int32_t output = (int32_t)(P + I + D);
+    /* 速度前馈(反电动势补偿): PWM += Kff * velocity
+     *
+     * 解决问题: 限流时电流目标被max_current截顶→P项不足→PWM<满量程→速度低于目标
+     *   限流0.5A: target截顶在60, P=15*(60-5)=825(89%), 速度3716(目标5000)
+     *   不限流:   target可达65+, P=15*(65-6)=880(98%), 速度4077
+     *   差距10%来源于P项被电流目标截顶限制
+     *
+     * 前馈原理: 电机高速旋转时反电动势Ke*ω增大, 需要更多PWM维持相同电流.
+     *   PWM = R*I + Ke*ω (电阻压降 + 反电动势)
+     *   前馈FF=Kff*velocity直接补偿反电动势项, 不受电流目标截顶影响.
+     *   限流时P项=825, 前馈补上75→PWM=900(满量程), 速度达到不限流水平.
+     *
+     * 方向保护: 仅在驱动方向(target与velocity同号)时加前馈.
+     *   制动方向(target<0而velocity>0)不加前馈, 避免抵抗制动.
+     *
+     * 标定: Kff = (目标PWM - P项) / 稳态速度
+     *   =(900-825)/3716 ≈ 0.020, 建议范围0.015~0.025
+     *   寄存器×10000, Modbus值=150~250 */
+    float FF = 0.0f;
+    if (mc->cur_Kff > 0.0f) {
+        float vel = (float)mc->velocity;
+        if ((target > 0.0f && vel > 0.0f) || (target < 0.0f && vel < 0.0f)) {
+            FF = mc->cur_Kff * vel;
+        }
+    }
 
-    /* 限幅 + 抗积分饱和 */
+    /* 记录电流环调试数据(供上位机读取) */
+    mc->cur_loop_error = error;
+    mc->cur_loop_p = P;
+    mc->cur_loop_i = I;
+    mc->cur_loop_d = D;
+
+    int32_t output = (int32_t)(P + I + D + FF);
+
+    /* 限幅 + 抗积分饱和
+     * 渐变式积分下, 抗饱和回退也用同样的int_gain, 保证加减对称.
+     * 输出饱和时回退本次按int_gain比例累加的积分, 防止windup.
+     * 输出限幅=max_output(PWM满量程), 电流限幅已在入口target处削峰 */
     int16_t limit = mc->max_output;
     if (output > limit) {
         output = limit;
-        mc->current_integral -= error * dt;
+        mc->current_integral -= error * dt * int_gain;
     }
     if (output < -limit) {
         output = -limit;
-        mc->current_integral -= error * dt;
+        mc->current_integral -= error * dt * int_gain;
+    }
+
+    /* 电流限幅: 实际电流超过限制时, 按比例缩小PWM输出(不改变PID内部状态)
+     *
+     * 原理: PWM是驱动量, 电流是被控量. 电流超限时直接削减PWM,
+     *       而非截顶PID目标. 这样电流未达限制前PID有满量程输出能力.
+     * 公式: output *= max_current / |actual|  (当|actual| > max_current且同方向时)
+     * 效果: actual=max_current时ratio=1.0(不削减), actual=2×max_current时ratio=0.5
+     *       电流越大削减越多, 平滑过渡, 无硬斩波的高频纹波
+     * 抗windup: PID的max_output抗饱和已防止积分windup(PID输出饱和时积分回退),
+     *   此处仅削减最终PWM, 不影响PID内部状态(integral等) */
+    if (mc->max_current > 0.0f) {
+        float abs_actual = fabsf(actual);
+        if (abs_actual > mc->max_current) {
+            /* 仅削减与电流同方向的PWM(驱动方向), 反向PWM(制动方向)不削减 */
+            if ((actual > 0.0f && output > 0) || (actual < 0.0f && output < 0)) {
+                float ratio = mc->max_current / abs_actual;
+                output = (int32_t)(output * ratio);
+            }
+        }
     }
 
     return (int16_t)output;
@@ -1012,7 +1464,13 @@ static int16_t MotorControl_CurrentLoop(MotorControl_t *mc)
 static void MotorControl_SpeedLoop(MotorControl_t *mc)
 {
     if (!motor_running || !mc->speed_loop_active) {
-        mc->speed_loop_integral = 0.0f;
+        /* 渐变衰减而非硬清零, 避免位置死区进出时速度环积分突变
+         * 导致current_target骤变→电流目标突变→速度突变.
+         * 位置死区内speed_loop_active=0, 每ms衰减10%, 约20ms归零. */
+        mc->speed_loop_integral *= 0.9f;
+        if (fabsf(mc->speed_loop_integral) < 0.01f) {
+            mc->speed_loop_integral = 0.0f;
+        }
         mc->speed_loop_prev_vel = mc->velocity;
         return;
     }
@@ -1033,23 +1491,76 @@ static void MotorControl_SpeedLoop(MotorControl_t *mc)
 
     float speed_error = mc->target_velocity - mc->velocity;
 
-    mc->speed_loop_integral += speed_error * dt;
+    /* 双套PID: 电流环使能时使用电流模式参数(增益更小), 关闭时使用电压模式参数 */
+    float eff_spd_Kp = mc->current_loop_en ? mc->spd_Kp_cur : mc->spd_Kp;
+    float eff_spd_Ki = mc->current_loop_en ? mc->spd_Ki_cur : mc->spd_Ki;
+    float eff_spd_Kd = mc->current_loop_en ? mc->spd_Kd_cur : mc->spd_Kd;
 
-    float P = mc->spd_Kp * speed_error;
-    float I = mc->spd_Ki * mc->speed_loop_integral;
-    float D = -mc->spd_Kd * (mc->velocity - mc->speed_loop_prev_vel) / dt;
+    /* eff_limit = output_limit(满量程): 电流限幅不再截顶速度环输出,
+     * 改由电流环PID输出后按比例缩小PWM. 速度环输出current_target可达满量程,
+     * 电流环在电流超限时直接削减PWM, 维持电流在限值 */
+    int32_t eff_limit = output_limit;
+
+    /* 积分分离 + 积分限幅: 防止速度环积分饱和导致电流目标虚高
+     *
+     * 问题现象: 电流环使能(3环级联)时, 电流目标远高于实际电流(实测目标936mA vs 实际68mA,
+     *   跟踪误差>90%), 但电机速度稳定(2219, 目标2222). 降速度环Ki会损失速度精度.
+     * 根因: 速度环1ms周期无条件累加积分. 稳态下编码器量化噪声导致的小速度误差(10脉冲/秒)
+     *   长期累积, speed_loop_integral涨到4680, I项=Ki*4680=936相对值=936mA.
+     *   电机轻载只需68mA(8相对值), 积分虚高导致电流环长期大误差空转, 启动时叠加电流环
+     *   积分则引发抖动. 原有抗饱和仅在输出>eff_limit(242相对值=2A)时回退, 但输出未饱和
+     *   (约113相对值), 积分无限累积.
+     *
+     * 修复(实测验证迭代):
+     *   1) 积分分离: |speed_error|<分离带时才积分(小误差精调), |error|>=分离带时不积分
+     *      (大误差仅靠P项快速响应). 分离带=目标速度2%(最小20脉冲/秒=速度死区).
+     *      稳态量化噪声约10脉冲/秒<20, 会积分消除稳态误差; 启动大误差不积分避免饱和.
+     *      注: 第一版逻辑写反(大误差才积分)导致修复无效, 已纠正.
+     *      注: 分离带曾用50, 但正常过冲误差~40<50会触发积分修正→I项下降→PWM下降→
+     *      速度崩溃→慢恢复(3秒), 表现为周期性停顿. 改为20(=死区)后过冲40>20不触发积分.
+     *   2) 积分限幅: |I|=|Ki*integral|≤20相对值(≈165mA). 积分仅消除稳态误差(摩擦/负载),
+     *      不承担大电流目标. 20相对值远小于eff_limit(242), 确保P项主导, 电流目标合理. */
+    float spd_sep_band = fabsf((float)mc->target_velocity) * 0.02f;
+    if (spd_sep_band < 20.0f) spd_sep_band = 20.0f;
+    if (fabsf(speed_error) < spd_sep_band) {
+        mc->speed_loop_integral += speed_error * dt;
+    }
+    /* 积分限幅: |I| ≤ 20相对值(≈165mA), 仅消除稳态误差, 不承担大电流目标 */
+    if (eff_spd_Ki > 1e-6f) {
+        const float spd_int_I_limit = 20.0f;  /* 积分项最大贡献, 相对值 */
+        float int_limit = spd_int_I_limit / eff_spd_Ki;
+        if (mc->speed_loop_integral > int_limit) mc->speed_loop_integral = int_limit;
+        if (mc->speed_loop_integral < -int_limit) mc->speed_loop_integral = -int_limit;
+    }
+
+    float P = eff_spd_Kp * speed_error;
+    float I = eff_spd_Ki * mc->speed_loop_integral;
+    float D = -eff_spd_Kd * (mc->velocity - mc->speed_loop_prev_vel) / dt;
     mc->speed_loop_prev_vel = mc->velocity;
+
+    /* 记录速度环调试数据(供上位机读取) */
+    mc->spd_loop_error = speed_error;
+    mc->spd_loop_p = P;
+    mc->spd_loop_i = I;
+    mc->spd_loop_d = D;
 
     int32_t output = (int32_t)(P + I + D);
 
-    /* 限幅 + 抗积分饱和 */
-    if (output > output_limit) {
-        output = output_limit;
-        mc->speed_loop_integral -= speed_error * dt;
+    /* 限幅 + 抗积分饱和
+     * output作为current_target, 使用满量程output_limit(不再受max_current截顶).
+     * 电流限幅改由电流环PID输出后按比例缩小PWM实现, 不影响速度环PID内部状态 */
+
+    if (output > eff_limit) {
+        output = eff_limit;
+        if (fabsf(speed_error) < spd_sep_band) {
+            mc->speed_loop_integral -= speed_error * dt;
+        }
     }
-    if (output < -output_limit) {
-        output = -output_limit;
-        mc->speed_loop_integral -= speed_error * dt;
+    if (output < -eff_limit) {
+        output = -eff_limit;
+        if (fabsf(speed_error) < spd_sep_band) {
+            mc->speed_loop_integral -= speed_error * dt;
+        }
     }
 
     /* 限位开关钳制 */
@@ -1064,9 +1575,31 @@ static void MotorControl_SpeedLoop(MotorControl_t *mc)
  * - 电流环关闭: output直接作为PWM输出(保持原行为) */
 static void MotorControl_SetOutput(MotorControl_t *mc, int16_t output)
 {
-    if (mc->current_loop_en) {
-        mc->current_target = (float)output;
-    } else {
+    /* 始终更新current_target, 供MotorControl_CurrentLoop读取
+     * (current_loop_en=0时电流环直接返回current_target作为PWM,
+     *  current_loop_en=1时电流环用current_target做PID) */
+    mc->current_target = (float)output;
+
+    /* 输出为0时渐变衰减电流环积分, 而非突然归零.
+     * 突然归零会导致 I=cur_Ki*current_integral 瞬间跌落, PWM骤变,
+     * 电机运行中(尤其是到位瞬间)速度突变.
+     *
+     * 渐变衰减: 每次将积分乘以衰减系数(0.9), 约10个100μs周期(1ms)衰减到35%,
+     * 约5ms衰减到12%, 约20ms衰减到1%, 既避免突变又能在短时间内自然归零防震荡.
+     * 仅在电流环使能时衰减(电流环关闭时积分无意义), 且仅衰减不硬清零.
+     * 电机停止/堵转/过流等保护场景仍硬清零(在CurrentLoop入口处处理). */
+    if (output == 0 && mc->current_loop_en) {
+        mc->current_integral *= 0.9f;
+        /* 衰减到极小值时直接归零, 避免浮点残差长期累积 */
+        if (fabsf(mc->current_integral) < 0.01f) {
+            mc->current_integral = 0.0f;
+        }
+    }
+
+    /* 开环/待机/电机未运行时立即写PWM; 其他运行模式由100us电流路径下发PWM,
+     * 这样非开环的电流环关闭模式也能执行过流检测和max_current软件斩波。 */
+    if (mc->mode == OPENLOOP_MODE || mc->mode == ADC_OPENLOOP_MODE ||
+        mc->mode == STANDBY_MODE || !motor_running) {
         Motor_SetPWM(output);
     }
 }
@@ -1356,11 +1889,19 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
             target = mc->pin5_target_pos;
         }
 
-        if (target_level_state != input || mc->target_position != target) {
+        if (target_level_state != input) {
             target_level_state = input;
-            MotorControl_SetTarget(mc, target);
-            mc->target_pos_frac = 0.0f;
-            MODBUS_SyncTargetPosition(mc->target_position);
+            if (mc->step_accel_en && !MotorControl_IsHoming()) {
+                /* 步进加减速: 目标送入yudingweizhi, 算法生成平滑轨迹 */
+                __disable_irq();
+                bujindianji[0].yudingweizhi = target;
+                __enable_irq();
+                StepAccel_Restart();
+            } else {
+                MotorControl_SetTarget(mc, target);
+                mc->target_pos_frac = 0.0f;
+                MODBUS_SyncTargetPosition(mc->target_position);
+            }
         }
     }
 
@@ -1415,10 +1956,12 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         mc->mode == ADC_OPENLOOP_MODE || mc->mode == ADC_POSITION_MODE) {
         /* 选择有效ADC通道: PC2优先, 仅当PC2=ADC_FUNC_NONE时才看PC3 */
         uint8_t active_func = mc->pc2_func;
-        uint16_t adc_raw = MotorControl_GetExternalADC(0);  /* PC2 */
+        /* 使用滤波后的ADC值(adc_filter_size=0或1时自动退化为原始值, 无副作用)
+         * 滤波在死区处理之前应用, 避免噪声在死区边缘频繁触发 */
+        uint16_t adc_raw = MotorControl_GetExternalADCFiltered(mc, 0);  /* PC2 */
         if (mc->pc2_func == ADC_FUNC_NONE) {
             active_func = mc->pc3_func;
-            adc_raw = MotorControl_GetExternalADC(1);  /* PC3 */
+            adc_raw = MotorControl_GetExternalADCFiltered(mc, 1);  /* PC3 */
         }
         float adc_norm = (float)adc_raw / 4095.0f;
         if (adc_norm > 1.0f) adc_norm = 1.0f;
@@ -1495,10 +2038,24 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         } else if (mc->mode == ADC_POSITION_MODE) {
             /* 位置类: min_position + ADC值×(max_position - min_position), 实时给目标位置走位置PID */
             int64_t target = mc->adc_min_position + (int64_t)(adc_norm * (float)(mc->adc_max_position - mc->adc_min_position));
-            if (mc->target_position != target) {
-                MotorControl_SetTarget(mc, target);
-                mc->target_pos_frac = 0.0f;
-                MODBUS_SyncTargetPosition(mc->target_position);
+            if (mc->step_accel_en && !MotorControl_IsHoming()) {
+                /* 步进加减速: 目标送入yudingweizhi, 算法生成平滑轨迹 */
+                int64_t ydwz;
+                __disable_irq();
+                ydwz = bujindianji[0].yudingweizhi;
+                __enable_irq();
+                if (ydwz != target) {
+                    __disable_irq();
+                    bujindianji[0].yudingweizhi = target;
+                    __enable_irq();
+                    StepAccel_Restart();
+                }
+            } else {
+                if (mc->target_position != target) {
+                    MotorControl_SetTarget(mc, target);
+                    mc->target_pos_frac = 0.0f;
+                    MODBUS_SyncTargetPosition(mc->target_position);
+                }
             }
         }
     }
@@ -1509,19 +2066,40 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         int32_t pulses = pulse_accumulator;
         pulse_accumulator = 0;
         __enable_irq();
-        mc->target_position += pulses;
-        MODBUS_SyncTargetPosition(mc->target_position);
+        if (mc->step_accel_en && MotorControl_IsPositionBasedMode(mc->mode) && !MotorControl_IsHoming()) {
+            /* 步进加减速: 脉冲累加到yudingweizhi, 算法生成平滑轨迹 */
+            __disable_irq();
+            bujindianji[0].yudingweizhi += pulses;
+            __enable_irq();
+            StepAccel_Restart();
+        } else {
+            mc->target_position += pulses;
+            MODBUS_SyncTargetPosition(mc->target_position);
+        }
     }
 
     /* 基于位置的速度模式：目标位置按速度累加（浮点累加避免低速截断） */
     if (mc->mode == VELOCITY_POSITION_MODE || mc->mode == ADC_POSITION_SPEED_MODE) {
         float limited_speed = mc->target_speed;
         if (mc->max_run_speed > 0) limited_speed = clampf(limited_speed, -(float)mc->max_run_speed, (float)mc->max_run_speed);
-        mc->target_pos_frac += limited_speed * dt;
-        int64_t inc = (int64_t)mc->target_pos_frac;
-        mc->target_position += inc;
-        mc->target_pos_frac -= (float)inc;
-        MODBUS_SyncTargetPosition(mc->target_position);
+        if (mc->step_accel_en && mc->mode == VELOCITY_POSITION_MODE && !MotorControl_IsHoming()) {
+            /* 步进加减速: 速度累加到yudingweizhi, 算法生成平滑轨迹 */
+            mc->target_pos_frac += limited_speed * dt;
+            int64_t inc = (int64_t)mc->target_pos_frac;
+            mc->target_pos_frac -= (float)inc;
+            if (inc != 0) {
+                __disable_irq();
+                bujindianji[0].yudingweizhi += inc;
+                __enable_irq();
+                StepAccel_Restart();
+            }
+        } else {
+            mc->target_pos_frac += limited_speed * dt;
+            int64_t inc = (int64_t)mc->target_pos_frac;
+            mc->target_position += inc;
+            mc->target_pos_frac -= (float)inc;
+            MODBUS_SyncTargetPosition(mc->target_position);
+        }
     }
 
     float error;
@@ -1538,7 +2116,31 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
     } else {
         error = (float)(mc->target_position - current_position);
         /* 位置模式/外部目标位置模式走死区；位置速度模式不走死区（目标持续移动，死区会导致脉冲式运动） */
-        if ((mc->mode == POSITION_MODE || mc->mode == EXTERNAL_TARGET_MODE) && fabsf(error) <= mc->dead_zone) {
+        /* 步进加减速模式: 运动中(dangqiansudu≠0)跳过死区(目标持续移动, 清积分会导致卡顿),
+         * 但到位后(dangqiansudu=0)必须应用死区, 否则残余位置误差→PWM饱和→极限环振荡.
+         *
+         * 100000步测试抖动根因: 步进完成后dangqiansudu=0但step_accel_en=1, 死区被跳过,
+         * 60脉冲误差×有效增益(pos_Kp_cur×cur_Kp=35)=2100→PWM饱和900→bang-bang→振荡.
+         * 修复: 检查dangqiansudu==0时视为"已完成", 允许死区介入停止PID输出. */
+        uint8_t apply_deadzone = 0;
+        if (mc->mode == POSITION_MODE || mc->mode == EXTERNAL_TARGET_MODE) {
+            if (!mc->step_accel_en) {
+                apply_deadzone = 1;
+            } else {
+                /* 步进加减速模式: 仅在算法停止时应用死区 */
+                __disable_irq();
+                int64_t step_spd = bujindianji[0].dangqiansudu;
+                __enable_irq();
+                if (step_spd == 0) apply_deadzone = 1;
+            }
+        }
+        if (apply_deadzone && fabsf(error) <= mc->dead_zone) {
+            /* 位置到位死区: 积分渐变衰减而非硬清零, 避免到位瞬间积分突变
+             * 导致I项跌落→PWM骤变→速度突变.
+             * mc->integral(位置环积分)和speed_limit_integral直接归零是安全的:
+             *   位置环积分在死区内无意义(误差已为0), 速度限幅积分同理.
+             * speed_loop_integral(1ms速度环)由SpeedLoop函数内根据
+             *   speed_loop_active=0自行衰减, 此处不直接清零. */
             mc->integral = 0;
             mc->prev_error = 0;
             speed_limit_integral = 0.0f;
@@ -1555,7 +2157,9 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
      * 位置环只做位置P输出target_velocity, 速度环激活标志置1.
      * 速度环在TimerTick中每10次(1ms)调用一次, 根据target_velocity做速度PID输出current_target. */
     if ((mc->mode == POSITION_MODE || mc->mode == EXTERNAL_TARGET_MODE) && mc->max_run_speed > 0) {
-        float target_vel = mc->pos_Kp * error;
+        /* 双套PID: 电流环使能时使用电流模式位置Kp */
+        float eff_pos_Kp = mc->current_loop_en ? mc->pos_Kp_cur : mc->pos_Kp;
+        float target_vel = eff_pos_Kp * error;
         target_vel = clampf(target_vel, -(float)mc->max_run_speed, (float)mc->max_run_speed);
         mc->target_velocity = target_vel;
         mc->speed_loop_active = 1;  /* 激活1ms速度环 */
@@ -1563,35 +2167,150 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         mc->prev_velocity = mc->velocity;
         /* 调试信息: 记录位置环输出供上位机观察 */
         mc->pid_error = error;
-        mc->pid_p = mc->pos_Kp * error;
+        mc->pid_p = eff_pos_Kp * error;
         mc->pid_i = 0.0f;
         mc->pid_d = 0.0f;
         /* 电流目标由速度环(1ms)写入current_target, 此处不直接输出 */
         return 0;
     }
 
-    float Kp = (mc->mode == SPEED_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE ||
-                 mc->mode == ADC_SPEED_MODE) ? mc->spd_Kp : mc->pos_Kp;
-    float Ki = (mc->mode == SPEED_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE ||
-                 mc->mode == ADC_SPEED_MODE) ? mc->spd_Ki : mc->pos_Ki;
-    float Kd = (mc->mode == SPEED_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE ||
-                 mc->mode == ADC_SPEED_MODE) ? mc->spd_Kd : mc->pos_Kd;
+    /* 单环PID参数选择: 先按模式选速度/位置参数, 再按电流环状态选电压/电流模式参数 */
+    uint8_t is_speed_mode = (mc->mode == SPEED_MODE || mc->mode == EXTERNAL_TARGET_SPEED_MODE ||
+                             mc->mode == ADC_SPEED_MODE);
+    float Kp = mc->current_loop_en ?
+        (is_speed_mode ? mc->spd_Kp_cur : mc->pos_Kp_cur) :
+        (is_speed_mode ? mc->spd_Kp : mc->pos_Kp);
+    float Ki = mc->current_loop_en ?
+        (is_speed_mode ? mc->spd_Ki_cur : mc->pos_Ki_cur) :
+        (is_speed_mode ? mc->spd_Ki : mc->pos_Ki);
+    float Kd = mc->current_loop_en ?
+        (is_speed_mode ? mc->spd_Kd_cur : mc->pos_Kd_cur) :
+        (is_speed_mode ? mc->spd_Kd : mc->pos_Kd);
 
     float P = Kp * error;
     mc->pid_error = error;
 
-    /* 位置模式: 误差过零时清零积分，防止超调后积分反向抵消导致缓慢回正 */
-    /* VELOCITY_POSITION_MODE 跳过此逻辑：跟踪中误差持续变化，清零积分会导致抖动 */
-    if (mc->mode == POSITION_MODE || mc->mode == EXTERNAL_TARGET_MODE) {
-        if (mc->prev_error != 0.0f &&
-            ((mc->prev_error > 0.0f && error < 0.0f) ||
-             (mc->prev_error < 0.0f && error > 0.0f))) {
-            mc->integral = 0;
+    /* [已关闭] 位置模式误差过零清零积分:
+     * 原逻辑在位置误差变号瞬间把 mc->integral 硬置0, 导致 I=Ki*integral 突然跌落,
+     * PID输出突变, 电机转速骤变(尤其Ki较大时). 现禁用此硬清零.
+     * 抗 windup 改由下列机制共同承担, 足以替代过零清零:
+     *   - 渐变式积分分离(int_gain = band/(band+|error|), 大误差时积分自动衰减)
+     *   - 积分限幅(|I| <= max_output*系数/Ki)
+     *   - 输出饱和时回退本次积分累积(见下方抗饱和块)
+     * 注: VELOCITY_POSITION_MODE 本就跳过此逻辑; 步进加减速到位后由死区停机处理. */
+    {
+        uint8_t allow_zero_clear = (!mc->step_accel_en);
+        if (mc->step_accel_en && (mc->mode == POSITION_MODE || mc->mode == EXTERNAL_TARGET_MODE)) {
+            __disable_irq();
+            int64_t step_spd_zc = bujindianji[0].dangqiansudu;
+            __enable_irq();
+            if (step_spd_zc == 0) allow_zero_clear = 1;
+        }
+        if ((mc->mode == POSITION_MODE || mc->mode == EXTERNAL_TARGET_MODE) && allow_zero_clear) {
+            /* 过零清零已禁用: 避免积分突变导致电机转速骤变 */
+            (void)allow_zero_clear;
+            (void)error;
+            /* if (mc->prev_error != 0.0f &&
+                ((mc->prev_error > 0.0f && error < 0.0f) ||
+                 (mc->prev_error < 0.0f && error > 0.0f))) {
+                mc->integral = 0;
+            } */
         }
     }
 
-    /* 标准PID积分: integral累加 error*dt, I = Ki * integral */
-    mc->integral += error * dt;
+    /* 标准PID积分: integral累加 error*dt, I = Ki * integral
+     *
+     * 速度模式积分分离+限幅: 防止电流环使能时电流目标虚高(实测936mA vs 实际68mA).
+     * 速度模式(mc->integral)与级联模式(speed_loop_integral)是两套独立积分变量,
+     * 速度模式走此单环PID, 级联模式(位置+max_run_speed)走MotorControl_SpeedLoop.
+     * 此前只改了SpeedLoop但速度模式走的是这里, 导致第一次修复无效.
+     * 修复:
+     *   1) 积分分离: 速度模式且|error|<分离带(目标速度2%,最小20脉冲/秒)时才积分,
+     *      大误差仅靠P项. 稳态量化噪声(<20)会积分消除静差, 启动大误差不积分.
+     *   2) 积分限幅: 速度模式|I|≤20相对值(≈165mA), 仅消除稳态摩擦/负载, 不承担大电流.
+     *   3) 位置模式保持原逻辑(过零清零已防饱和, 积分用于消除位置静差). */
+    if (is_speed_mode) {
+        if (mc->current_loop_en) {
+            /* 3环级联模式: 渐变式积分分离(替代硬分离带), 同时解决匀速停顿和变速卡顿.
+             *
+             * 问题历史:
+             *   1) 匀速停顿: 分离带宽(2%)时, 正常速度波动(误差60~200)在带内积分,
+             *      Ki=5~15导致I项波动大(0~20), 引发电流目标波动→速度振荡→周期性停顿.
+             *   2) 变速卡顿: 分离带窄(0.5%)时, 大误差(1450)完全不积分, I项=0,
+             *      仅靠P项(Kp=0.15)输出11~28, 加速缓慢, 变速卡顿0.6秒.
+             *
+             * 方案: 渐变式积分增益 - 误差小时全积分, 误差大时积分按比例衰减.
+             *   gain = sep_band / (sep_band + |error|)   (0 < gain <= 1)
+             *   - |error|<<sep_band: gain≈1, 全积分(消除稳态静差)
+             *   - |error|≈sep_band: gain≈0.5, 半积分(温和参与)
+             *   - |error|>>sep_band: gain≈0, 几乎不积分(防windup, 但非完全禁止)
+             * 相比硬分离带, 大误差时积分缓慢参与, 帮助P项加速, 消除变速卡顿.
+             *
+             * sep_band=目标速度2%(最小20), 匀速时正常波动(60)的gain=20/80=0.25,
+             * 积分贡献仅为全积分的1/4, 避免I项大幅波动导致停顿.
+             * 积分限幅=max_current的0.8倍(或max_output的0.5倍), 确保I项有足够调节空间.
+             * 注: 原限幅|I|≤15太小, Ki=5时integral限幅仅3, I项长期顶在15饱和失去调节
+             *   能力, 速度突降时无法补偿, 导致匀速卡顿. 放宽到max_current的0.8倍后,
+             *   I项可在0~190范围调节, 匀速时I项约12(轻载), 有充足余量应对扰动. */
+            float spd_sep_band = fabsf((float)mc->target_speed) * 0.02f;
+            if (spd_sep_band < 20.0f) spd_sep_band = 20.0f;
+            float abs_err = fabsf(error);
+            float int_gain = spd_sep_band / (spd_sep_band + abs_err);
+            mc->integral += error * dt * int_gain;
+            if (Ki > 1e-6f) {
+                /* 积分限幅: 取max_current*0.8与max_output*0.5的较小值, 确保不超电流/输出限制 */
+                float i_limit_val = (float)mc->max_output * 0.5f;
+                if (mc->max_current > 0.0f && mc->max_current * 0.8f < i_limit_val) {
+                    i_limit_val = mc->max_current * 0.8f;
+                }
+                float int_limit = i_limit_val / Ki;
+                if (mc->integral > int_limit) mc->integral = int_limit;
+                if (mc->integral < -int_limit) mc->integral = -int_limit;
+            }
+        } else {
+            /* 2环模式(无电流环): output直接作为PWM, 积分需消除大静差(轻载电机需PWM~500).
+             * 同样使用渐变式积分, sep_band=目标速度2%(最小50).
+             * 积分限幅放宽到max_output*0.8/Ki, 允许积分贡献足够PWM消除31%静差. */
+            float spd_sep_band = fabsf((float)mc->target_speed) * 0.02f;
+            if (spd_sep_band < 50.0f) spd_sep_band = 50.0f;
+            float abs_err = fabsf(error);
+            float int_gain = spd_sep_band / (spd_sep_band + abs_err);
+            mc->integral += error * dt * int_gain;
+            if (Ki > 1e-6f) {
+                float int_limit = (float)mc->max_output * 0.8f / Ki;
+                if (mc->integral > int_limit) mc->integral = int_limit;
+                if (mc->integral < -int_limit) mc->integral = -int_limit;
+            }
+        }
+    } else {
+        /* 位置模式积分: 步进加减速模式需限幅, 防止跟踪误差持续累加导致低频振荡
+         *
+         * 问题现象: 100000步加减速运行中, 匀速段速度有~3秒周期性抖动(波动7%),
+         *   到位后5秒才稳定(pos_err从+129振荡到0), PWM在到位后持续负向(-5~-97).
+         * 根因: 步进加减速模式下目标位置持续移动, 电机跟踪有微小滞后,
+         *   位置误差持续为正→积分无限累加(I项达-308)→到位后积分需长时间放电→振荡.
+         *   匀速段: 误差+57→积分增→PWM增→速度增→误差变负→积分减→PWM减→速度减→周期循环.
+         *
+         * 修复: 步进加减速模式下使用渐变式积分分离+限幅, 与速度模式一致:
+         *   1) 分离带: 步进模式sep_band=30脉冲(位置死区30倍), |error|>band时积分按比例衰减
+         *      正常跟踪误差5~20<30→全积分(消除稳态偏差), 大误差(启动/减速)>30→积分衰减
+         *   2) 积分限幅: |I|≤max_output*0.1(=90相对值), 积分仅微调不主导
+         *   非步进模式保持原逻辑(过零清零已防饱和, 积分用于消除位置静差) */
+        if (mc->step_accel_en) {
+            float pos_sep_band = 30.0f;  /* 位置积分分离带(脉冲) */
+            float abs_err = fabsf(error);
+            float int_gain = pos_sep_band / (pos_sep_band + abs_err);
+            mc->integral += error * dt * int_gain;
+            /* 积分限幅: |I| ≤ max_output*0.1, 防止积分主导输出 */
+            if (Ki > 1e-6f) {
+                float int_limit = (float)mc->max_output * 0.1f / Ki;
+                if (mc->integral > int_limit) mc->integral = int_limit;
+                if (mc->integral < -int_limit) mc->integral = -int_limit;
+            }
+        } else {
+            mc->integral += error * dt;
+        }
+    }
     float I = Ki * mc->integral;
     mc->pid_p = P;
     mc->pid_i = I;
@@ -1602,26 +2321,93 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         /* D项基于速度变化, 经过移动平均后噪声小 */
         D = -Kd * (mc->velocity - mc->prev_velocity) / dt;
     } else {
-        /* 位置模式: 用当前速度做微分阻尼 */
-        D = -Kd * mc->velocity;
+        /* 位置模式D项: 步进加减速模式用误差导数, 普通模式用速度阻尼
+         *
+         * 原代码: D = -Kd * velocity (所有位置模式统一)
+         * 问题: 步进加减速模式目标持续移动, 匀速跟踪时velocity≈target_vel≠0,
+         *   D=-Kd*4100=-234(制动力!), 积分必须windup到+772来克服, 导致~3秒周期抖动.
+         *
+         * 修复: 步进加减速模式改用误差导数 D=Kd*(target_vel-actual_vel)
+         *   - 匀速跟踪: target_vel≈actual_vel → D≈0 (无多余制动力)
+         *   - 启动加速: target_vel>actual_vel → D>0 (助力加速)
+         *   - 减速停车: target_vel<actual_vel → D<0 (助力减速)
+         * 普通位置模式(静止目标): target_vel=0 → D=-Kd*velocity (与原代码一致) */
+        if (mc->step_accel_en) {
+            float target_vel = (float)(mc->target_position - mc->prev_target_position) / dt;
+            D = Kd * (target_vel - mc->velocity);
+        } else {
+            D = -Kd * mc->velocity;
+        }
     }
     mc->pid_d = D;
     mc->prev_error = error;
     mc->prev_velocity = mc->velocity;
 
-    int32_t output = (int32_t)(P + I + D);
+    /* 速度前馈(步进加减速模式): 提供维持速度所需的基础输出, 消除积分windup
+     * FF = pos_Kff * target_vel
+     * 匀速时FF提供主要驱动量, P/I/D仅修正微小偏差, 积分不再需要windup
+     * 注意: 必须在prev_target_position更新之前计算, 否则target_vel=0 */
+    float FF = 0.0f;
+    if (mc->step_accel_en && mc->pos_Kff > 0.0f) {
+        float target_vel_ff = (float)(mc->target_position - mc->prev_target_position) / dt;
+        FF = mc->pos_Kff * target_vel_ff;
+    }
 
-    /* 输出限幅 + 抗积分饱和: 输出饱和时停止积分继续累积 */
-    if (output > output_limit) {
-        output = output_limit;
-        /* 饱和时回退本次积分累积 */
-        mc->integral -= error * dt;
+    /* 更新prev_target_position(供下次D项和FF计算使用) */
+    mc->prev_target_position = mc->target_position;
+
+    int32_t output = (int32_t)(P + I + D + FF);
+
+    /* 输出限幅 + 抗积分饱和:
+     * 电流环使能时, output作为current_target, 不再受max_current限制,
+     * 而是使用满量程max_output. 电流限幅改由电流环PID输出后按比例缩小PWM实现.
+     * 这样位置/速度环可以输出满量程current_target, 电流环在电流超限时削减PWM */
+    int32_t eff_limit = output_limit;
+
+    if (output > eff_limit) {
+        output = eff_limit;
+        /* 饱和时回退本次积分累积(渐变式, 与上方累加逻辑一致) */
+        if (is_speed_mode) {
+            float spd_sep_band;
+            if (mc->current_loop_en) {
+                spd_sep_band = fabsf((float)mc->target_speed) * 0.02f;
+                if (spd_sep_band < 20.0f) spd_sep_band = 20.0f;
+            } else {
+                spd_sep_band = fabsf((float)mc->target_speed) * 0.02f;
+                if (spd_sep_band < 50.0f) spd_sep_band = 50.0f;
+            }
+            float int_gain = spd_sep_band / (spd_sep_band + fabsf(error));
+            mc->integral -= error * dt * int_gain;
+        } else if (mc->step_accel_en) {
+            float pos_sep_band = 30.0f;
+            float int_gain = pos_sep_band / (pos_sep_band + fabsf(error));
+            mc->integral -= error * dt * int_gain;
+        } else {
+            mc->integral -= error * dt;
+        }
         mc->pid_i = Ki * mc->integral;
     }
-    if (output < -output_limit) {
-        output = -output_limit;
-        /* 饱和时回退本次积分累积 */
-        mc->integral -= error * dt;
+    if (output < -eff_limit) {
+        output = -eff_limit;
+        /* 饱和时回退本次积分累积(渐变式, 与上方累加逻辑一致) */
+        if (is_speed_mode) {
+            float spd_sep_band;
+            if (mc->current_loop_en) {
+                spd_sep_band = fabsf((float)mc->target_speed) * 0.02f;
+                if (spd_sep_band < 20.0f) spd_sep_band = 20.0f;
+            } else {
+                spd_sep_band = fabsf((float)mc->target_speed) * 0.02f;
+                if (spd_sep_band < 50.0f) spd_sep_band = 50.0f;
+            }
+            float int_gain = spd_sep_band / (spd_sep_band + fabsf(error));
+            mc->integral -= error * dt * int_gain;
+        } else if (mc->step_accel_en) {
+            float pos_sep_band = 30.0f;
+            float int_gain = pos_sep_band / (pos_sep_band + fabsf(error));
+            mc->integral -= error * dt * int_gain;
+        } else {
+            mc->integral -= error * dt;
+        }
         mc->pid_i = Ki * mc->integral;
     }
 
@@ -1669,10 +2455,8 @@ void Motor_Start(void)
     TIM4->CCR2 = 1000;
     TIM4->CCR4 = 1000;
 
-    /* 启动前清零编码器 */
-    __HAL_TIM_SET_COUNTER(&htim3, 0);
-    encoder_cnt_prev = 0;
-    encoder_total_count = 0;
+    /* 启动前清零编码器(CNT/prev/total 原子清零, 实现已移至 encoder.c) */
+    Encoder_Reset();
 
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
 
@@ -1683,11 +2467,11 @@ void Motor_Start(void)
 
     /* 启动ADC DMA连续转换(4通道: 电流+电压+2个外部ADC)
      * ADC1已配置为连续转换模式+DMA循环模式, 启动后DMA按Rank顺序把4个通道的
-     * 转换结果循环搬到adc_values[4]数组中, 各功能模块直接读数组对应元素即可
+     * 转换结果循环搬到adc_values[100]数组中, 各功能模块读取对应通道25个元素平均值
      * 注意: HAL_ADC_Start_DMA内部会调用HAL_DMA_Start_IT使能传输完成中断,
      * 但ADC连续转换每1us就会触发一次中断, 严重干扰TIM3编码器(0,0)和TIM1 PID(2,0)
      * 所以启动后立即关闭DMA1_Channel1的NVIC使能, 让DMA在后台静默传输 */
-    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_values, 4) != HAL_OK) {
+    if (HAL_ADC_Start_DMA(&hadc1, (uint32_t*)adc_values, ADC_DMA_VALUE_COUNT) != HAL_OK) {
         /* ADC启动失败: 不阻塞运行, 电流环读到的值会是0(相当于无电流)
          * 电流环如果未使能(默认), 完全不影响原有功能 */
     }
@@ -1731,316 +2515,82 @@ void Motor_SetPWM(int16_t output)
     }
 }
 
-/* TIM3溢出中断已弃用: 保留空函数避免stm32f1xx_it.c中的调用链接错误.
- * 64位位置合成改为在TIM1 100μs中断里调用Encoder_Synthesize()实现. */
-void Encoder_OverflowHandler(void)
+/* 采集辅助函数: 根据采集类型返回一个int16_t采样值
+ * 提取自TIM1中断中的采集逻辑, 供多通道轮询调用.
+ * 参数: mc - 电机控制结构体, acq_type - 采集类型(0~23)
+ * 返回: 钳位到int16_t范围的采样值 */
+static int16_t MotorControl_GetAcqSample(MotorControl_t *mc, uint8_t acq_type)
 {
-    /* 空函数 - TIM3溢出中断已关闭, 不会进入此处 */
-}
-
-/* 编码器位置合成: 在TIM1 100μs中断中调用, 差分累加CNT.
- * 利用int16_t补码自动处理65536模回绕:
- *   正向溢出 65535→0:   delta = (int16_t)(0 - 65535) = (int16_t)(-65535) = +1
- *   反向溢出 0→65535:   delta = (int16_t)(65535 - 0) = (int16_t)(65535) = -1
- *   正常递增 100→200:   delta = +100
- *   正常递减 200→100:   delta = -100
- * 100μs内编码器不可能走32768步(物理约束), 故int16_t差分无歧义. */
-static void Encoder_Synthesize(void)
-{
-    uint16_t cnt_curr = (uint16_t)TIM3->CNT;
-    int16_t delta = (int16_t)(cnt_curr - encoder_cnt_prev);
-    encoder_total_count += delta;
-    encoder_cnt_prev = cnt_curr;
-}
-
-int64_t Encoder_GetCount(void)
-{
-    /* encoder_total_count在TIM1 100μs中断里更新(64位).
-     * 主循环读取时必须关全局中断保证64位读原子性,
-     * 避免读到"高32位已更新/低32位未更新"的撕裂值.
-     * 关中断时间极短(几条指令), 对系统无影响.
-     * 在TIM1 ISR中调用时__get_PRIMASK()=1, __disable_irq()无效但安全. */
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    int64_t count = encoder_total_count;
-    __set_PRIMASK(primask);
-
-    /* 编码器方向反转时计数取反 */
-    if (motor_ctl && motor_ctl->encoder_dir == ENCODER_DIR_REVERSED) {
-        count = -count;
-    }
-    return count;
-}
-
-float Encoder_GetSpeed(void)
-{
-    float spd = current_velocity;
-    /* 编码器方向反转时速度取反 */
-    if (motor_ctl && motor_ctl->encoder_dir == ENCODER_DIR_REVERSED) {
-        spd = -spd;
-    }
-    return spd;
-}
-
-void Encoder_Reset(void)
-{
-    /* 关全局中断保证CNT/prev/total三者的同步原子性.
-     * Encoder_Reset可能被以下场景调用:
-     *   - 主循环(如MotorControl_SetOrigin已关TIM1中断, 这里再关全局更稳妥)
-     *   - TIM1 ISR内(如MotorControl_FinishHoming), 此时已禁中断, 重复禁用安全 */
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-    TIM3->CNT = 0;
-    encoder_cnt_prev = 0;
-    encoder_total_count = 0;
-    __set_PRIMASK(primask);
-}
-
-/* 主循环中处理PB4/PB5输入（备份检查，定时器中断已处理脉冲/限位）
- *
- * 当前职责:
- *   - 处理配置为 PIN_FUNC_HOME_START("执行复位操作") 的引脚:
- *     按下瞬间(上升沿)触发一次 MotorControl_StartHoming。
- *     受 home_mode 配置约束: home_mode=HOME_MODE_OFF 时 StartHoming 内部直接返回。
- *     复位进行中(IsHoming=1)时不重复触发, 冷却 HOME_START_COOLDOWN_MS 防抖。
- *   - 处理配置为 PIN_FUNC_START_FLAG("启动标志位触发") 的引脚:
- *     引脚有效边沿触发一次 MODBUS_TriggerStartFlag, 等同于上位机写 REG_START_MODE=1。
- *     仅在 start_mode=1(标志位启动) 时有效, 用于多电机同步启动。
- *     复位进行中(IsHoming=1)时不触发, 冷却 HOME_START_COOLDOWN_MS 防抖。 */
-void MotorControl_ProcessInputs(void)
-{
-    if (!motor_ctl) return;
-
-    /* ========== 停止功能处理（PIN_FUNC_STOP）==========
-     * 按钮按下时stop_override=1强制PWM输出为0,
-     * 松开后stop_override=0恢复正常运行。
-     * 不依赖Homing状态, 任何时刻都生效。 */
-    {
-        uint8_t stop_active = 0;
-        if (motor_ctl->pin4_func == PIN_FUNC_STOP) {
-            uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) ? 1 : 0;
-            if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-            if (cur) stop_active = 1;
-        }
-        if (motor_ctl->pin5_func == PIN_FUNC_STOP) {
-            uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) ? 1 : 0;
-            if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-            if (cur) stop_active = 1;
-        }
-        stop_override = stop_active;
-    }
-
-    /* 仅在非复位状态处理按钮, 避免与正在进行的复位流程互相干扰 */
-    if (MotorControl_IsHoming()) {
-        /* 复位期间持续刷新"上次电平", 防止复位结束时误把松开动作当成新按下 */
-        if (motor_ctl->pin4_func == PIN_FUNC_HOME_START) {
-            uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) ? 1 : 0;
-            if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-            home_start_btn4_prev = cur;
-        }
-        if (motor_ctl->pin5_func == PIN_FUNC_HOME_START) {
-            uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) ? 1 : 0;
-            if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-            home_start_btn5_prev = cur;
-        }
-        if (motor_ctl->pin4_func == PIN_FUNC_START_FLAG) {
-            uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) ? 1 : 0;
-            if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-            startflag_btn4_prev = cur;
-        }
-        if (motor_ctl->pin5_func == PIN_FUNC_START_FLAG) {
-            uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) ? 1 : 0;
-            if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-            startflag_btn5_prev = cur;
-        }
-        return;
-    }
-
-    uint32_t now = HAL_GetTick();
-
-    /* PB4 配置为"执行复位操作"按钮 */
-    if (motor_ctl->pin4_func == PIN_FUNC_HOME_START) {
-        uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) ? 1 : 0;
-        if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-        /* 上升沿 + 冷却时间已过 → 触发一次复位 */
-        if (cur && !home_start_btn4_prev &&
-            (now - home_start_last_trigger_tick) >= HOME_START_COOLDOWN_MS) {
-            MotorControl_StartHoming(motor_ctl);
-            home_start_last_trigger_tick = now;
-        }
-        home_start_btn4_prev = cur;
+    int16_t sample;
+    if (acq_type == 1) {
+        /* 采集PWM输出 (-1000~+1000) */
+        sample = current_pwm_output;
+    } else if (acq_type == 2) {
+        /* 采集位置(相对起始位置的偏移, int16_t范围±32767脉冲) */
+        int64_t diff = Encoder_GetCount() - mc->speed_acq_pos_start;
+        if (diff > 32767) diff = 32767;
+        if (diff < -32767) diff = -32767;
+        sample = (int16_t)diff;
+    } else if (acq_type == 3) {
+        /* 采集电流(A×1000, 1A=1000, 满量程±8.25A=±8250) */
+        float cur = MotorControl_ReadCurrent(mc);
+        mc->current_actual = cur;
+        float cur_A1000 = cur * 8.25f;
+        if (cur_A1000 > 32767.0f) cur_A1000 = 32767.0f;
+        if (cur_A1000 < -32767.0f) cur_A1000 = -32767.0f;
+        sample = (int16_t)cur_A1000;
+    } else if (acq_type == 4) {
+        /* 采集PC0电压ADC原始值 (0~4095, 12位ADC) */
+        sample = (int16_t)MotorControl_GetSupplyVoltageADC();
+    } else if (acq_type == 5) {
+        /* 采集PC2外部ADC值 (滤波后, 0~4095) */
+        sample = (int16_t)MotorControl_GetExternalADCFiltered(mc, 0);
+    } else if (acq_type == 6) {
+        /* 采集PC3外部ADC值 (滤波后, 0~4095) */
+        sample = (int16_t)MotorControl_GetExternalADCFiltered(mc, 1);
+    } else if (acq_type >= 7 && acq_type <= 21) {
+        /* 采集PID各环输出项(P/I/D实时输出) */
+        float pid_val = 0.0f;
+        uint8_t t = acq_type;
+        if (t == 7 || t == 16) pid_val = mc->pid_p;
+        else if (t == 8 || t == 17) pid_val = mc->pid_i;
+        else if (t == 9 || t == 18) pid_val = mc->pid_d;
+        else if (t == 10 || t == 19) pid_val = mc->spd_loop_p;
+        else if (t == 11 || t == 20) pid_val = mc->spd_loop_i;
+        else if (t == 12 || t == 21) pid_val = mc->spd_loop_d;
+        else if (t == 13) pid_val = mc->cur_loop_p;
+        else if (t == 14) pid_val = mc->cur_loop_i;
+        else if (t == 15) pid_val = mc->cur_loop_d;
+        if (pid_val > 32767.0f) pid_val = 32767.0f;
+        if (pid_val < -32767.0f) pid_val = -32767.0f;
+        sample = (int16_t)pid_val;
+    } else if (acq_type == 22) {
+        /* 采集位置误差 (目标位置 - 当前位置, 脉冲, int16_t范围±32767)
+         * 位置模式下: pid_error即为位置误差, 直接读取
+         * 其他模式下: 实时计算 target_position - Encoder_GetCount() */
+        float err = (float)(mc->target_position - Encoder_GetCount());
+        if (err > 32767.0f) err = 32767.0f;
+        if (err < -32767.0f) err = -32767.0f;
+        sample = (int16_t)err;
+    } else if (acq_type == 23) {
+        /* 采集速度误差 (目标速度 - 当前速度, 脉冲/秒, int16_t范围±32767)
+         * 速度模式下: pid_error即为速度误差
+         * 级联模式下: spd_loop_error为速度环误差(target_velocity - velocity)
+         * 这里统一用 target_speed - velocity 计算, 适用于速度模式 */
+        float err = mc->target_speed - mc->velocity;
+        if (err > 32767.0f) err = 32767.0f;
+        if (err < -32767.0f) err = -32767.0f;
+        sample = (int16_t)err;
     } else {
-        home_start_btn4_prev = 0;
+        /* 默认: 采集转速 (脉冲/秒, int16_t范围±32767) */
+        float spd = Encoder_GetSpeed();
+        if (spd > 32767.0f) spd = 32767.0f;
+        if (spd < -32767.0f) spd = -32767.0f;
+        sample = (int16_t)spd;
     }
-
-    /* PB5 配置为"执行复位操作"按钮 */
-    if (motor_ctl->pin5_func == PIN_FUNC_HOME_START) {
-        uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) ? 1 : 0;
-        if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-        if (cur && !home_start_btn5_prev &&
-            (now - home_start_last_trigger_tick) >= HOME_START_COOLDOWN_MS) {
-            MotorControl_StartHoming(motor_ctl);
-            home_start_last_trigger_tick = now;
-        }
-        home_start_btn5_prev = cur;
-    } else {
-        home_start_btn5_prev = 0;
-    }
-
-    /* ========== 启动标志位触发处理（PIN_FUNC_START_FLAG）==========
-     * 引脚有效边沿(上升沿)触发一次 MODBUS_TriggerStartFlag,
-     * 等同于上位机写 REG_START_MODE=1: 应用缓存的模式/目标位置/目标速度。
-     * 仅在 start_mode=1 时由 MODBUS_TriggerStartFlag 内部判定生效,
-     * start_mode=0(直接启动)时触发无动作(目标已在写入时即时生效)。
-     * 用途: 多电机同步启动——上位机批量下发目标后, 硬件信号同步触发各电机。 */
-
-    /* PB4 配置为"启动标志位触发" */
-    if (motor_ctl->pin4_func == PIN_FUNC_START_FLAG) {
-        uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) ? 1 : 0;
-        if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-        if (cur && !startflag_btn4_prev &&
-            (now - startflag_last_trigger_tick) >= HOME_START_COOLDOWN_MS) {
-            MODBUS_TriggerStartFlag();
-            startflag_last_trigger_tick = now;
-        }
-        startflag_btn4_prev = cur;
-    } else {
-        startflag_btn4_prev = 0;
-    }
-
-    /* PB5 配置为"启动标志位触发" */
-    if (motor_ctl->pin5_func == PIN_FUNC_START_FLAG) {
-        uint8_t cur = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) ? 1 : 0;
-        if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) cur = !cur;
-        if (cur && !startflag_btn5_prev &&
-            (now - startflag_last_trigger_tick) >= HOME_START_COOLDOWN_MS) {
-            MODBUS_TriggerStartFlag();
-            startflag_last_trigger_tick = now;
-        }
-        startflag_btn5_prev = cur;
-    } else {
-        startflag_btn5_prev = 0;
-    }
+    return sample;
 }
 
-/* 根据PB4/PB5功能配置EXTI外部中断
- * 仅当引脚功能为 PIN_FUNC_PULSE 时启用EXTI边沿触发, 极性决定触发沿:
- *   POLARITY_ACTIVE_HIGH -> 上升沿触发
- *   POLARITY_ACTIVE_LOW  -> 下降沿触发
- * 非脉冲功能: 关闭EXTI并清挂起位, 防止残留触发
- *
- * STM32F1 EXTI线映射:
- *   EXTI4 通过 AFIO_EXTICR2 选择源引脚(0=PA4, 1=PB4, 2=PC4...)
- *   EXTI5 通过 AFIO_EXTICR2 选择源引脚(0=PA5, 1=PB5, 2=PC5...)
- * GPIO_MODE_INPUT 模式下HAL不配置 AFIO_EXTICR, 这里必须手动配置
- *
- * 中断优先级(固定, 不再动态切换):
- *   TIM1 PID=1 (main.c启动时设置), EXTI脉冲=1 (同级, 不互相抢占),
- *   USART1=3. EXTI有PR硬件挂起位锁存, 即便被TIM1延迟处理也不会丢失脉冲边沿. */
-void MotorControl_UpdateIrqPriority(void)
-{
-    if (!motor_ctl) return;
-
-    uint8_t pulse_on_pin4 = (motor_ctl->pin4_func == PIN_FUNC_PULSE);
-    uint8_t pulse_on_pin5 = (motor_ctl->pin5_func == PIN_FUNC_PULSE);
-
-    /* 配置EXTI4/EXTI5源为PB4/PB5 (AFIO_EXTICR2: bits[3:0]=EXTI4源, bits[7:4]=EXTI5源)
-     * PB port source = 0x01, 写之前先屏蔽对应EXTI线避免配置期间误触发 */
-    EXTI->IMR &= ~(EXTI_IMR_IM4 | EXTI_IMR_IM5);
-    AFIO->EXTICR[1] = (AFIO->EXTICR[1] & ~0x00FFu) | 0x0011u;  /* EXTI4=PB4, EXTI5=PB5 */
-
-    /* 配置PB4 EXTI线 (Line 4) */
-    {
-        EXTI->EMR &= ~EXTI_EMR_EM4;
-        EXTI->RTSR &= ~EXTI_RTSR_TR4;   /* 清上升沿 */
-        EXTI->FTSR &= ~EXTI_FTSR_TR4;   /* 清下降沿 */
-        EXTI->PR = EXTI_PR_PR4;         /* 清挂起位, 写1清0 */
-
-        if (pulse_on_pin4) {
-            if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) {
-                EXTI->FTSR |= EXTI_FTSR_TR4;  /* 低电平有效: 下降沿触发 */
-            } else {
-                EXTI->RTSR |= EXTI_RTSR_TR4;  /* 高电平有效: 上升沿触发 */
-            }
-            EXTI->IMR |= EXTI_IMR_IM4;       /* 取消屏蔽, 使能中断 */
-        }
-    }
-
-    /* 配置PB5 EXTI线 (Line 5, 与Line 5~9共享 EXTI9_5_IRQHandler) */
-    {
-        EXTI->EMR &= ~EXTI_EMR_EM5;
-        EXTI->RTSR &= ~EXTI_RTSR_TR5;
-        EXTI->FTSR &= ~EXTI_FTSR_TR5;
-        EXTI->PR = EXTI_PR_PR5;
-
-        if (pulse_on_pin5) {
-            if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) {
-                EXTI->FTSR |= EXTI_FTSR_TR5;
-            } else {
-                EXTI->RTSR |= EXTI_RTSR_TR5;
-            }
-            EXTI->IMR |= EXTI_IMR_IM5;
-        }
-    }
-
-    /* NVIC: EXTI优先级固定为1, 仅按需使能/失能NVIC (不再切换TIM1优先级)
-     * TIM1_UP_IRQn优先级在main.c启动时一次性设为1 */
-    HAL_NVIC_SetPriority(EXTI4_IRQn,   1, 0);
-    HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
-    if (pulse_on_pin4 || pulse_on_pin5) {
-        HAL_NVIC_EnableIRQ(EXTI4_IRQn);
-        HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-    } else {
-        HAL_NVIC_DisableIRQ(EXTI4_IRQn);
-        HAL_NVIC_DisableIRQ(EXTI9_5_IRQn);
-    }
-
-    /* 同步内部边沿检测状态(归一化后电平), 避免切换瞬间误触发 */
-    uint8_t p4 = (GPIOB->IDR & GPIO_PIN_4) ? 1 : 0;
-    uint8_t p5 = (GPIOB->IDR & GPIO_PIN_5) ? 1 : 0;
-    if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) p4 = !p4;
-    if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) p5 = !p5;
-    prev_pin4_state = p4;
-    prev_pin5_state = p5;
-}
-
-/* EXTI中断中调用: 脉冲边沿处理 (pin=4或5)
- * 直接读GPIO IDR寄存器(2 cycles), 累加pulse_accumulator(atomic int32)
- * 全函数约30~50 cycles, 含硬件压栈出栈约580ns
- * 方向引脚在同一时刻读取, 比TIM2轮询更精准 */
-void MotorControl_OnPulseExti(uint8_t pin)
-{
-    if (!motor_ctl) return;
-
-    /* 当前直接读IDR寄存器, 避免HAL_GPIO_ReadPin的额外开销 */
-    uint32_t idr = GPIOB->IDR;
-    uint8_t cur_pin4 = (idr & GPIO_PIN_4) ? 1 : 0;
-    uint8_t cur_pin5 = (idr & GPIO_PIN_5) ? 1 : 0;
-
-    if (motor_ctl->pin4_polarity == POLARITY_ACTIVE_LOW) cur_pin4 = !cur_pin4;
-    if (motor_ctl->pin5_polarity == POLARITY_ACTIVE_LOW) cur_pin5 = !cur_pin5;
-
-    /* 查找方向引脚: PB4/PB5中配置为DIR的那个 */
-    uint8_t dir_pin_state = 0;
-    if (motor_ctl->pin4_func == PIN_FUNC_DIR) {
-        dir_pin_state = cur_pin4;
-    } else if (motor_ctl->pin5_func == PIN_FUNC_DIR) {
-        dir_pin_state = cur_pin5;
-    }
-
-    if (pin == 4) {
-        /* PB4脉冲: 根据方向脚累加+1或-1 */
-        if (motor_ctl->pin4_func == PIN_FUNC_PULSE) {
-            pulse_accumulator += dir_pin_state ? 1 : -1;
-        }
-        prev_pin4_state = cur_pin4;
-    } else if (pin == 5) {
-        if (motor_ctl->pin5_func == PIN_FUNC_PULSE) {
-            pulse_accumulator += dir_pin_state ? 1 : -1;
-        }
-        prev_pin5_state = cur_pin5;
-    }
-}
 
 /* TIM1 100us滴答, 三环分频控制:
  *   每 1 次  (100μs): 电流环 PID   - 读ADC电流, 根据current_target做PID输出PWM
@@ -2063,51 +2613,38 @@ void MotorControl_TimerTick100us(void)
      * 差分用int16_t补码自动处理65536模回绕, 不依赖任何中断. */
     Encoder_Synthesize();
 
-    /* 转速采集：按分频值采样到1KB缓冲区 */
+    /* 多通道数据采集：按分频值采样到缓冲区
+     * 每个采样周期(divider个100us tick)依次采集所有通道,
+     * 缓冲区数据交错存储: [ch1_t0, ch2_t0, ..., chN_t0, ch1_t1, ...]
+     * 类似STM32 ADC扫描模式. 采样率(每通道)不变, 缓冲区填充快N倍. */
     if (motor_ctl && motor_ctl->speed_acq_active && !motor_ctl->speed_acq_done) {
         if (motor_ctl->speed_acq_div_cnt == 0) {
-            if (motor_ctl->speed_acq_count < SPEED_ACQ_BUF_SIZE) {
-                int16_t sample;
-                if (motor_ctl->speed_acq_type == 1) {
-                    /* 采集PWM输出 (-1000~+1000) */
-                    sample = current_pwm_output;
-                } else if (motor_ctl->speed_acq_type == 2) {
-                    /* 采集位置(相对起始位置的偏移, int16_t范围±32767脉冲) */
-                    int64_t diff = Encoder_GetCount() - motor_ctl->speed_acq_pos_start;
-                    if (diff > 32767) diff = 32767;
-                    if (diff < -32767) diff = -32767;
-                    sample = (int16_t)diff;
-                } else if (motor_ctl->speed_acq_type == 3) {
-                    /* 采集电流(相对值, ±1000对应±8.25A, int16_t范围±32767)
-                     * 直接读ADC, 不依赖电流环是否使能 */
-                    float cur = MotorControl_ReadCurrent(motor_ctl);
-                    motor_ctl->current_actual = cur;  /* 顺便刷新实际电流值 */
-                    if (cur > 32767.0f) cur = 32767.0f;
-                    if (cur < -32767.0f) cur = -32767.0f;
-                    sample = (int16_t)cur;
-                } else if (motor_ctl->speed_acq_type == 4) {
-                    /* 采集PC0电压ADC原始值 (0~4095, 12位ADC, 分压100K:10K检测供电电压)
-                     * ADC值0~4095完全在int16_t正数范围内, 无符号问题 */
-                    sample = (int16_t)MotorControl_GetSupplyVoltageADC();
-                } else if (motor_ctl->speed_acq_type == 5) {
-                    /* 采集PC2外部ADC原始值 (0~4095, 12位ADC, 电位器等外部输入) */
-                    sample = (int16_t)MotorControl_GetExternalADC(0);
-                } else if (motor_ctl->speed_acq_type == 6) {
-                    /* 采集PC3外部ADC原始值 (0~4095, 12位ADC, 电位器等外部输入) */
-                    sample = (int16_t)MotorControl_GetExternalADC(1);
-                } else {
-                    /* 采集转速 (脉冲/秒, int16_t范围±32767) */
-                    float spd = Encoder_GetSpeed();
-                    if (spd > 32767.0f) spd = 32767.0f;
-                    if (spd < -32767.0f) spd = -32767.0f;
-                    sample = (int16_t)spd;
+            /* 确定有效通道数(钳位1~4) */
+            uint8_t nch = motor_ctl->speed_acq_channels;
+            if (nch < 1) nch = 1;
+            if (nch > 4) nch = 4;
+            /* 依次采集每个通道 */
+            uint8_t ch;
+            for (ch = 0; ch < nch; ch++) {
+                if (motor_ctl->speed_acq_count >= SPEED_ACQ_BUF_SIZE) break;
+                if (motor_ctl->speed_acq_count >= motor_ctl->speed_acq_size) break;
+                /* 选择当前通道的采集类型 */
+                uint8_t acq_type;
+                switch (ch) {
+                    case 0:  acq_type = motor_ctl->speed_acq_type;  break;
+                    case 1:  acq_type = motor_ctl->speed_acq_type2; break;
+                    case 2:  acq_type = motor_ctl->speed_acq_type3; break;
+                    case 3:  acq_type = motor_ctl->speed_acq_type4; break;
+                    default: acq_type = 0; break;
                 }
+                int16_t sample = MotorControl_GetAcqSample(motor_ctl, acq_type);
                 motor_ctl->speed_acq_buffer[motor_ctl->speed_acq_count] = sample;
                 motor_ctl->speed_acq_count++;
-                if (motor_ctl->speed_acq_count >= motor_ctl->speed_acq_size) {
-                    motor_ctl->speed_acq_done = 1;
-                    motor_ctl->speed_acq_active = 0;
-                }
+            }
+            /* 检查是否采满 */
+            if (motor_ctl->speed_acq_count >= motor_ctl->speed_acq_size) {
+                motor_ctl->speed_acq_done = 1;
+                motor_ctl->speed_acq_active = 0;
             }
         }
         motor_ctl->speed_acq_div_cnt++;
@@ -2116,13 +2653,13 @@ void MotorControl_TimerTick100us(void)
         }
     }
 
-    /* ===== 电流环: 每1次(100μs)执行 =====
-     * 电流环仅当使能时才运行并输出PWM:
-     *   - 使能时: 读ADC→电流PID→输出PWM
-     *   - 未使能时: 不做任何事, PWM由位置/速度环通过MotorControl_SetOutput直接控制
-     *     (避免电流环用stale的current_target覆盖位置/速度环刚设置的PWM)
-     * 待机模式(STANDBY_MODE)下跳过电流环, 确保PWM保持为0 */
-    if (motor_ctl && motor_ctl->current_loop_en && motor_ctl->mode != STANDBY_MODE) {
+    /* ===== 电流路径: 每1次(100μs)执行 =====
+     * 非开环、非待机模式经过这里:
+     *   - current_loop_en=1: 读ADC + 过流检测 + 电流PID + 输出PWM
+     *   - current_loop_en=0: 读ADC + 过流检测 + max_current软件斩波 + current_target作为PWM
+     * 开环模式保持直接PWM输出, 不受max_current限制。 */
+    if (motor_ctl && motor_ctl->mode != STANDBY_MODE &&
+        motor_ctl->mode != OPENLOOP_MODE && motor_ctl->mode != ADC_OPENLOOP_MODE) {
         int16_t pwm = MotorControl_CurrentLoop(motor_ctl);
         Motor_SetPWM(pwm);
     }
@@ -2143,6 +2680,20 @@ void MotorControl_TimerTick100us(void)
     if (pid_divider >= 50) {
         pid_divider = 0;
         if (motor_ctl) {
+            /* 步进加减速同步: 在位置PID运行前, 将dangqianweizhi复制到target_position
+             * 原来在main.c主循环中异步执行(每1ms), 与5ms位置PID不同步,
+             * 导致target_position时新时旧, 位置误差随机跳动.
+             * 电流环使电机响应更快, 放大了这种跳动 → 转速抖动.
+             * 移到此处与位置PID同步执行, 确保每次PID用的都是最新且一致的目标位置 */
+            if (motor_ctl->step_accel_en &&
+                MotorControl_IsPositionBasedMode(motor_ctl->mode) &&
+                !MotorControl_IsHoming()) {
+                int64_t step_pos;
+                __disable_irq();
+                step_pos = bujindianji[0].dangqianweizhi;
+                __enable_irq();
+                motor_ctl->target_position = step_pos;
+            }
             MotorControl_Update(motor_ctl, Encoder_GetCount());
         }
     }
@@ -2205,6 +2756,24 @@ void MotorControl_SetOverCurrentLimit(MotorControl_t *mc, float limit)
     HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
 }
 
+void MotorControl_SetMaxCurrent(MotorControl_t *mc, float max_current)
+{
+    /* 电流限幅由电流环PID实时读取, 写操作需关TIM1中断保证原子性.
+     * 负值无意义, 强制为0(不限制). */
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+    mc->max_current = (max_current < 0.0f) ? 0.0f : max_current;
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+}
+
+void MotorControl_SetCurrentDeadZone(MotorControl_t *mc, float dead_zone)
+{
+    /* 电流死区由电流环PID实时读取, 写操作需关TIM1中断保证原子性.
+     * 负值无意义, 强制为0(关闭死区). */
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+    mc->current_dead_zone = (dead_zone < 0.0f) ? 0.0f : dead_zone;
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+}
+
 uint8_t MotorControl_IsOverCurrentTripped(void)
 {
     return motor_ctl ? motor_ctl->over_current_tripped : 0;
@@ -2228,4 +2797,35 @@ float MotorControl_GetCurrent(void)
 float MotorControl_GetCurrentTarget(void)
 {
     return motor_ctl ? motor_ctl->current_target : 0.0f;
+}
+
+/* 获取电流ADC平均值(12位, 0~4095, PC1通道)
+ * 供上位机标定使用, 返回DMA缓冲区中该通道25个样本的平均值 */
+uint16_t MotorControl_GetCurrentADC(void)
+{
+    return MotorControl_ReadADCAverage(0);
+}
+
+/* 自动零点标定: 电机停止时读取64次ADC值取平均作为零电流offset
+ * 要求调用前电机已停止且无电流流过采样电阻
+ * 返回新的offset值(0~4095), 同时更新mc->current_offset */
+uint16_t MotorControl_AutoCalibrateCurrentOffset(MotorControl_t *mc)
+{
+    HAL_NVIC_DisableIRQ(TIM1_UP_IRQn);
+
+    /* 采样64次取平均, 抑制噪声 */
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < 64; i++) {
+        sum += (uint32_t)MotorControl_ReadADCAverage(0);
+        /* 简单延时等待ADC刷新(DMA连续转换, 等几个周期即可) */
+        for (volatile uint16_t d = 0; d < 100; d++);
+    }
+    uint16_t new_offset = (uint16_t)(sum / 64);
+
+    /* 更新offset, 使后续电流换算立即使用新零点 */
+    mc->current_offset = new_offset;
+    mc->current_actual = 0.0f;
+
+    HAL_NVIC_EnableIRQ(TIM1_UP_IRQn);
+    return new_offset;
 }

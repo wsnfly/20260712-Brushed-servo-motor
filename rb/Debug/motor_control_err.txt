@@ -1,0 +1,4 @@
+../Core/Src/motor_control.c: In function 'MotorControl_Update':
+../Core/Src/motor_control.c:1934:17: warning: variable 'active_func' set but not used [-Wunused-but-set-variable]
+ 1934 |         uint8_t active_func = mc->pc2_func;
+      |                 ^~~~~~~~~~~

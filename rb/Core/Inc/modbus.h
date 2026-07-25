@@ -86,7 +86,7 @@
 #define REG_SPEED_ACQ_DIV            0x003B  /* 转速采集分频值(1=100us, 50=5ms, 默认50) */
 #define REG_SPEED_ACQ_COUNT          0x003C  /* 采集已采样数量(只读, 0~5120) */
 #define REG_SPEED_ACQ_STATUS         0x003D  /* 转速采集状态(只读, 同0x003A读取值) */
-#define REG_SPEED_ACQ_TYPE           0x003E  /* 采集类型: 0=转速(脉冲/秒), 1=PWM输出(-1000~+1000), 2=位置(相对起始位置偏移, ±32767脉冲), 3=电流(相对值, ±1000=±8.25A), 4=PC0电压ADC(0~4095), 5=PC2外部ADC(0~4095), 6=PC3外部ADC(0~4095) */
+#define REG_SPEED_ACQ_TYPE           0x003E  /* 采集类型: 0=转速,1=PWM,2=位置,3=电流,4=PC0电压,5=PC2,6=PC3, 7~15=电流环开启PID输出(位置PID/速度PID/电流PID各P/I/D), 16~21=电流环关闭PID输出(位置PID/速度PID各P/I/D), 22=位置误差, 23=速度误差 */
 #define REG_SPEED_ACQ_SIZE           0x003F  /* 采集点数(1~5120, 默认5120) */
 
 /* 堵转保护寄存器 0x0040~0x0044 */
@@ -150,6 +150,130 @@
 #define REG_ADC_DEAD_ZONE2_POS        0x0060  /* ADC死区2位置 (0=最小点, 1=中位点, 2=最大点, 默认0) */
 #define REG_ADC_DEAD_ZONE2_WIDTH      0x0061  /* ADC死区2宽度 (0~4095, 0=关闭, 默认0) */
 
+/* 电流限幅寄存器 (新增)
+ * 限制电流环目标(current_target)的绝对值, 平滑限幅, 不触发保护.
+ * 与REG_OVER_CUR_LIMIT区别: 限幅限制目标电流, 过流保护检测实际电流超限关闭输出.
+ * 单位与电流相对值一致(×10, 1位小数), 0=不限制.
+ * 例: 1A≈121相对 → REG_MAX_CURRENT=1210; 5A≈606相对 → 6060 */
+#define REG_MAX_CURRENT               0x0062  /* 电流限幅(相对值×10, 0=不限制) */
+
+/* 电流环使能时的速度环/位置环PID参数(双套PID自动切换, 新增) 0x0063~0x0068
+ * 电流环使能时PID运算使用这些参数, 关闭时使用原 spd_Kp/Ki/Kd, pos_Kp/Ki/Kd
+ * 典型值: 电流模式Kp约为电压模式1/3, Ki约为1/5 */
+#define REG_SPD_KP_CUR                0x0063  /* 电流环使能时速度环Kp(×100) */
+#define REG_SPD_KI_CUR                0x0064  /* 电流环使能时速度环Ki(×100) */
+#define REG_SPD_KD_CUR                0x0065  /* 电流环使能时速度环Kd(×1000) */
+#define REG_POS_KP_CUR                0x0066  /* 电流环使能时位置环Kp(×100) */
+#define REG_POS_KI_CUR                0x0067  /* 电流环使能时位置环Ki(×100) */
+#define REG_POS_KD_CUR                0x0068  /* 电流环使能时位置环Kd(×1000) */
+
+/* 电流死区寄存器(新增)
+ * 实际电流绝对值<此值且电流目标=0时, 强制PWM=0, 防止静止时细微电流.
+ * 单位与电流相对值一致(×10, 1位小数), 0=关闭此功能.
+ * 例: 30=3.0相对≈25mA, 100=10.0相对≈83mA */
+#define REG_CUR_DEAD_ZONE             0x0069  /* 电流死区(相对值×10, 0=关闭) */
+
+/* 外部ADC滤波寄存器(新增)
+ * 滑动平均(Moving Average)窗口大小, 作用于PC2/PC3外部ADC通道.
+ * 0或1=关闭滤波(直接用原始值), 2~128=滑动平均窗口大小.
+ * 主循环5ms周期下延迟: 4点≈20ms, 16点≈80ms, 64点≈320ms, 100点≈500ms, 128点≈640ms(最大).
+ * 越大越平滑但滞后越大. 推荐值4~32. */
+#define REG_ADC_FILTER_SIZE           0x006A  /* 外部ADC滤波窗口(0~128, 0/1=关闭) */
+
+/* 步进电机加减速参数寄存器 bujindianji[0] 0x006B~0x0090 (新增)
+ * 映射 ajiajiansu.c 的 bujinpwm 结构体字段, 每个int64字段占4个连续寄存器
+ * (H3=bit[63:48], H2=bit[47:32], L2=bit[31:16], L1=bit[15:0], 有符号)
+ * 前3个字段为可写参数(写入立即生效, 不落Flash):
+ *   0x006B~0x006E zuidasudu      最大运行速度(步/秒)
+ *   0x006F~0x0072 zuixiaosudu    最小/启动速度(步/秒)
+ *   0x0073~0x0076 yudingweizhi   预定目标位置(步)
+ * 其余字段为运行状态(只读, 写入无效):
+ *   0x0077~0x007A dangqiansudu   当前运行速度(步/秒)
+ *   0x007B~0x007E yudingsudu     预定运行速度(步/秒)
+ *   0x007F~0x0082 sudukongzhi    加减速控制(-1=减速, 0=匀速, 1=加速)
+ *   0x0083~0x0086 tingzhiweizhi  停止位置(步)
+ *   0x0087~0x008A jiluweizhi     外部中断记录位置(步)
+ *   0x008B~0x008E dangqianweizhi 当前步位置(步)
+ *   0x008F        shijifangxiang 实际方向(0=负方向, 1=正方向)
+ *   0x0090        dingshi        定时器周期值
+ * 注: 上位机用功能码03从0x006B一次读38个寄存器即可获取全部参数 */
+#define REG_STEP_MAX_SPEED_H3         0x006B  /* 最大运行速度 bit[63:48] (读写) */
+#define REG_STEP_MAX_SPEED_H2         0x006C  /* 最大运行速度 bit[47:32] */
+#define REG_STEP_MAX_SPEED_L2         0x006D  /* 最大运行速度 bit[31:16] */
+#define REG_STEP_MAX_SPEED_L1         0x006E  /* 最大运行速度 bit[15:0] */
+#define REG_STEP_MIN_SPEED_H3         0x006F  /* 最小/启动速度 bit[63:48] (读写) */
+#define REG_STEP_MIN_SPEED_H2         0x0070  /* 最小/启动速度 bit[47:32] */
+#define REG_STEP_MIN_SPEED_L2         0x0071  /* 最小/启动速度 bit[31:16] */
+#define REG_STEP_MIN_SPEED_L1         0x0072  /* 最小/启动速度 bit[15:0] */
+#define REG_STEP_TARGET_POS_H3        0x0073  /* 预定目标位置 bit[63:48] (读写) */
+#define REG_STEP_TARGET_POS_H2        0x0074  /* 预定目标位置 bit[47:32] */
+#define REG_STEP_TARGET_POS_L2        0x0075  /* 预定目标位置 bit[31:16] */
+#define REG_STEP_TARGET_POS_L1        0x0076  /* 预定目标位置 bit[15:0] */
+#define REG_STEP_CUR_SPEED_H3         0x0077  /* 当前运行速度 bit[63:48] (只读) */
+#define REG_STEP_CUR_SPEED_H2         0x0078  /* 当前运行速度 bit[47:32] */
+#define REG_STEP_CUR_SPEED_L2         0x0079  /* 当前运行速度 bit[31:16] */
+#define REG_STEP_CUR_SPEED_L1         0x007A  /* 当前运行速度 bit[15:0] */
+#define REG_STEP_PRESET_SPEED_H3      0x007B  /* 预定运行速度 bit[63:48] (只读) */
+#define REG_STEP_PRESET_SPEED_H2      0x007C  /* 预定运行速度 bit[47:32] */
+#define REG_STEP_PRESET_SPEED_L2      0x007D  /* 预定运行速度 bit[31:16] */
+#define REG_STEP_PRESET_SPEED_L1      0x007E  /* 预定运行速度 bit[15:0] */
+#define REG_STEP_ACCEL_CTRL_H3        0x007F  /* 加减速控制 bit[63:48] (只读) */
+#define REG_STEP_ACCEL_CTRL_H2        0x0080  /* 加减速控制 bit[47:32] */
+#define REG_STEP_ACCEL_CTRL_L2        0x0081  /* 加减速控制 bit[31:16] */
+#define REG_STEP_ACCEL_CTRL_L1        0x0082  /* 加减速控制 bit[15:0] */
+#define REG_STEP_STOP_POS_H3          0x0083  /* 停止位置 bit[63:48] (只读) */
+#define REG_STEP_STOP_POS_H2          0x0084  /* 停止位置 bit[47:32] */
+#define REG_STEP_STOP_POS_L2          0x0085  /* 停止位置 bit[31:16] */
+#define REG_STEP_STOP_POS_L1          0x0086  /* 停止位置 bit[15:0] */
+#define REG_STEP_REC_POS_H3           0x0087  /* 外部中断记录位置 bit[63:48] (只读) */
+#define REG_STEP_REC_POS_H2           0x0088  /* 外部中断记录位置 bit[47:32] */
+#define REG_STEP_REC_POS_L2           0x0089  /* 外部中断记录位置 bit[31:16] */
+#define REG_STEP_REC_POS_L1           0x008A  /* 外部中断记录位置 bit[15:0] */
+#define REG_STEP_CUR_POS_H3           0x008B  /* 当前步位置 bit[63:48] (只读) */
+#define REG_STEP_CUR_POS_H2           0x008C  /* 当前步位置 bit[47:32] */
+#define REG_STEP_CUR_POS_L2           0x008D  /* 当前步位置 bit[31:16] */
+#define REG_STEP_CUR_POS_L1           0x008E  /* 当前步位置 bit[15:0] */
+#define REG_STEP_DIRECTION            0x008F  /* 实际方向(只读): 0=负方向, 1=正方向 */
+#define REG_STEP_TIMING               0x0090  /* 定时器周期值(只读) */
+#define REG_STEP_ACCEL_EN             0x0091  /* 步进加减速使能(读写): 0=关闭, 1=位置模式启用 */
+
+/* 加速表计算寄存器(新增) 0x0092~0x009A
+ * 上位机写入参数后触发计算, STM32计算加速表并存入Flash
+ * 0x0092~0x0093: timc(主频, 32位, 如32000000)
+ * 0x0094: u(最小速度, 16位, 如500)
+ * 0x0095~0x0096: a(加速度, 32位, 如320000)
+ * 0x0097: len(表长度, 16位, 最大10015)
+ * 0x0098: 触发(写1=开始计算, 写2=恢复ROM默认表)
+ * 0x0099: 状态(只读: 0=ROM表/idle, 1=计算中, 2=自定义表已启用, 3=错误)
+ * 0x009A: 进度(只读: 0~1000, 1000=完成) */
+#define REG_ACC_TABLE_TIMC_L          0x0092  /* 主频 低16位 (读写) */
+#define REG_ACC_TABLE_TIMC_H          0x0093  /* 主频 高16位 */
+#define REG_ACC_TABLE_U               0x0094  /* 最小速度 (读写) */
+#define REG_ACC_TABLE_A_L             0x0095  /* 加速度 低16位 (读写) */
+#define REG_ACC_TABLE_A_H             0x0096  /* 加速度 高16位 */
+#define REG_ACC_TABLE_LEN             0x0097  /* 表长度 (读写, 最大10015) */
+#define REG_ACC_TABLE_TRIGGER         0x0098  /* 触发(写1=计算, 写2=恢复ROM) */
+#define REG_ACC_TABLE_STATUS          0x0099  /* 状态(只读) */
+#define REG_ACC_TABLE_PROGRESS        0x009A  /* 进度(只读, 0~1000) */
+#define REG_STEP_BASE                 REG_STEP_MAX_SPEED_H3  /* 加减速寄存器区起始地址 */
+#define REG_STEP_END                  0x009F  /* 寄存器区结束地址(含前馈系数0x009B + 多通道采集0x009C~0x009F) */
+
+/* 电流环前馈系数(新增) 0x009B
+ * 速度前馈(反电动势补偿): PWM += Kff * velocity
+ * 解决限流时电流目标被截顶→P项不足→PWM偏低→速度下降
+ * ×10000, 建议150~250(=0.015~0.025), 0=关闭 */
+#define REG_CUR_KFF                   0x009B  /* 电流环前馈系数(×10000, 0=关闭) */
+
+/* 多通道采集寄存器(新增) 0x009C~0x009F
+ * 支持同时采集1~4个通道, 每个采样周期依次采集所有通道,
+ * 缓冲区数据交错存储(类似STM32 ADC扫描模式).
+ * 通道1类型使用REG_SPEED_ACQ_TYPE(0x003E), 通道2~4使用下列寄存器.
+ * 采样率不变(由REG_SPEED_ACQ_DIV控制), 缓冲区填充快N倍. */
+#define REG_SPEED_ACQ_CHANNELS        0x009C  /* 采集通道数(1~4, 默认1=单通道兼容原行为) */
+#define REG_SPEED_ACQ_TYPE2           0x009D  /* 通道2采集类型(编码同REG_SPEED_ACQ_TYPE) */
+#define REG_SPEED_ACQ_TYPE3           0x009E  /* 通道3采集类型 */
+#define REG_SPEED_ACQ_TYPE4           0x009F  /* 通道4采集类型 */
+
 /* 数据寄存器 (只读) - 采集缓冲区 0x0200~0x15FF (5120个int16_t, 10KB) */
 #define REG_SPEED_DATA_BASE          0x0200  /* 采集数据起始地址 */
 #define REG_SPEED_DATA_END           0x15FF  /* 采集数据结束地址 (0x0200 + SPEED_ACQ_BUF_SIZE - 1) */
@@ -181,11 +305,40 @@
  * 由ADC1 DMA循环模式持续刷新, 上位机可用功能码03读取:
  *   0x0113 = 供电电压(单位0.01V, PC0分压100K:10K, 实际电压=ADC电压×11)
  *            例: 3300 = 33.00V, 2400 = 24.00V
- *   0x0114 = 外部ADC1原始值(PC2, 12位 0~4095)
- *   0x0115 = 外部ADC2原始值(PC3, 12位 0~4095) */
+ *   0x0114 = 外部ADC1滤波后值(PC2, 12位 0~4095)
+ *            滤波窗口由REG_ADC_FILTER_SIZE(0x006A)控制, 0或1=关闭返回原始值
+ *   0x0115 = 外部ADC2滤波后值(PC3, 12位 0~4095), 同上 */
 #define REG_SUPPLY_VOLTAGE           0x0113  /* 供电电压(只读, 单位0.01V) */
-#define REG_EXT_ADC1                 0x0114  /* 外部ADC1原始值(只读, PC2) */
-#define REG_EXT_ADC2                 0x0115  /* 外部ADC2原始值(只读, PC3) */
+#define REG_EXT_ADC1                 0x0114  /* 外部ADC1滤波后值(只读, PC2) */
+#define REG_EXT_ADC2                 0x0115  /* 外部ADC2滤波后值(只读, PC3) */
+
+/* 三环PID调试寄存器(只读) 0x0116~0x0127 (新增)
+ * 用于级联调参: 上位机可一次性读取位置环/速度环/电流环的error/P/I/D,
+ * 实时观察三环工作状态, 定位"电流不上升/位置过冲/振荡"等问题.
+ *
+ * 寄存器布局(所有值×100, 有符号int16):
+ *   位置环(5ms): 0x0116~0x0119 = error, P, I, D  (与0x0109~0x0110相同,此处独立便于批量读取)
+ *   速度环(1ms): 0x011A~0x011D = error, P, I, D
+ *   电流环(100us):0x011E~0x0121 = error, P, I, D
+ *   中间变量:    0x0122=target_velocity, 0x0123=current_target, 0x0124=current_actual
+ *
+ * 注意: 单环模式(无max_run_speed)下速度环不运行, 0x011A~0x011D保持0.
+ *       电流环关闭时0x011E~0x0121仍会更新(透传模式下error=0,P=I=D=0). */
+#define REG_POS_LOOP_ERR             0x0116  /* 位置环误差(×100, 有符号) */
+#define REG_POS_LOOP_P               0x0117  /* 位置环P项(×100) */
+#define REG_POS_LOOP_I               0x0118  /* 位置环I项(×100) */
+#define REG_POS_LOOP_D               0x0119  /* 位置环D项(×100) */
+#define REG_SPD_LOOP_ERR             0x011A  /* 速度环误差(×100, 脉冲/秒) */
+#define REG_SPD_LOOP_P               0x011B  /* 速度环P项(×100) */
+#define REG_SPD_LOOP_I               0x011C  /* 速度环I项(×100) */
+#define REG_SPD_LOOP_D               0x011D  /* 速度环D项(×100) */
+#define REG_CUR_LOOP_ERR             0x011E  /* 电流环误差(×100, 相对值) */
+#define REG_CUR_LOOP_P               0x011F  /* 电流环P项(×100) */
+#define REG_CUR_LOOP_I               0x0120  /* 电流环I项(×100) */
+#define REG_CUR_LOOP_D               0x0121  /* 电流环D项(×100) */
+#define REG_TARGET_VELOCITY_RO       0x0122  /* 位置环输出的目标速度(×100, 脉冲/秒) */
+#define REG_CURRENT_TARGET_DISP      0x0123  /* 电流目标(×10, 相对值, 与0x0112相同便于批量读取) */
+#define REG_CURRENT_ACTUAL_DISP      0x0124  /* 实际电流(×10, 相对值, 与0x0111相同便于批量读取) */
 
 /* 控制字位定义 */
 #define CTRL_MODE_MASK               0x000F  /* 模式掩码 */
@@ -269,6 +422,7 @@ static inline int64_t SYS_GetTimeMs(void) {
 
 /* 函数声明 */
 void MODBUS_Init(MB_Context_t *ctx, uint8_t slave_addr, MotorControl_t *motor);
+void MODBUS_SyncAccParams(void);  /* 开机后同步加速表参数到MODBUS缓存 */
 void MODBUS_OnByteReceived(MB_Context_t *ctx, uint8_t byte);   /* UART中断中调用 */
 void MODBUS_OnTimeoutTick(MB_Context_t *ctx);                  /* TIM1中断中调用 */
 void MODBUS_Process(MB_Context_t *ctx);                        /* 主循环中调用 */

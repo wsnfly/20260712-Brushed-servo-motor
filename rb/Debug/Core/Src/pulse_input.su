@@ -1,0 +1,11 @@
+../Core/Src/pulse_input.c:54:6:PulseInput_Init	16	static
+../Core/Src/pulse_input.c:69:13:config_pins_af_input	24	static
+../Core/Src/pulse_input.c:92:13:config_pins_gpio_input	24	static
+../Core/Src/pulse_input.c:128:13:config_tim2_external_clock_mode	4	static
+../Core/Src/pulse_input.c:157:6:PulseInput_Reconfig	32	static
+../Core/Src/pulse_input.c:201:6:PulseInput_Synthesize	48	static
+../Core/Src/pulse_input.c:227:9:PulseInput_ConsumeDelta	48	static,ignoring_inline_asm
+../Core/Src/pulse_input.c:252:6:PulseInput_Start	16	static
+../Core/Src/pulse_input.c:273:6:PulseInput_Stop	4	static
+../Core/Src/pulse_input.c:282:9:PulseInput_GetCount	32	static,ignoring_inline_asm
+../Core/Src/pulse_input.c:296:6:PulseInput_Reset	24	static,ignoring_inline_asm

@@ -24,6 +24,7 @@
 /* USER CODE BEGIN Includes */
 #include "motor_control.h"
 #include "modbus.h"
+#include "ajiajiansu.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,7 +49,7 @@ extern MB_Context_t mb_ctx;
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN PFP */
-
+#include "input.h"
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -59,6 +60,7 @@ extern MB_Context_t mb_ctx;
 /* External variables --------------------------------------------------------*/
 extern DMA_HandleTypeDef hdma_adc1;
 extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
 extern UART_HandleTypeDef huart1;
 /* USER CODE BEGIN EV */
 
@@ -203,6 +205,23 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief This function handles EXTI line4 interrupt.
+  */
+void EXTI4_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI4_IRQn 0 */
+  /* PB4脉冲输入中断: HAL_GPIO_EXTI_IRQHandler会清挂起位并调用HAL_GPIO_EXTI_Callback,
+   * 但HAL弱定义回调是空的. 直接调用MotorControl_OnPulseExti处理脉冲累加,
+   * 不依赖HAL回调, 避免空调用开销. */
+  MotorControl_OnPulseExti(4);
+  /* USER CODE END EXTI4_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4);
+  /* USER CODE BEGIN EXTI4_IRQn 1 */
+
+  /* USER CODE END EXTI4_IRQn 1 */
+}
+
+/**
   * @brief This function handles DMA1 channel1 global interrupt.
   */
 void DMA1_Channel1_IRQHandler(void)
@@ -214,6 +233,23 @@ void DMA1_Channel1_IRQHandler(void)
   /* USER CODE BEGIN DMA1_Channel1_IRQn 1 */
 
   /* USER CODE END DMA1_Channel1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI line[9:5] interrupts.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
+  /* PB5脉冲输入中断(EXTI5): EXTI9_5是共享中断(EXTI5~9), 本工程仅使能EXTI5.
+   * HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_5)会检查PR5挂起位并清零, 然后调用回调.
+   * 直接调用MotorControl_OnPulseExti处理脉冲累加. */
+  MotorControl_OnPulseExti(5);
+  /* USER CODE END EXTI9_5_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_5);
+  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
+
+  /* USER CODE END EXTI9_5_IRQn 1 */
 }
 
 /**
@@ -236,6 +272,27 @@ void TIM1_UP_IRQHandler(void)
   /* USER CODE BEGIN TIM1_UP_IRQn 1 */
 
   /* USER CODE END TIM1_UP_IRQn 1 */
+}
+
+/**
+  * @brief This function handles TIM2 global interrupt.
+  */
+void TIM2_IRQHandler(void)
+{
+  /* USER CODE BEGIN TIM2_IRQn 0 */
+  /* 先清除UIF标志, 再执行算法.
+   * 原代码先调用pwmzhongduankongzhi()再由HAL清标志,
+   * 高速时(ARR很小)算法执行期间计数器可能再次溢出,
+   * 但UIF已置位无法挂起新中断, 导致丢脉冲→卡顿 */
+  if (__HAL_TIM_GET_FLAG(&htim2, TIM_FLAG_UPDATE)) {
+    __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
+    pwmzhongduankongzhi();
+  }
+  /* USER CODE END TIM2_IRQn 0 */
+  HAL_TIM_IRQHandler(&htim2);
+  /* USER CODE BEGIN TIM2_IRQn 1 */
+
+  /* USER CODE END TIM2_IRQn 1 */
 }
 
 /**
@@ -264,5 +321,8 @@ void USART1_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-
+/* EXTI4_IRQHandler 和 EXTI9_5_IRQHandler 已由CubeMX在上方生成,
+ * 分别调用 HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4/5) 清挂起位.
+ * 脉冲处理逻辑 MotorControl_OnPulseExti 通过 USER CODE 区域直接调用,
+ * 不依赖空的 HAL_GPIO_EXTI_Callback 弱定义, 更高效. */
 /* USER CODE END 1 */

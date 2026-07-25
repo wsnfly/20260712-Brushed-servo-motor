@@ -23,7 +23,9 @@
 /* USER CODE BEGIN Includes */
 #include "motor_control.h"
 #include "modbus.h"
+#include "input.h"      /* MotorControl_ProcessInputs / MotorControl_UpdateIrqPriority */
 #include "afangkaobei.h"
+#include "ajiajiansu.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,6 +48,7 @@ ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 
@@ -65,6 +68,7 @@ static void MX_TIM4_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -109,6 +113,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_TIM1_Init();
   MX_ADC1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   /* 初始化电机控读取PID: 位置�???? Kp=7.00 Ki=10.00 Kd=0.10 | 速度�???? Kp=0.30 Ki=3.00 Kd=0.00�????? */
   MotorControl_Init(&motor, 7.0f, 10.1f, 0.1f, 0.30f, 3.0f, 0.0f, 1, 900);
@@ -125,6 +130,13 @@ int main(void)
 
   /* 启动电机控制 */
   Motor_Start();
+
+  /* 加速表开机加载(新增): 检查Flash中是否有自定义加速表, 有则切换指针 */
+  AccTable_LoadOnBoot();
+  /* 同步加速表参数到MODBUS缓存: 使上位机读取0x0092~0x0097时能读到Flash中的实际参数,
+   * 而非默认值. 解决重启后上位机显示默认参数、用户误以为表被重置的问题 */
+  MODBUS_SyncAccParams();
+
   if (motor.home_auto_start) {
     MotorControl_StartHoming(&motor);
   }
@@ -132,7 +144,7 @@ int main(void)
   HAL_TIM_Base_Start_IT(&htim1);
   /* TIM1固定优先级1(覆盖CubeMX在MspInit中的默认值2, 不再随脉冲模式动态切换)
    * EXTI脉冲中断同为优先级1, 同级不互相抢占, 靠硬件PR锁存保证不丢脉冲 */
-  HAL_NVIC_SetPriority(TIM1_UP_IRQn, 1, 0);
+  //HAL_NVIC_SetPriority(TIM1_UP_IRQn, 1, 0);
 
   /* 启动UART中断接收（每字节，由HAL_UART_RxCpltCallback处理） */
   HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1);
@@ -142,11 +154,29 @@ int main(void)
    *   无脉冲输入时关闭EXTI NVIC, 释放CPU给USART1等
    * 注: TIM2已释放可作其他用途, 由EXTI4/EXTI9_5中断直接处理脉冲边沿 */
   MotorControl_UpdateIrqPriority();
-  HAL_NVIC_SetPriority(USART1_IRQn, 3, 0);
+
+  /* 中断优先级配置(CubeMX重新生成后需重新设置, 否则会被MspInit的默认值覆盖)
+   * 优先级原则(数值小=优先级高):
+   *   USART1=0 (最高) - 串口字节到达必须立即处理, 避免ORE溢出丢包
+   *   TIM1_UP=1       - 100μs周期PID, 被USART1短时抢占(<5μs)不影响控制
+   *   EXTI4/EXTI9_5=1 - 脉冲输入, 与TIM1同级不互相抢占, 靠硬件PR锁存保证不丢边沿
+   *                    不能设为0(高于TIM1), 否则高频脉冲会频繁打断PID导致周期抖动
+   * 注: MX_GPIO_Init设EXTI=0(最高), 此处覆盖为1(与TIM1同级), 防止脉冲中断抢占PID
+   * 注: stm32f1xx_hal_msp.c中HAL MSP init设TIM1=2/USART1=3, 此处覆盖为正确值 */
+  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
+  HAL_NVIC_SetPriority(TIM1_UP_IRQn, 2, 0);
+  HAL_NVIC_SetPriority(TIM2_IRQn, 3, 0);   /* TIM2步进加减速: 最低优先级, 不抢PID和通信 */
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 1, 0);
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  /* 步进加减速: 若Flash中使能(上位机勾选并保存), 初始化算法并启动TIM2 (新增)
+   * 未使能时TIM2不启动, 保持原有行为不变 */
+  if (motor.step_accel_en) {
+      StepAccel_Enable(1, Encoder_GetCount());
+  }
   while(fangkaobei(0) == 1);
   while (1)
   {
@@ -194,22 +224,16 @@ int main(void)
 
 	  // 示例：每 2 秒执行一�????
 	  static int64_t last_2s = 0;
-	  static int64_t aaa = 0;
 	  if (now - last_2s >= 5000) {
 		  last_2s = now;
 		  // 你的逻辑
-//		  if(aaa == 0){
-//			  MotorControl_SetTarget(&motor, 65550);
-//			  MODBUS_SyncTargetPosition(65550);
-//			  aaa=1;
-//		  }else
-//		  if(aaa == 1){
-//			  MotorControl_SetTarget(&motor, 65500);
-//			  MODBUS_SyncTargetPosition(65500);
-//			  aaa = 0;
-//		  }
-		 //Motor_Start();
+
 	  }
+
+	  /* ========== 步进加减速位置模式 ==========
+	   * dangqianweizhi → target_position 的同步已移至 TIM1 中断(MotorControl_TimerTick100us),
+	   * 在位置PID(5ms)运行前执行, 确保时序同步, 避免异步复制导致的转速抖动.
+	   * 支持所有基于位置PID的模式: POSITION_MODE/VELOCITY_POSITION_MODE/EXTERNAL_TARGET_MODE/ADC_POSITION_MODE */
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -291,54 +315,23 @@ int main(void)
     //         MODBUS_SyncTargetPosition(8000);      // 同步pending，上位机可见
     //     }
     // }
-	  // 实验轨迹：总时长 150ms，分为 4 段
-	          //   0～30ms  静止在 0
-	          //  30～70ms  从 0  匀速到 2000（40ms 内走 2000）
-	          //  70～110ms 从 2000 匀速到 4000
-	          // 110～150ms 从 4000 匀速回到 0
-	          // 150ms 后  停止
-	  if(1){
-		  static uint8_t exp_run = 1;
-	  static int64_t exp_start = 0;
-	  static int64_t exp_last_tgt = -1;
-	  static uint8_t exp_reset_done = 0;          /* 复位是否已执行过，保证只触发一次 */
+	  /* ========== 潜水模拟时间轴（PWM开环模式）==========
+	   * 总时长 2分30秒, 分5个阶段
+	   *-------------------------------------------------------------------
+	   * 阶段   时间          振动PWM              皮带张力
+	   *-------------------------------------------------------------------
+	   * 浅海   0:00-0:30     60 恒定              LEVEL_0(0) 不收紧
+	   * 中层   0:30-1:10     85 恒定              0→LEVEL_MID(350)
+	   * 深海   1:10-1:50     80↔130 脉冲          MID→LEVEL_DEEP(750)
+	   *                     (每800ms切换, 周期1.6s)
+	   * 上浮   1:50-2:30     100→20 线性递减       DEEP→0 释放
+	   *                     (vib = 100 - 80*p)
+	   * 结束   2:30+         0                    running=false 全部停止
+	   *-------------------------------------------------------------------
+	   * 注: 皮带张力为位置控制(需切POSITION_MODE), 此处仅实现振动PWM开环部分;
+	   *     皮带目标位置以注释标注, 如需启用请配合第二电机或模式切换实现
+	   */
 
-
-
-
-          if (exp_run) {
-              int64_t et = now - exp_start;
-              int64_t tgt = 0;
-
-              if (et < 30000) {
-                  tgt = 0; //小于30秒时执行一次复位
-                  if (!exp_reset_done) {
-                      exp_reset_done = 1;
-                      MotorControl_SetMode(&motor, POSITION_MODE);
-                      MotorControl_StartHoming(&motor);   /* 按 home_mode 配置启动一次回零复位 */
-                  }
-              } else if (et < 70000) {
-	                  float p = (float)(et - 30000) / 40000.0f;
-	                  tgt = (int64_t)(2000.0f * p);
-	              } else if (et < 110000) {
-	                  float p = (float)(et - 70000) / 40000.0f;
-	                  tgt = 2000 + (int64_t)(2000.0f * p);
-	              } else if (et < 150000) {
-	                  float p = (float)(et - 110000) / 40000.0f;
-	                  tgt = 4000 - (int64_t)(4000.0f * p);
-	              } else {
-	                  exp_run = 0;
-	                  tgt = 0;
-
-	              }
-
-	              if (tgt != exp_last_tgt) {
-	                  exp_last_tgt = tgt;
-	                  MotorControl_SetTarget(&motor, tgt);
-	                  MODBUS_SyncTargetPosition(tgt);
-	              }
-	          }
-	  }
     /* ============ 系统任务（勿删）============ */
 
     /* 处理PB4/PB5输入引脚 */
@@ -522,6 +515,51 @@ static void MX_TIM1_Init(void)
   /* USER CODE BEGIN TIM1_Init 2 */
 
   /* USER CODE END TIM1_Init 2 */
+
+}
+
+/**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 1;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 65535;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
 
 }
 
@@ -722,9 +760,16 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pins : PB4 PB5 */
   GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   /* USER CODE END MX_GPIO_Init_2 */
@@ -741,21 +786,45 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     if (huart->Instance == USART1) {
         /* 将收到的字节交给MODBUS处理 */
         MODBUS_OnByteReceived(&mb_ctx, mb_ctx.rx_byte);
-        /* 重新启动下一字节的中断接�????? */
-        HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1);
+        /* 重新启动下一字节的中断接收.
+         * 注意: HAL_UART_Receive_IT在gState=BUSY_TX(发送中)时会返回HAL_BUSY静默失败,
+         *   接收会被永久关闭, 后续字节全部丢失. 必须检查返回值, 失败时直接操作寄存器. */
+        if (HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1) != HAL_OK) {
+            /* 发送进行中导致HAL拒绝重启接收: 直接使能RXNEIE保证后续字节能触发中断.
+             * 发送完成后, HAL_UART_IRQHandler的TX路径不会关闭RXNEIE,
+             * 接收中断会继续触发, 调用本回调重启HAL接收流程. */
+            SET_BIT(huart1.Instance->CR1, USART_CR1_RXNEIE);
+        }
     }
 }
 
 /**
   * @brief  UART错误回调 - ORE/FE/NE错误会中止接收，必须重启
+  * 注意: HAL_UART_Receive_IT在huart->gState=BUSY_TX时会返回HAL_BUSY静默失败,
+  *       导致接收永久卡死. 必须强制把gState切回READY再重启接收.
   */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1) {
-        /* 清除溢出错误标志 */
+        /* 清除溢出错误标志 (ORE: 软件读SR然后读DR清零, 或直接清ORECF) */
         __HAL_UART_CLEAR_OREFLAG(huart);
-        /* 重启中断接收 */
-        HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1);
+        /* 清除帧错误/噪声错误标志 */
+        __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_FE);
+        __HAL_UART_CLEAR_FLAG(huart, UART_FLAG_NE);
+
+        /* 强制把HAL状态切回READY.
+         * 错误发生时HAL可能把RxState置为READY但gState仍为BUSY_TX(发送中),
+         * 直接调HAL_UART_Receive_IT会因gState!=READY返回HAL_BUSY, 接收永远无法重启.
+         * 此时必须改用直接寄存器操作重新使能RXNE中断, 绕过HAL状态机. */
+        if (huart->gState != HAL_UART_STATE_READY) {
+            /* 发送仍在进行: 不能调HAL_UART_Receive_IT(会返回BUSY),
+             * 直接使能RXNEIE, 硬件收到下一字节会立即触发中断.
+             * HAL_UART_IRQHandler会处理RXNE, 即使gState=BUSY_TX也能读DR. */
+            SET_BIT(huart->Instance->CR1, USART_CR1_RXNEIE);
+        } else {
+            /* 发送已完成: 正常重启接收 */
+            HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1);
+        }
     }
 }
 
