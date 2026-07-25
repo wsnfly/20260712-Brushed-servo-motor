@@ -895,9 +895,19 @@ uint8_t MotorControl_HomingFailed(void)
 
 void MotorControl_SetTarget(MotorControl_t *mc, int64_t target)
 {
-    mc->target_position = target;
-    mc->integral = 0;
-    mc->prev_error = 0;
+    if (mc->step_accel_en) {
+        /* 步进加减速模式: 目标送入yudingweizhi, 算法生成平滑轨迹
+         * 不能直接设target_position, 会被TIM1中断中的dangqianweizhi覆盖 */
+        __disable_irq();
+        bujindianji[0].yudingweizhi = target;
+        __enable_irq();
+        StepAccel_Restart();
+    } else {
+        /* 普通模式: 直接设目标位置, 清积分和误差 */
+        mc->target_position = target;
+        mc->integral = 0;
+        mc->prev_error = 0;
+    }
 }
 
 void MotorControl_SetSpeed(MotorControl_t *mc, float speed)

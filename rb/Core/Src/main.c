@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+﻿/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -180,160 +180,77 @@ int main(void)
   while(fangkaobei(0) == 1);
   while (1)
   {
-	  // 示例：每 500ms 执行�????�????
+	  /* ========== 电机运行参数读取（每次主循环刷新）==========
+	   * 这些变量可在下方任意逻辑中直接使用, 也可通过调试器/串口观察 */
+	  int64_t cur_pos    = Encoder_GetCount();      /* 当前实际编码器位置(脉冲) */
+	  float   cur_speed  = Encoder_GetSpeed();      /* 当前实际速度(脉冲/秒, 已滤波) */
+	  int64_t tgt_pos    = motor.target_position;   /* 目标位置(脉冲)
+	                                                 * 注意: 步进加减速使能时此处为算法输出的中间位置,
+	                                                 * 真正的预设目标在 bujindianji[0].yudingweizhi */
+	  float   tgt_speed  = motor.target_speed;      /* 目标速度(脉冲/秒) */
+	  int16_t cur_pwm    = MotorControl_GetPWM();   /* 当前PWM输出(-1000~+1000 = -100%~+100%) */
+	  MotorMode_t mode   = motor.mode;              /* 当前运行模式 */
+	  float   cur_cur    = MotorControl_GetCurrent();         /* 当前实际电流(相对值, ±1000=±8.25A) */
+	  float   tgt_cur    = MotorControl_GetCurrentTarget();   /* 电流目标(相对值) */
+	  float   supply_v   = MotorControl_GetSupplyVoltage();   /* 供电电压(V) */
+
+	  // 示例：每 500ms 执行一次
 	  static int64_t last_500ms = 0;
 	  int64_t now = SYS_GetTimeMs();
 	  if (now - last_500ms >= 500) {
 		  last_500ms = now;
 	  }
 
-	  /* ========== LED1 状态指示灯 ==========
-	   * 正常状态：常亮（高电平）
-	   * 异常状态（复位中/复位失败/堵转/过流）：闪烁（200ms周期，约5Hz） */
-	  {
-		  uint8_t has_fault = 0;
-		  if (MotorControl_IsHoming())           has_fault = 1;  /* 正在复位 */
-		  else if (MotorControl_HomingFailed())  has_fault = 1;  /* 复位失败 */
-		  else if (MotorControl_IsStallTripped()) has_fault = 1; /* 堵转保护 */
-		  else if (motor.over_current_tripped)   has_fault = 1;  /* 过流保护 */
 
-		  if (has_fault) {
-			  static int64_t last_led1_toggle = 0;
-			  if (now - last_led1_toggle >= 200) {
-				  last_led1_toggle = now;
-				  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
-			  }
-		  } else {
-			  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);  /* 常亮（高电平） */
-		  }
-	  }
 
-	  /* ========== LED2 通讯状态指示灯 ==========
-	   * 收到MODBUS帧时点亮50ms，平时熄灭 */
-	  {
-		  static uint32_t last_rx_count = 0;
-		  static int64_t led2_on_time = 0;
-		  if (mb_ctx.rx_count != last_rx_count) {
-			  last_rx_count = mb_ctx.rx_count;
-			  led2_on_time = now;
-			  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
-		  } else if (now - led2_on_time >= 50) {
-			  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
-		  }
-	  }
-
-	  // 示例：每 2 秒执行一�????
+	  /* 每5秒在位置0和10000之间来回切换 */
 	  static int64_t last_2s = 0;
+	  static int64_t weizhi = 0;
 	  if (now - last_2s >= 5000) {
 		  last_2s = now;
-		  // 你的逻辑
-
+		  if(weizhi == 10000) weizhi = 0;
+		  else weizhi = 10000;
+		  MotorControl_SetTarget(&motor, weizhi);
+		  MODBUS_SyncTargetPosition(weizhi);
 	  }
 
-	  /* ========== 步进加减速位置模式 ==========
-	   * dangqianweizhi → target_position 的同步已移至 TIM1 中断(MotorControl_TimerTick100us),
-	   * 在位置PID(5ms)运行前执行, 确保时序同步, 避免异步复制导致的转速抖动.
-	   * 支持所有基于位置PID的模式: POSITION_MODE/VELOCITY_POSITION_MODE/EXTERNAL_TARGET_MODE/ADC_POSITION_MODE */
-    /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
-
-    /* ============ 用户示例代码（注释形式，取消注释即可使用）============ */
-
-    /* 示例1：旋转到指定位置（绝对位置，单位=编码器脉冲）
-     * 注意1：SetMode 切到位置模式时会把当前编码器值作为目标，
-     *        所以必须紧接着 SetTarget 设真正的目标，否则电机不动
-     * 注意2：上位机读的目标位置是 MODBUS 内部的 pending 缓存，不是 mc->target_position。
-     *        主循环里改了目标位置后，必须再调 MODBUS_SyncTargetPosition 同步，上位机才能读到 */
-    // MotorControl_SetMode(&motor, POSITION_MODE);
-    // MotorControl_SetTarget(&motor, 10000);          // 转到 10000 脉冲位置
-    // MODBUS_SyncTargetPosition(10000);               // 同步到 MODBUS pending 缓存，上位机才能读到
-    // Motor_Start();
-
-    /* 示例2：以指定速度旋转（单位=脉冲/秒，负值=反转）*/
-    // MotorControl_SetMode(&motor, SPEED_MODE);
-    // MotorControl_SetSpeed(&motor, 2000.0f);  // 2000 脉冲/秒
-    // Motor_Start();
-
-    /* 示例3：读当前位置/速度，可用于条件判断 */
-    // int64_t cur_pos = Encoder_GetCount();    // 当前位置（脉冲）
-    // float    cur_spd = Encoder_GetSpeed();    // 当前速度（脉冲/秒）
-    // int16_t  cur_pwm = MotorControl_GetPWM(); // 当前PWM输出(-1000~+1000)
-
-    /* 示例4：顺序动作状态机——先到5000再到-5000，到位停1秒
-     * 放在主循环每次都执行的位置（非节拍块内），用 now 做时间判断 */
-    // static uint8_t  run_step = 0;
-    // static int64_t  run_time = 0;
-    // switch (run_step) {
-    //     case 0:
-    //         MotorControl_SetMode(&motor, POSITION_MODE);
-    //         MotorControl_SetTarget(&motor, 5000);
-    //         MODBUS_SyncTargetPosition(5000);     // 同步pending，上位机可见
-    //         run_step = 1; run_time = now;
-    //         break;
-    //     case 1:
-    //         if (llabs(Encoder_GetCount() - 5000) < 20 && (now - run_time) > 1000) {
-    //             MotorControl_SetTarget(&motor, -5000);
-    //             MODBUS_SyncTargetPosition(-5000); // 同步pending，上位机可见
-    //             run_step = 2; run_time = now;
-    //         }
-    //         break;
-    //     case 2:
-    //         if (llabs(Encoder_GetCount() + 5000) < 20) {
-    //             Motor_Stop();
-    //             run_step = 3;
-    //         }
-    //         break;
-    //     default: break;
-    // }
-
-    /* 示例5：每500ms切换速度方向做正反往复——应放在上面 last_500ms 节拍块内 */
-    // static uint8_t toggle = 0;
-    // MotorControl_SetMode(&motor, SPEED_MODE);
-    // MotorControl_SetSpeed(&motor, toggle ? 1500.0f : -1500.0f);
-    // toggle ^= 1;
-
-    /* 示例6：每3秒在 0 和 10000 之间来回摆动（位置模式）*/
-    // static uint8_t  pos_toggle = 0;
-    // static int64_t  last_move  = 0;
-    // if (now - last_move > 3000) {
-    //     last_move = now;
-    //     MotorControl_SetMode(&motor, POSITION_MODE);
-    //     int64_t tgt = pos_toggle ? 0 : 10000;
-    //     MotorControl_SetTarget(&motor, tgt);
-    //     MODBUS_SyncTargetPosition(tgt);          // 同步pending，上位机可见
-    //     pos_toggle ^= 1;
-    // }
-
-    /* 示例7：开机先回零，完成后转到 8000 脉冲处 */
-    // if (!MotorControl_IsHoming()) {
-    //     if (MotorControl_HomingFailed()) {
-    //         // 复位失败处理……
-    //     } else if (run_step == 0) {
-    //         MotorControl_SetMode(&motor, POSITION_MODE);
-    //         MotorControl_SetTarget(&motor, 8000);
-    //         MODBUS_SyncTargetPosition(8000);      // 同步pending，上位机可见
-    //     }
-    // }
-	  /* ========== 潜水模拟时间轴（PWM开环模式）==========
-	   * 总时长 2分30秒, 分5个阶段
-	   *-------------------------------------------------------------------
-	   * 阶段   时间          振动PWM              皮带张力
-	   *-------------------------------------------------------------------
-	   * 浅海   0:00-0:30     60 恒定              LEVEL_0(0) 不收紧
-	   * 中层   0:30-1:10     85 恒定              0→LEVEL_MID(350)
-	   * 深海   1:10-1:50     80↔130 脉冲          MID→LEVEL_DEEP(750)
-	   *                     (每800ms切换, 周期1.6s)
-	   * 上浮   1:50-2:30     100→20 线性递减       DEEP→0 释放
-	   *                     (vib = 100 - 80*p)
-	   * 结束   2:30+         0                    running=false 全部停止
-	   *-------------------------------------------------------------------
-	   * 注: 皮带张力为位置控制(需切POSITION_MODE), 此处仅实现振动PWM开环部分;
-	   *     皮带目标位置以注释标注, 如需启用请配合第二电机或模式切换实现
-	   */
 
     /* ============ 系统任务（勿删）============ */
+	  /* ========== LED1 状态指示灯 ==========
+		   * 正常状态：常亮（高电平）
+		   * 异常状态（复位中/复位失败/堵转/过流）：闪烁（200ms周期，约5Hz） */
+		  {
+			  uint8_t has_fault = 0;
+			  if (MotorControl_IsHoming())           has_fault = 1;  /* 正在复位 */
+			  else if (MotorControl_HomingFailed())  has_fault = 1;  /* 复位失败 */
+			  else if (MotorControl_IsStallTripped()) has_fault = 1; /* 堵转保护 */
+			  else if (motor.over_current_tripped)   has_fault = 1;  /* 过流保护 */
 
+			  if (has_fault) {
+				  static int64_t last_led1_toggle = 0;
+				  if (now - last_led1_toggle >= 200) {
+					  last_led1_toggle = now;
+					  HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+				  }
+			  } else {
+				  HAL_GPIO_WritePin(LED1_GPIO_Port, LED1_Pin, GPIO_PIN_SET);  /* 常亮（高电平） */
+			  }
+		  }
+
+		  /* ========== LED2 通讯状态指示灯 ==========
+		   * 收到MODBUS帧时点亮50ms，平时熄灭 */
+		  {
+			  static uint32_t last_rx_count = 0;
+			  static int64_t led2_on_time = 0;
+			  if (mb_ctx.rx_count != last_rx_count) {
+				  last_rx_count = mb_ctx.rx_count;
+				  led2_on_time = now;
+				  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_SET);
+			  } else if (now - led2_on_time >= 50) {
+				  HAL_GPIO_WritePin(LED2_GPIO_Port, LED2_Pin, GPIO_PIN_RESET);
+			  }
+		  }
     /* 处理PB4/PB5输入引脚 */
     MotorControl_ProcessInputs();
 

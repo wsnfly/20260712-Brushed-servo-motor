@@ -3823,6 +3823,7 @@ class ModbusDebuggerApp:
 
     def _plot_speed_data(self, channel_data, types):
         """绘制多通道采集曲线, 每通道独立子图+独立Y轴
+        多通道时共享X轴(缩放/平移同步), 各通道Y轴独立缩放
         channel_data: 各通道数据列表 [[ch1_data], [ch2_data], ...]
         types: 各通道采集类型列表"""
         nch = len(channel_data)
@@ -3831,7 +3832,10 @@ class ModbusDebuggerApp:
         if nch == 1:
             axes = [self.speed_fig.add_subplot(111)]
         else:
-            axes = [self.speed_fig.add_subplot(nch, 1, i + 1) for i in range(nch)]
+            # 多通道: 第一个子图正常创建, 其余共享X轴(缩放/平移同步)
+            axes = [self.speed_fig.add_subplot(nch, 1, 1)]
+            for i in range(1, nch):
+                axes.append(self.speed_fig.add_subplot(nch, 1, i + 1, sharex=axes[0]))
         self.speed_axes = axes
         self.speed_ax = axes[0]  # 兼容旧代码引用
 
@@ -3854,9 +3858,12 @@ class ModbusDebuggerApp:
             ax.tick_params(axis='y', labelcolor=color)
             ax.grid(True)
             ax.legend(loc='best', fontsize=8)
-            # 只有最底部子图显示X轴标签
+            # 只有最底部子图显示X轴标签和刻度
             if ch_idx == nch - 1:
                 ax.set_xlabel("采样点 (每通道)")
+            else:
+                # 共享X轴时隐藏非底部子图的X轴刻度标签(避免重叠)
+                ax.tick_params(labelbottom=False)
 
         # 标题
         if nch == 1:
@@ -3876,7 +3883,10 @@ class ModbusDebuggerApp:
         if nch == 1:
             axes = [self.speed_fig.add_subplot(111)]
         else:
-            axes = [self.speed_fig.add_subplot(nch, 1, i + 1) for i in range(nch)]
+            # 多通道: 共享X轴(缩放/平移同步), 各通道Y轴独立
+            axes = [self.speed_fig.add_subplot(nch, 1, 1)]
+            for i in range(1, nch):
+                axes.append(self.speed_fig.add_subplot(nch, 1, i + 1, sharex=axes[0]))
         self.speed_axes = axes
         self.speed_ax = axes[0]
         for ch_idx in range(nch):
@@ -3888,6 +3898,8 @@ class ModbusDebuggerApp:
             ax.grid(True)
             if ch_idx == nch - 1:
                 ax.set_xlabel("采样点 (每通道)")
+            else:
+                ax.tick_params(labelbottom=False)
         if nch == 1:
             acq_type = types[0] if types else 0
             axes[0].set_title(self._acq_title(acq_type))
