@@ -16,6 +16,10 @@ import csv
 
 import matplotlib
 matplotlib.use('TkAgg')
+# 配置中文字体, 解决图表中文(标题/标签/图例)显示为方块的问题
+matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun',
+                                           'Arial Unicode MS', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False  # 正常显示负号
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
@@ -1162,6 +1166,17 @@ class ModbusDebuggerApp:
         right_canvas.bind('<Configure>', _on_right_canvas_configure)
 
         def _on_right_mousewheel(event):
+            # 鼠标在matplotlib图表区域时不拦截滚轮, 交给matplotlib处理缩放.
+            # 注意: Windows下<MouseWheel>发送给焦点控件而非鼠标下控件,
+            # 需用winfo_containing按屏幕坐标查找鼠标下真正控件(与matplotlib一致).
+            if hasattr(self, 'speed_canvas'):
+                try:
+                    mpl_widget = self.speed_canvas.get_tk_widget()
+                    w = event.widget.winfo_containing(event.x_root, event.y_root)
+                    if w is mpl_widget:
+                        return
+                except Exception:
+                    pass
             right_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
         # 鼠标在右侧区域时启用滚轮
@@ -1487,6 +1502,35 @@ class ModbusDebuggerApp:
         self._update_channel_visibility()
         self.acq_channels_var.trace_add("write", lambda *_: self._update_channel_visibility())
 
+        # X轴缩放滑块(顶部, 单一: X轴所有子图共享)
+        # 各通道Y轴缩放滑块在图表左侧纵向排列(每通道一个), 绘图时动态创建
+        scale_frame = ttk.Frame(ctrl_bar)
+        scale_frame.pack(fill=tk.X, pady=(2, 0))
+
+        ttk.Label(scale_frame, text="X轴缩放:").grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
+        self.acq_x_zoom_var = tk.DoubleVar(value=1.0)
+        self.acq_x_zoom_scale = ttk.Scale(scale_frame, from_=0.1, to=20.0,
+                                          orient=tk.HORIZONTAL, length=140,
+                                          variable=self.acq_x_zoom_var,
+                                          command=self._on_x_zoom_slider)
+        self.acq_x_zoom_scale.grid(row=0, column=1, padx=2, sticky=tk.EW)
+        self.acq_x_zoom_label = ttk.Label(scale_frame, text="1.0x", width=6)
+        self.acq_x_zoom_label.grid(row=0, column=2, padx=(2, 0))
+        ttk.Button(scale_frame, text="重置", width=4,
+                   command=lambda: self.acq_x_zoom_var.set(1.0)).grid(row=0, column=3, padx=2)
+        ttk.Label(scale_frame, text="(Y轴缩放在图表左侧, 每通道独立)",
+                  foreground="gray").grid(row=0, column=4, padx=(8, 0))
+        scale_frame.columnconfigure(1, weight=1)
+        # 初始无数据时禁用滑块
+        self.acq_x_zoom_scale.state(['disabled'])
+        # 原始全视图范围(绘图时记录), 供滑块按倍数缩放
+        self._orig_xlim = None
+        self._orig_ylims = []
+        # 各通道Y轴缩放状态(动态, 长度=通道数)
+        self._y_zoom_vars = []      # DoubleVar列表
+        self._y_zoom_scales = []    # ttk.Scale列表(纵向)
+        self._y_zoom_labels = []    # 倍数显示Label列表
+
         # 新起一行: 采集参数 + 操作按钮
         btn_frame = ttk.Frame(ctrl_bar)
         btn_frame.pack(fill=tk.X, pady=(2, 0))
@@ -1518,14 +1562,54 @@ class ModbusDebuggerApp:
         self.speed_ax.grid(True)
         self.speed_fig.tight_layout()
 
-        self.speed_canvas = FigureCanvasTkAgg(self.speed_fig, chart_frame)
-        self.speed_canvas.draw()
-        self.speed_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # 图表区: 左侧Y轴缩放滑块(纵向, 每通道一个) + 右侧matplotlib画布
+        # Y滑块与子图纵向堆叠对齐(每行等高, 对应一个子图)
+        # 注意: 先创建所有widget, 再按正确顺序pack, 确保工具栏不被挤没
+        plot_area = ttk.Frame(chart_frame)
 
-        # matplotlib 工具栏（缩放/平移/保存等）
-        self.speed_toolbar = NavigationToolbar2Tk(self.speed_canvas, chart_frame)
+        # 左侧: Y轴缩放滑块容器(动态重建, 初始1个)
+        self._y_sliders_frame = ttk.Frame(plot_area, width=70)
+        self._y_sliders_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 4))
+        self._y_sliders_frame.pack_propagate(False)
+
+        # 右侧: 画布容器(画布占满全部高度, 与Y滑块对齐)
+        canvas_holder = ttk.Frame(plot_area)
+        canvas_holder.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # matplotlib画布 — master直接设为canvas_holder, 避免用in_导致渲染异常
+        self.speed_canvas = FigureCanvasTkAgg(self.speed_fig, canvas_holder)
+        self.speed_canvas.draw()
+        self.speed_canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        # matplotlib 工具栏（缩放/平移/保存等）— master设为chart_frame, 放在图表区下方
+        # pack_toolbar=False避免自动pack; 先pack工具栏(side=BOTTOM)再pack plot_area,
+        # 否则expand=True的plot_area会占满所有空间把工具栏挤没
+        self.speed_toolbar = NavigationToolbar2Tk(self.speed_canvas, chart_frame,
+                                                  pack_toolbar=False)
         self.speed_toolbar.update()
         self.speed_toolbar.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # 最后pack plot_area, 填充ctrl_bar与工具栏之间的剩余空间
+        plot_area.pack(fill=tk.BOTH, expand=True)
+
+        # 初始构建1个Y滑块(占位, 无数据时禁用)
+        self._rebuild_y_sliders(1, enabled=False)
+
+        # 鼠标滚轮: 整体缩放(X+Y同时), 以光标位置为中心
+        # 多通道共享X轴时, 缩放任一子图的X轴其余自动跟随
+        self._canvas_wheel_cid = self.speed_canvas.mpl_connect('scroll_event',
+                                                               self._on_mpl_wheel_zoom)
+        # 鼠标左键拖拽: 平移整个图表(X+Y同步平移)
+        # 工具栏pan/zoom模式下让出控制权, 避免冲突
+        self._pan_state = {'active': False, 'ax': None,
+                           'x0': None, 'y0': None,
+                           'xlims': None, 'ylims': None}
+        self._canvas_bpress_cid = self.speed_canvas.mpl_connect(
+            'button_press_event', self._on_mpl_pan_press)
+        self._canvas_brel_cid = self.speed_canvas.mpl_connect(
+            'button_release_event', self._on_mpl_pan_release)
+        self._canvas_motion_cid = self.speed_canvas.mpl_connect(
+            'motion_notify_event', self._on_mpl_pan_motion)
 
         # === 底部：日志(左) + 原始数据包(右) - 独立高度容器 ===
         self._bottom_container = ttk.Frame(right_stack, height=220)
@@ -3824,34 +3908,239 @@ class ModbusDebuggerApp:
     def _plot_speed_data(self, channel_data, types):
         """绘制多通道采集曲线, 每通道独立子图+独立Y轴
         多通道时共享X轴(缩放/平移同步), 各通道Y轴独立缩放
+        应用X轴共享缩放/偏移 + 各通道Y轴独立缩放/偏移
         channel_data: 各通道数据列表 [[ch1_data], [ch2_data], ...]
         types: 各通道采集类型列表"""
-        nch = len(channel_data)
-        # 清空figure, 按通道数创建子图
+        # 存储原始数据供"应用缩放/偏移"按钮重新绘图
+        self._last_channel_data = channel_data
+        self._last_types = types
+        self._render_plot(channel_data, types)
+
+    def _ensure_axes(self, nch):
+        """确保figure有nch个子图(共享X轴). 仅在子图数量变化时重建,
+        避免每次绘图都clear figure导致工具栏丢失轴引用、框选缩放报错.
+        返回axes列表"""
+        current_n = len(self.speed_axes) if hasattr(self, 'speed_axes') else 0
+        if current_n == nch and nch > 0:
+            # 子图数量没变, 只清空各轴内容, 保留轴对象和sharex链接
+            for ax in self.speed_axes:
+                ax.clear()
+            return self.speed_axes
+
+        # 子图数量变了, 重建整个figure
         self.speed_fig.clear()
         if nch == 1:
             axes = [self.speed_fig.add_subplot(111)]
         else:
-            # 多通道: 第一个子图正常创建, 其余共享X轴(缩放/平移同步)
+            # 多通道: 第一个子图正常创建, 其余共享X轴
+            # sharex后, 工具栏框选缩放时: 被选中的子图XY都缩放, 其余只缩放X
             axes = [self.speed_fig.add_subplot(nch, 1, 1)]
             for i in range(1, nch):
                 axes.append(self.speed_fig.add_subplot(nch, 1, i + 1, sharex=axes[0]))
         self.speed_axes = axes
         self.speed_ax = axes[0]  # 兼容旧代码引用
+        # 刷新工具栏状态, 使其跟踪新的轴对象
+        if hasattr(self, 'speed_toolbar'):
+            self.speed_toolbar.update()
+        return axes
+
+    def _on_mpl_wheel_zoom(self, event):
+        """鼠标滚轮缩放: X轴所有子图同步缩放(共享), Y轴仅缩放光标所在子图.
+        - 向上滚(放大): 范围缩小到90%
+        - 向下滚(缩小): 范围扩大到110%
+        - X轴以光标x为中心, 同步应用到所有子图(多通道X轴永远对齐)
+        - Y轴以光标y为中心, 仅作用于光标所在的那个子图"""
+        ax = event.inaxes
+        if ax is None:
+            return
+        x, y = event.xdata, event.ydata
+        if x is None or y is None:
+            return  # 光标在子图边距外, 无有效数据坐标
+        # 工具栏处于平移/框选模式时不干预, 避免冲突
+        if hasattr(self, 'speed_toolbar'):
+            mode = self.speed_toolbar.mode
+            if mode and ('pan' in mode or 'zoom' in mode):
+                return
+        # 拖拽平移进行中时不处理滚轮, 避免冲突
+        if self._pan_state.get('active'):
+            return
+        scale_factor = 0.9 if event.button == 'up' else 1.1
+        # X轴缩放: X轴共享, 只设在主轴(第一个), 其余通过sharex自动同步
+        # (循环set会因sharex传播导致重复缩放)
+        master_ax = self.speed_axes[0]
+        xlim = master_ax.get_xlim()
+        master_ax.set_xlim([x - (x - xlim[0]) * scale_factor,
+                            x - (x - xlim[1]) * scale_factor])
+        # Y轴缩放: 仅光标所在子图(以光标y为中心)
+        ylim = ax.get_ylim()
+        ax.set_ylim([y - (y - ylim[0]) * scale_factor,
+                     y - (y - ylim[1]) * scale_factor])
+        self.speed_canvas.draw_idle()
+
+    # ========== 鼠标拖拽平移 ==========
+    def _on_mpl_pan_press(self, event):
+        """鼠标左键按下: 记录起始位置, 进入平移状态.
+        X轴所有子图共享同步; Y轴仅平移被拖拽的那个子图."""
+        if event.button != 1:
+            return  # 仅响应左键
+        ax = event.inaxes
+        if ax is None:
+            return
+        # 工具栏pan/zoom模式下不干预
+        if hasattr(self, 'speed_toolbar'):
+            mode = self.speed_toolbar.mode
+            if mode and ('pan' in mode or 'zoom' in mode):
+                return
+        if event.xdata is None or event.ydata is None:
+            return
+        # 记录所有子图的X范围(共享同步) + 被拖拽子图的Y范围
+        xlims = [a.get_xlim() for a in self.speed_axes]
+        dragged_ylim = ax.get_ylim()
+        # 找到被拖拽子图的索引
+        dragged_idx = self.speed_axes.index(ax) if ax in self.speed_axes else 0
+        self._pan_state = {'active': True, 'ax': ax, 'dragged_idx': dragged_idx,
+                           'x0': event.xdata, 'y0': event.ydata,
+                           'xlims': xlims, 'ylim': dragged_ylim}
+
+    def _on_mpl_pan_motion(self, event):
+        """鼠标拖拽中: X轴所有子图同步平移; Y轴仅平移被拖拽子图."""
+        if not self._pan_state.get('active'):
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        dx = event.xdata - self._pan_state['x0']
+        dy = event.ydata - self._pan_state['y0']
+        # X轴共享: 只设在主轴(第一个), 其余通过sharex自动同步(保持X轴对齐)
+        ox0, ox1 = self._pan_state['xlims'][0]
+        self.speed_axes[0].set_xlim(ox0 - dx, ox1 - dx)
+        # Y轴: 仅平移被拖拽的那个子图
+        idx = self._pan_state['dragged_idx']
+        oy0, oy1 = self._pan_state['ylim']
+        self.speed_axes[idx].set_ylim(oy0 - dy, oy1 - dy)
+        self.speed_canvas.draw_idle()
+
+    def _on_mpl_pan_release(self, event):
+        """鼠标松开: 结束平移"""
+        if event.button != 1:
+            return
+        self._pan_state['active'] = False
+
+    # ========== X轴缩放滑块(顶部, 所有子图共享) ==========
+    def _on_x_zoom_slider(self, val):
+        """X轴缩放滑块: 按倍数缩放X轴(以当前视图中心为基准, 相对原始全视图).
+        X轴所有子图共享, 设第一个子图即可同步."""
+        try:
+            zoom = float(val)
+        except (TypeError, ValueError):
+            return
+        if zoom <= 0:
+            return
+        self.acq_x_zoom_label.config(text=f"{zoom:.1f}x")
+        if not self.speed_axes or self._orig_xlim is None:
+            return
+        ax = self.speed_axes[0]  # X轴共享
+        cur = ax.get_xlim()
+        cx = (cur[0] + cur[1]) / 2.0
+        half = (self._orig_xlim[1] - self._orig_xlim[0]) / 2.0 / zoom
+        if half <= 0:
+            return
+        ax.set_xlim(cx - half, cx + half)
+        self.speed_canvas.draw_idle()
+
+    # ========== 各通道Y轴缩放滑块(图表左侧纵向) ==========
+    def _rebuild_y_sliders(self, nch, enabled=True):
+        """重建左侧Y轴缩放滑块(每通道一个, 纵向排列, 与子图行对齐).
+        nch: 通道数; enabled: 是否启用(有数据时True, 无数据False)"""
+        # 清空旧滑块
+        for w in self._y_sliders_frame.winfo_children():
+            w.destroy()
+        self._y_zoom_vars = []
+        self._y_zoom_scales = []
+        self._y_zoom_labels = []
+        # 用grid均分高度, 使每个滑块行与对应子图大致对齐
+        for i in range(nch):
+            self._y_sliders_frame.rowconfigure(i, weight=1)
+            row = ttk.Frame(self._y_sliders_frame)
+            row.grid(row=i, column=0, sticky="nsew", padx=2, pady=1)
+            row.rowconfigure(1, weight=1)
+            # 通道标签 + 倍数值
+            top = ttk.Frame(row)
+            top.grid(row=0, column=0, sticky="ew")
+            ttk.Label(top, text=f"CH{i+1}", foreground=self._CH_COLORS[i % len(self._CH_COLORS)]).pack()
+            val_lbl = ttk.Label(top, text="1.0x", width=5)
+            val_lbl.pack()
+            self._y_zoom_labels.append(val_lbl)
+            # 纵向滑块
+            var = tk.DoubleVar(value=1.0)
+            scl = ttk.Scale(row, from_=20.0, to=0.1, orient=tk.VERTICAL,
+                            variable=var, command=lambda v, idx=i: self._on_y_zoom_slider(idx, v))
+            scl.grid(row=1, column=0, sticky="ns")
+            # 重置按钮
+            ttk.Button(row, text="1x", width=3,
+                       command=lambda idx=i: self._y_zoom_vars[idx].set(1.0)).grid(row=2, column=0, pady=(1, 0))
+            if not enabled:
+                scl.state(['disabled'])
+            self._y_zoom_vars.append(var)
+            self._y_zoom_scales.append(scl)
+        # 多余行清掉权重(通道数减少时)
+        for i in range(nch, 4):
+            self._y_sliders_frame.rowconfigure(i, weight=0)
+
+    def _on_y_zoom_slider(self, ch_idx, val):
+        """第ch_idx通道Y轴缩放滑块: 按倍数缩放该通道Y轴(以其当前视图中心为基准)"""
+        try:
+            zoom = float(val)
+        except (TypeError, ValueError):
+            return
+        if zoom <= 0:
+            return
+        if ch_idx < len(self._y_zoom_labels):
+            self._y_zoom_labels[ch_idx].config(text=f"{zoom:.1f}x")
+        if not self.speed_axes or ch_idx >= len(self._orig_ylims):
+            return
+        if ch_idx >= len(self._orig_ylims):
+            return
+        ax = self.speed_axes[ch_idx]
+        cur = ax.get_ylim()
+        cy = (cur[0] + cur[1]) / 2.0
+        half = (self._orig_ylims[ch_idx][1] - self._orig_ylims[ch_idx][0]) / 2.0 / zoom
+        if half <= 0:
+            return
+        ax.set_ylim(cy - half, cy + half)
+        self.speed_canvas.draw_idle()
+
+    def _reset_zoom_sliders(self, nch):
+        """重置缩放滑块: X轴(顶部) + 各通道Y轴(左侧)到1.0x并启用.
+        nch: 当前通道数, 用于重建Y轴滑块"""
+        # X轴滑块
+        self.acq_x_zoom_var.set(1.0)
+        self.acq_x_zoom_label.config(text="1.0x")
+        self.acq_x_zoom_scale.state(['!disabled'])
+        # 重建Y轴滑块(每通道一个)并启用
+        self._rebuild_y_sliders(nch, enabled=True)
+
+    def _render_plot(self, channel_data, types):
+        """实际绘图函数: 绘制各通道曲线并自动适配坐标轴.
+        Y轴缩放/偏移输入框已移除, 改由 X/Y缩放滑块 + 鼠标滚轮/拖拽 控制."""
+        nch = len(channel_data)
+
+        # 复用或重建子图(仅数量变化时重建, 避免工具栏出错)
+        axes = self._ensure_axes(nch)
 
         for ch_idx in range(nch):
             ax = axes[ch_idx]
             data = channel_data[ch_idx]
             acq_type = types[ch_idx] if ch_idx < len(types) else 0
-            # 电流/电压类型: 换算为带物理单位的值
+            # 电流/电压类型: 先换算为带物理单位的值
             scale = self._ACQ_SCALE.get(acq_type)
             if scale is not None:
-                plot_data = [v * scale for v in data]
+                base_data = [v * scale for v in data]
             else:
-                plot_data = data
+                base_data = data
+            # X轴直接用采样点序号
             color = self._CH_COLORS[ch_idx % len(self._CH_COLORS)]
             label = f"CH{ch_idx+1}: {self._acq_label(acq_type)}"
-            ax.plot(range(len(plot_data)), plot_data,
+            ax.plot(range(len(base_data)), base_data,
                     color=color, linewidth=0.8, label=label)
             # 每个通道独立Y轴标签
             ax.set_ylabel(self._acq_y_label(acq_type), color=color)
@@ -3861,6 +4150,7 @@ class ModbusDebuggerApp:
             # 只有最底部子图显示X轴标签和刻度
             if ch_idx == nch - 1:
                 ax.set_xlabel("采样点 (每通道)")
+                ax.tick_params(labelbottom=True)
             else:
                 # 共享X轴时隐藏非底部子图的X轴刻度标签(避免重叠)
                 ax.tick_params(labelbottom=False)
@@ -3873,22 +4163,21 @@ class ModbusDebuggerApp:
             per_ch = len(channel_data[0]) if channel_data else 0
             self.speed_fig.suptitle(f"多通道采集 ({nch}通道×{per_ch}点/通道)", fontsize=10)
         self.speed_fig.tight_layout()
+        # 自动适配坐标轴范围(autoscale), 并记录为"原始全视图"供滑块缩放
+        for ax in axes:
+            ax.relim()
+            ax.autoscale_view()
+        self._orig_xlim = axes[0].get_xlim()
+        self._orig_ylims = [ax.get_ylim() for ax in axes]
+        # 重置缩放滑块到1.0x并启用(X轴 + 各通道Y轴, 重建Y滑块匹配通道数)
+        self._reset_zoom_sliders(nch)
         self.speed_canvas.draw()
 
     def clear_speed_plot(self):
         """清空采集曲线"""
         nch = self._current_nch()
         types = self._current_acq_types()
-        self.speed_fig.clear()
-        if nch == 1:
-            axes = [self.speed_fig.add_subplot(111)]
-        else:
-            # 多通道: 共享X轴(缩放/平移同步), 各通道Y轴独立
-            axes = [self.speed_fig.add_subplot(nch, 1, 1)]
-            for i in range(1, nch):
-                axes.append(self.speed_fig.add_subplot(nch, 1, i + 1, sharex=axes[0]))
-        self.speed_axes = axes
-        self.speed_ax = axes[0]
+        axes = self._ensure_axes(nch)
         for ch_idx in range(nch):
             ax = axes[ch_idx]
             acq_type = types[ch_idx] if ch_idx < len(types) else 0
@@ -3898,6 +4187,7 @@ class ModbusDebuggerApp:
             ax.grid(True)
             if ch_idx == nch - 1:
                 ax.set_xlabel("采样点 (每通道)")
+                ax.tick_params(labelbottom=True)
             else:
                 ax.tick_params(labelbottom=False)
         if nch == 1:
@@ -3907,6 +4197,14 @@ class ModbusDebuggerApp:
             self.speed_fig.suptitle(f"多通道采集 ({nch}通道)", fontsize=10)
         self.speed_fig.tight_layout()
         self.speed_canvas.draw()
+        # 清空后无数据: 禁用缩放滑块, 清除原始视图记录
+        self._orig_xlim = None
+        self._orig_ylims = []
+        self.acq_x_zoom_var.set(1.0)
+        self.acq_x_zoom_label.config(text="1.0x")
+        self.acq_x_zoom_scale.state(['disabled'])
+        # 重建Y轴滑块(占位, 禁用)
+        self._rebuild_y_sliders(nch, enabled=False)
         self.acq_status_label.config(text="状态: 空闲", foreground="gray")
         self.log("清空采集曲线")
 
