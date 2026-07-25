@@ -16,8 +16,8 @@
 ../Core/Src/modbus.c:712:13:MODBUS_ApplyTarget	10
 ../Core/Src/modbus.c:743:13:MODBUS_ApplyMode	10
 ../Core/Src/modbus.c:771:6:MODBUS_TriggerStartFlag	4
-../Core/Src/modbus.c:792:13:MODBUS_WriteRegister	224
-../Core/Src/modbus.c:1507:13:MODBUS_ProcessReadHoldingRegs	9
-../Core/Src/modbus.c:1545:13:MODBUS_ProcessWriteSingleReg	3
-../Core/Src/modbus.c:1575:13:MODBUS_ProcessWriteMultipleRegs	13
-../Core/Src/modbus.c:1622:6:MODBUS_Process	12
+../Core/Src/modbus.c:792:13:MODBUS_WriteRegister	226
+../Core/Src/modbus.c:1509:13:MODBUS_ProcessReadHoldingRegs	9
+../Core/Src/modbus.c:1547:13:MODBUS_ProcessWriteSingleReg	3
+../Core/Src/modbus.c:1577:13:MODBUS_ProcessWriteMultipleRegs	13
+../Core/Src/modbus.c:1624:6:MODBUS_Process	12

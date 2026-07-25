@@ -61,7 +61,9 @@ typedef enum {
 typedef enum {
     HOME_MODE_OFF = 0,         /* 关闭复位 */
     HOME_MODE_STALL = 1,       /* 堵转检测复位 */
-    HOME_MODE_SWITCH = 2       /* 开关精确复位：使用限位开关低速来回检测精确位置 */
+    HOME_MODE_SWITCH = 2,      /* 开关精确复位：使用限位开关低速来回检测精确位置 */
+    HOME_MODE_BIDIR_STALL = 3, /* 双向堵转复位：负方向堵转→正方向堵转→取中点+偏置设原点 */
+    HOME_MODE_BIDIR_SENSOR = 4 /* 双向传感器居中复位：负方向限位→正方向限位→取中点+偏置设原点 */
 } HomeMode_t;
 
 /* PB4/PB5 引脚功能 */
@@ -110,7 +112,7 @@ typedef struct {
     uint8_t start_mode;          /* 启动模式: 0=直接启动, 1=需要启动标志位 */
     uint8_t modbus_addr;         /* MODBUS从机地址: 1~247 */
     uint32_t modbus_baud;        /* MODBUS波特率 */
-    uint8_t home_mode;             /* 复位模式: 0=关闭, 1=堵转复位, 2=开关精确复位 */
+    uint8_t home_mode;             /* 复位模式: 0=关闭, 1=堵转复位, 2=开关精确复位, 3=双向堵转复位, 4=双向传感器居中复位 */
     int8_t home_dir;               /* 复位方向: 0=负方向, 1=正方向 */
     int16_t home_current;          /* 复位电流限制(PWM值) */
     int32_t home_speed;            /* 复位速度(脉冲/秒) */

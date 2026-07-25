@@ -206,13 +206,13 @@ int main(void)
 	  /* 每5秒在位置0和10000之间来回切换 */
 	  static int64_t last_2s = 0;
 	  static int64_t weizhi = 0;
-	  if (now - last_2s >= 5000) {
-		  last_2s = now;
-		  if(weizhi == 10000) weizhi = 0;
-		  else weizhi = 10000;
-		  MotorControl_SetTarget(&motor, weizhi);
-		  MODBUS_SyncTargetPosition(weizhi);
-	  }
+//	  if (now - last_2s >= 5000) {
+//		  last_2s = now;
+//		  if(weizhi == 10000) weizhi = 0;
+//		  else weizhi = 10000;
+//		  MotorControl_SetTarget(&motor, weizhi);
+//		  MODBUS_SyncTargetPosition(weizhi);
+//	  }
 
 
 

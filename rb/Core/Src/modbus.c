@@ -936,6 +936,8 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
             case REG_HOME_MODE:
                 if (value == 1) mc->home_mode = HOME_MODE_STALL;
                 else if (value == 2) mc->home_mode = HOME_MODE_SWITCH;
+                else if (value == 3) mc->home_mode = HOME_MODE_BIDIR_STALL;
+                else if (value == 4) mc->home_mode = HOME_MODE_BIDIR_SENSOR;
                 else mc->home_mode = HOME_MODE_OFF;
                 config_dirty = 1;
                 break;

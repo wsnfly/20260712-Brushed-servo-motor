@@ -1,6 +1,6 @@
 ../Core/Inc/modbus.h:410:23:SYS_GetTime100us	16	static,ignoring_inline_asm
 ../Core/Inc/modbus.h:419:23:SYS_GetTimeMs	8	static
-../Core/Src/main.c:85:5:main	128	static
+../Core/Src/main.c:85:5:main	120	static
 ../Core/Src/main.c:272:6:SystemClock_Config	88	static
 ../Core/Src/main.c:318:13:MX_ADC1_Init	24	static
 ../Core/Src/main.c:397:13:MX_TIM1_Init	32	static

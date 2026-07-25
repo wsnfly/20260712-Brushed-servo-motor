@@ -232,7 +232,7 @@ class ModbusDebuggerApp:
     REG_SLAVE_ADDR = 0x0014       # MODBUS从机地址 (1~247)
     REG_BAUD_RATE = 0x0015        # MODBUS波特率 (波特率/100)
     REG_SET_ORIGIN = 0x0016       # 设置当前位置为原点 (写1触发)
-    REG_HOME_MODE = 0x0017        # 复位模式 (0=关闭, 1=堵转复位)
+    REG_HOME_MODE = 0x0017        # 复位模式 (0=关闭, 1=堵转复位, 2=开关精确复位, 3=双向堵转复位, 4=双向传感器居中复位)
     REG_HOME_DIRECTION = 0x0018   # 复位方向 (0=负方向, 1=正方向)
     REG_HOME_CURRENT = 0x0019     # 复位电流限制(PWM值)
     REG_HOME_SPEED_H = 0x001A
@@ -430,7 +430,7 @@ class ModbusDebuggerApp:
         (0x0014, "REG_SLAVE_ADDR", "MODBUS从机地址", "1~247"),
         (0x0015, "REG_BAUD_RATE", "MODBUS波特率", "波特率/100"),
         (0x0016, "REG_SET_ORIGIN", "设置原点", "写1触发(只写)"),
-        (0x0017, "REG_HOME_MODE", "复位模式", "0=关闭,1=堵转,2=精确复位"),
+        (0x0017, "REG_HOME_MODE", "复位模式", "0=关闭,1=堵转,2=精确复位,3=双向堵转,4=双向传感器居中"),
         (0x0018, "REG_HOME_DIRECTION", "复位方向", "0=负方向,1=正方向"),
         (0x0019, "REG_HOME_CURRENT", "复位电流限制", "PWM值"),
         (0x001A, "REG_HOME_SPEED_H", "复位速度高16位", "int32高位"),
@@ -847,8 +847,8 @@ class ModbusDebuggerApp:
 
         ttk.Label(other_frame, text="复位模式:").grid(row=6, column=0, padx=5, pady=2)
         self.home_mode_var = tk.StringVar(value="")
-        ttk.Combobox(other_frame, textvariable=self.home_mode_var, width=8,
-                     values=["关闭", "堵转", "精确复位"], state="readonly").grid(row=6, column=1, padx=5, pady=2)
+        ttk.Combobox(other_frame, textvariable=self.home_mode_var, width=18,
+                     values=["关闭", "堵转", "精确复位", "双向堵转复位", "双向传感器居中"], state="readonly").grid(row=6, column=1, padx=5, pady=2)
 
         ttk.Label(other_frame, text="复位方向:").grid(row=7, column=0, padx=5, pady=2)
         self.home_dir_var = tk.StringVar(value="")
@@ -2256,7 +2256,7 @@ class ModbusDebuggerApp:
                         start_mode = 1 if self.start_mode_var.get() == "标志位" else 0
                         motor_dir = 1 if self.motor_dir_var.get() == "反转" else 0
                         encoder_dir = 1 if self.encoder_dir_var.get() == "反转" else 0
-                        home_mode_map = {"关闭": 0, "堵转": 1, "精确复位": 2}
+                        home_mode_map = {"关闭": 0, "堵转": 1, "精确复位": 2, "双向堵转复位": 3, "双向传感器居中": 4}
                         home_mode = home_mode_map.get(self.home_mode_var.get(), 0)
                         home_dir = 1 if self.home_dir_var.get() == "正方向" else 0
                         home_current = int(self.home_current_var.get())
@@ -2294,7 +2294,7 @@ class ModbusDebuggerApp:
                             [(home_precision_speed >> 16) & 0xFFFF, home_precision_speed & 0xFFFF])
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_HOME_PRECISION_CYCLES, home_precision_cycles)
 
-                        hm_name = {0: "关闭", 1: "堵转", 2: "精确复位"}
+                        hm_name = {0: "关闭", 1: "堵转", 2: "精确复位", 3: "双向堵转复位", 4: "双向传感器居中"}
                         self.root.after(0, lambda: self.log(
                             f"应用参数成功: 死区={dead_zone}, 最大输出={max_output}, "
                             f"最大运行速度={max_run_speed}, "
@@ -2349,7 +2349,7 @@ class ModbusDebuggerApp:
                         home_precision_speed = (precision_data[0] << 16) | precision_data[1]
                         home_precision_cycles = precision_data[2]
 
-                        hm_display = {0: "关闭", 1: "堵转", 2: "精确复位"}
+                        hm_display = {0: "关闭", 1: "堵转", 2: "精确复位", 3: "双向堵转复位", 4: "双向传感器居中"}
                         def update_ui():
                             self.dead_zone_var.set(str(dead_zone))
                             self.max_output_var.set(str(max_output))
@@ -4638,7 +4638,7 @@ class ModbusDebuggerApp:
             elif addr == 0x0016:  # REG_SET_ORIGIN - 设置原点
                 return "写1触发(只写)"
             elif addr == 0x0017:  # REG_HOME_MODE - 复位模式
-                return {0: "关闭", 1: "堵转", 2: "精确复位"}.get(val, str(val))
+                return {0: "关闭", 1: "堵转", 2: "精确复位", 3: "双向堵转复位", 4: "双向传感器居中"}.get(val, str(val))
             elif addr == 0x0018:  # REG_HOME_DIRECTION - 复位方向
                 return "负方向" if val == 0 else ("正方向" if val == 1 else str(val))
             elif addr == 0x0019:  # REG_HOME_CURRENT - 复位电流限制 PWM值
@@ -5054,7 +5054,7 @@ class ModbusDebuggerApp:
                 (0x0012, 'encoder_dir_var', lambda v: "反转" if v == 1 else "正常"),
                 (0x0014, 'device_addr_var', lambda v: str(v)),
                 (0x0015, 'device_baud_var', lambda v: str(v * 100)),
-                (0x0017, 'home_mode_var', lambda v: {0: "关闭", 1: "堵转", 2: "精确复位"}.get(v, str(v))),
+                (0x0017, 'home_mode_var', lambda v: {0: "关闭", 1: "堵转", 2: "精确复位", 3: "双向堵转复位", 4: "双向传感器居中"}.get(v, str(v))),
                 (0x0018, 'home_dir_var', lambda v: "正方向" if v == 1 else "负方向"),
                 (0x0019, 'home_current_var', lambda v: str(v)),
                 (0x0021, 'home_auto_start_var', lambda v: "开启" if v == 1 else "关闭"),

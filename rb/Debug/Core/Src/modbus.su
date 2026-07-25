@@ -17,7 +17,7 @@
 ../Core/Src/modbus.c:743:13:MODBUS_ApplyMode	24	static
 ../Core/Src/modbus.c:771:6:MODBUS_TriggerStartFlag	16	static
 ../Core/Src/modbus.c:792:13:MODBUS_WriteRegister	552	static,ignoring_inline_asm
-../Core/Src/modbus.c:1507:13:MODBUS_ProcessReadHoldingRegs	280	static
-../Core/Src/modbus.c:1545:13:MODBUS_ProcessWriteSingleReg	32	static
-../Core/Src/modbus.c:1575:13:MODBUS_ProcessWriteMultipleRegs	48	static
-../Core/Src/modbus.c:1622:6:MODBUS_Process	40	static
+../Core/Src/modbus.c:1509:13:MODBUS_ProcessReadHoldingRegs	280	static
+../Core/Src/modbus.c:1547:13:MODBUS_ProcessWriteSingleReg	32	static
+../Core/Src/modbus.c:1577:13:MODBUS_ProcessWriteMultipleRegs	48	static
+../Core/Src/modbus.c:1624:6:MODBUS_Process	40	static

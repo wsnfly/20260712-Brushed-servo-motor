@@ -48,7 +48,7 @@
 #define REG_SLAVE_ADDR               0x0014  /* MODBUS从机地址 (1~247) */
 #define REG_BAUD_RATE                0x0015  /* MODBUS波特率 (波特率/100) */
 #define REG_SET_ORIGIN               0x0016  /* 设置当前位置为原点 (写1触发, 读取始终返回0) */
-#define REG_HOME_MODE                0x0017  /* 复位模式 (0=关闭, 1=堵转复位) */
+#define REG_HOME_MODE                0x0017  /* 复位模式 (0=关闭, 1=堵转复位, 2=开关精确复位, 3=双向堵转复位, 4=双向传感器居中复位) */
 #define REG_HOME_DIRECTION           0x0018  /* 复位方向 (0=负方向, 1=正方向) */
 #define REG_HOME_CURRENT             0x0019  /* 复位电流限制(PWM值, 10~1000) */
 #define REG_HOME_SPEED_H             0x001A  /* 复位速度高16位 */

@@ -174,7 +174,10 @@ typedef enum {
     HOMING_SWITCH_RELEASE,             /* 开关复位：向正方向离开开关 */
     HOMING_SWITCH_PRECISION_APPROACH,  /* 开关复位：低速接近开关 */
     HOMING_SWITCH_PRECISION_RELEASE,   /* 开关复位：低速离开开关 */
-    HOMING_SWITCH_BACK                 /* 开关复位：退回偏置距离后设为零点 */
+    HOMING_SWITCH_BACK,                /* 开关复位：退回偏置距离后设为零点 */
+    HOMING_BIDIR_NEG_SEARCH,           /* 双向复位：负方向搜索(堵转/限位传感器) */
+    HOMING_BIDIR_POS_SEARCH,           /* 双向复位：正方向搜索(堵转/限位传感器) */
+    HOMING_BIDIR_CENTER                /* 双向复位：运动到中点+偏置位置后设为零点 */
 } HomingState_t;
 
 #define HOMING_STALL_TICKS       30U   /* 30 * 5ms = 150ms */
@@ -234,7 +237,7 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
             cfg->modbus_baud == 115200) {
             mc->modbus_baud = cfg->modbus_baud;
         }
-        if (cfg->home_mode <= 2) {
+        if (cfg->home_mode <= 4) {
             mc->home_mode = (uint8_t)cfg->home_mode;
         }
         if (cfg->home_dir <= 1) {
@@ -565,6 +568,10 @@ static int64_t switch_edge_pos = 0;       /* 开关边缘触发位置 */
 static uint8_t precision_cycle_idx = 0;   /* 当前精确检测循环次数 */
 static int64_t switch_edge_sum = 0;       /* 边缘位置累加（用于求平均） */
 
+/* 双向复位专用变量 */
+static int64_t bidir_neg_position = 0;    /* 负方向停止位置(堵转/限位触发点) */
+static int64_t bidir_pos_position = 0;    /* 正方向停止位置(堵转/限位触发点) */
+
 /* 外部目标电平模式状态(本模块 MotorControl_Update 内部使用, 保留于此) */
 static uint8_t target_level_state = 0;
 
@@ -631,6 +638,20 @@ static uint8_t ReadHomeSwitch(MotorControl_t *mc)
     if (mc->pin5_polarity == POLARITY_ACTIVE_LOW) pin5 = !pin5;
     if (mc->pin4_func == PIN_FUNC_HOME && pin4) return 1;
     if (mc->pin5_func == PIN_FUNC_HOME && pin5) return 1;
+    return 0;
+}
+
+/* 读取指定方向的限位开关状态（有效=1，无效=0）
+ * dir: 0=正方向限位(limit_dir=0, 停止正方向), 1=负方向限位(limit_dir=1, 停止负方向)
+ * 用于双向传感器居中复位检测正/负限位到达 */
+static uint8_t ReadLimitSwitch(MotorControl_t *mc, uint8_t dir)
+{
+    uint8_t pin4 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_4) == GPIO_PIN_SET) ? 1 : 0;
+    uint8_t pin5 = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_5) == GPIO_PIN_SET) ? 1 : 0;
+    if (mc->pin4_polarity == POLARITY_ACTIVE_LOW) pin4 = !pin4;
+    if (mc->pin5_polarity == POLARITY_ACTIVE_LOW) pin5 = !pin5;
+    if (mc->pin4_func == PIN_FUNC_LIMIT && pin4 && mc->pin4_limit_dir == dir) return 1;
+    if (mc->pin5_func == PIN_FUNC_LIMIT && pin5 && mc->pin5_limit_dir == dir) return 1;
     return 0;
 }
 
@@ -874,6 +895,34 @@ void MotorControl_StartHoming(MotorControl_t *mc)
 
         mc->mode = VELOCITY_POSITION_MODE;
         mc->target_position = Encoder_GetCount();
+        mc->target_pos_frac = 0.0f;
+        mc->integral = 0;
+        mc->prev_error = 0;
+        return;
+    }
+
+    /* ========== 双向复位（堵转/传感器居中）==========
+     * 流程: 负方向搜索→正方向搜索→计算中点→运动到中点+偏置→清零设原点
+     * 堵转模式(BIDIR_STALL): 两端靠堵转检测停止
+     * 传感器模式(BIDIR_SENSOR): 两端靠正/负限位开关停止
+     * 启动逻辑两种模式相同, 区别在Update状态机中的停止条件检测 */
+    if (mc->home_mode == HOME_MODE_BIDIR_STALL || mc->home_mode == HOME_MODE_BIDIR_SENSOR) {
+        if (mc->home_current < 10 || mc->home_current > 1000) mc->home_current = 300;
+        if (mc->home_speed <= 0) mc->home_speed = 1000;
+        if (mc->home_max_distance <= 0) mc->home_max_distance = 10000;
+
+        homing_state = HOMING_BIDIR_NEG_SEARCH;
+        homing_failed = 0;
+        homing_ticks = 0;
+        homing_stall_ticks = 0;
+        homing_start_position = Encoder_GetCount();
+        mode_before_homing = mc->mode;
+        bidir_neg_position = 0;
+        bidir_pos_position = 0;
+
+        mc->mode = VELOCITY_POSITION_MODE;
+        mc->target_position = homing_start_position;
+        mc->target_speed = -(float)mc->home_speed;  /* 先负方向运动 */
         mc->target_pos_frac = 0.0f;
         mc->integral = 0;
         mc->prev_error = 0;
@@ -1876,6 +1925,114 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         int64_t err = mc->target_position - current_position;
         if (abs64(err) <= 2) {
             MotorControl_FinishHoming(mc, 0);
+            return 0;
+        }
+    }
+
+    /* ========== 双向复位状态机（堵转/传感器居中）==========
+     * HOMING_BIDIR_NEG_SEARCH: 负方向搜索, 到达堵转/负限位后记录位置, 转正方向
+     * HOMING_BIDIR_POS_SEARCH: 正方向搜索, 到达堵转/正限位后记录位置, 计算中点转居中
+     * HOMING_BIDIR_CENTER: 运动到中点+偏置位置, 到位后清零编码器设原点 */
+    if (homing_state == HOMING_BIDIR_NEG_SEARCH) {
+        homing_ticks++;
+
+        /* 检测停止条件: 传感器模式检测负限位, 堵转模式检测速度近0 */
+        uint8_t stop = 0;
+        if (mc->home_mode == HOME_MODE_BIDIR_SENSOR) {
+            if (ReadLimitSwitch(mc, 1)) stop = 1;  /* 负方向限位(limit_dir=1) */
+        } else {
+            int32_t effective_home_speed = mc->home_speed;
+            if (mc->max_run_speed > 0 && effective_home_speed > mc->max_run_speed) {
+                effective_home_speed = mc->max_run_speed;
+            }
+            int32_t stall_speed = effective_home_speed / 10;
+            if (stall_speed < 5) stall_speed = 5;
+            if (homing_ticks > HOMING_STALL_GRACE_TICKS && fabsf(mc->velocity) <= (float)stall_speed) {
+                homing_stall_ticks++;
+            } else {
+                homing_stall_ticks = 0;
+            }
+            if (homing_stall_ticks >= HOMING_STALL_TICKS) stop = 1;
+        }
+
+        if (stop) {
+            /* 记录负方向停止位置, 切换到正方向搜索 */
+            bidir_neg_position = current_position;
+            homing_state = HOMING_BIDIR_POS_SEARCH;
+            homing_ticks = 0;
+            homing_stall_ticks = 0;
+            homing_start_position = current_position;  /* 重置起始位置用于正方向max_distance检测 */
+            mc->target_position = current_position;    /* 重置目标位置, 消除限位钳制期间的位置误差累积 */
+            mc->target_pos_frac = 0.0f;
+            mc->target_speed = (float)mc->home_speed;  /* 正方向运动 */
+            mc->integral = 0;
+            mc->prev_error = 0;
+            mc->current_target = 0.0f;
+            MotorControl_SetOutput(mc, 0);
+            return 0;
+        }
+
+        /* 超过最大距离则失败 */
+        int64_t distance = abs64(current_position - homing_start_position);
+        if (distance >= mc->home_max_distance) {
+            MotorControl_FinishHoming(mc, 1);
+            return 0;
+        }
+
+        /* 持续负方向运动 */
+        mc->target_speed = -(float)mc->home_speed;
+    }
+
+    if (homing_state == HOMING_BIDIR_POS_SEARCH) {
+        homing_ticks++;
+
+        /* 检测停止条件: 传感器模式检测正限位, 堵转模式检测速度近0 */
+        uint8_t stop = 0;
+        if (mc->home_mode == HOME_MODE_BIDIR_SENSOR) {
+            if (ReadLimitSwitch(mc, 0)) stop = 1;  /* 正方向限位(limit_dir=0) */
+        } else {
+            int32_t effective_home_speed = mc->home_speed;
+            if (mc->max_run_speed > 0 && effective_home_speed > mc->max_run_speed) {
+                effective_home_speed = mc->max_run_speed;
+            }
+            int32_t stall_speed = effective_home_speed / 10;
+            if (stall_speed < 5) stall_speed = 5;
+            if (homing_ticks > HOMING_STALL_GRACE_TICKS && fabsf(mc->velocity) <= (float)stall_speed) {
+                homing_stall_ticks++;
+            } else {
+                homing_stall_ticks = 0;
+            }
+            if (homing_stall_ticks >= HOMING_STALL_TICKS) stop = 1;
+        }
+
+        if (stop) {
+            /* 记录正方向停止位置, 计算中点+偏置, 切换到居中运动 */
+            bidir_pos_position = current_position;
+            int64_t center = (bidir_neg_position + bidir_pos_position) / 2;
+            int64_t target = center + (int64_t)mc->home_back_distance;
+            homing_state = HOMING_BIDIR_CENTER;
+            mc->mode = POSITION_MODE;
+            mc->target_position = target;
+            mc->current_target = 0.0f;
+            MotorControl_SetOutput(mc, 0);
+            return 0;
+        }
+
+        /* 超过最大距离则失败 */
+        int64_t distance = abs64(current_position - homing_start_position);
+        if (distance >= mc->home_max_distance) {
+            MotorControl_FinishHoming(mc, 1);
+            return 0;
+        }
+
+        /* 持续正方向运动 */
+        mc->target_speed = (float)mc->home_speed;
+    }
+
+    if (homing_state == HOMING_BIDIR_CENTER) {
+        int64_t err = mc->target_position - current_position;
+        if (abs64(err) <= 2) {
+            MotorControl_FinishHoming(mc, 0);  /* 到位, 清零编码器设原点 */
             return 0;
         }
     }

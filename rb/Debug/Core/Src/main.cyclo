@@ -1,6 +1,6 @@
 ../Core/Inc/modbus.h:410:23:SYS_GetTime100us	1
 ../Core/Inc/modbus.h:419:23:SYS_GetTimeMs	1
-../Core/Src/main.c:85:5:main	19
+../Core/Src/main.c:85:5:main	17
 ../Core/Src/main.c:272:6:SystemClock_Config	4
 ../Core/Src/main.c:318:13:MX_ADC1_Init	7
 ../Core/Src/main.c:397:13:MX_TIM1_Init	4
