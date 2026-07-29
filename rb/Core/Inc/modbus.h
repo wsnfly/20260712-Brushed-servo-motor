@@ -256,7 +256,7 @@
 #define REG_ACC_TABLE_STATUS          0x0099  /* 状态(只读) */
 #define REG_ACC_TABLE_PROGRESS        0x009A  /* 进度(只读, 0~1000) */
 #define REG_STEP_BASE                 REG_STEP_MAX_SPEED_H3  /* 加减速寄存器区起始地址 */
-#define REG_STEP_END                  0x009F  /* 寄存器区结束地址(含前馈系数0x009B + 多通道采集0x009C~0x009F) */
+#define REG_STEP_END                  0x00A7  /* 寄存器区结束地址(含前馈0x009B + 多通道0x009C~0x009F + 自动校准0x00A0 + 电子齿轮0x00A1~0x00A2 + 中断优先级0x00A3~0x00A7) */
 
 /* 电流环前馈系数(新增) 0x009B
  * 速度前馈(反电动势补偿): PWM += Kff * velocity
@@ -273,6 +273,31 @@
 #define REG_SPEED_ACQ_TYPE2           0x009D  /* 通道2采集类型(编码同REG_SPEED_ACQ_TYPE) */
 #define REG_SPEED_ACQ_TYPE3           0x009E  /* 通道3采集类型 */
 #define REG_SPEED_ACQ_TYPE4           0x009F  /* 通道4采集类型 */
+
+/* 开机自动零点电流校准(新增) 0x00A0
+ * 0=关闭(默认): 使用Flash保存的offset, 手动校准后存Flash
+ * 1=开启: 每次开机自动校准, 结果不存Flash(避免频繁烧写) */
+#define REG_AUTO_CALIB_CURRENT        0x00A0  /* 开机自动零点电流校准: 0=关闭, 1=开启 */
+
+/* 电子齿轮(脉冲倍频/分频, 新增) 0x00A1~0x00A2
+ * 外部脉冲输入后, 实际移动量 = 输入脉冲 × (分子/分母)
+ * 倍频: 分子>分母, 如 2/1 = 每脉冲移动2步
+ * 分频: 分子<分母, 如 1/2 = 每2脉冲移动1步
+ * 适用: 脉冲检测频率受限(如3KHz), 倍频提高等效速度, 分频配合高频源 */
+#define REG_GEAR_NUMERATOR            0x00A1  /* 电子齿轮分子(1~65535, 默认1) */
+#define REG_GEAR_DENOMINATOR          0x00A2  /* 电子齿轮分母(1~65535, 默认1) */
+
+/* 中断优先级配置寄存器 0x00A3~0x00A7 (新增)
+ * STM32F103有4位抢占优先级(0~15), 数值越小优先级越高
+ * 默认值: USART1=1, TIM1=2, TIM2=3, EXTI4=1, EXTI9_5=1
+ * 修改后立即生效并保存Flash, 掉电不丢失 */
+#define REG_IRQ_PRIO_USART1           0x00A3  /* USART1中断优先级(0~15, 默认1) */
+#define REG_IRQ_PRIO_TIM1             0x00A4  /* TIM1中断优先级(0~15, 默认2) */
+#define REG_IRQ_PRIO_TIM2             0x00A5  /* TIM2中断优先级(0~15, 默认3) */
+#define REG_IRQ_PRIO_EXTI4            0x00A6  /* EXTI4中断优先级(0~15, 默认1) */
+#define REG_IRQ_PRIO_EXTI9_5          0x00A7  /* EXTI9_5中断优先级(0~15, 默认1) */
+
+#define REG_CALIB_CURRENT_END         0x00A7  /* 寄存器区结束地址(含中断优先级) */
 
 /* 数据寄存器 (只读) - 采集缓冲区 0x0200~0x15FF (5120个int16_t, 10KB) */
 #define REG_SPEED_DATA_BASE          0x0200  /* 采集数据起始地址 */
@@ -340,6 +365,20 @@
 #define REG_CURRENT_TARGET_DISP      0x0123  /* 电流目标(×10, 相对值, 与0x0112相同便于批量读取) */
 #define REG_CURRENT_ACTUAL_DISP      0x0124  /* 实际电流(×10, 相对值, 与0x0111相同便于批量读取) */
 
+/* 系统时间寄存器(只读) 0x0125~0x0128 (新增)
+ * 系统时间(sys_time_100us)为64位整数, TIM1每100us中断+1, 单位0.1ms.
+ * 上电后从0开始累计, 最大值 2^63-1 ≈ 9.22×10^18 (约2.9万年不会溢出).
+ * 4个寄存器组成64位值(大端序):
+ *   0x0125 = bit[63:48]   0x0126 = bit[47:32]
+ *   0x0127 = bit[31:16]   0x0128 = bit[15:0]
+ * 上位机读取后合并: time = (R0x0125<<48)|(R0x0126<<32)|(R0x0127<<16)|R0x0128
+ * 实际时间 = time × 0.1ms, 即 time×100 微秒.
+ * 用途: 上位机与下位机时间同步, 采集数据时间戳, 延时测量等. */
+#define REG_SYS_TIME_H3              0x0125  /* 系统时间 bit[63:48] (只读, 单位0.1ms) */
+#define REG_SYS_TIME_H2              0x0126  /* 系统时间 bit[47:32] */
+#define REG_SYS_TIME_L2              0x0127  /* 系统时间 bit[31:16] */
+#define REG_SYS_TIME_L1              0x0128  /* 系统时间 bit[15:0] */
+
 /* 控制字位定义 */
 #define CTRL_MODE_MASK               0x000F  /* 模式掩码 */
 
@@ -396,6 +435,7 @@ typedef struct {
     volatile uint16_t frame_timeout_ticks;   /* 帧间超时阈值（随波特率调整） */
     volatile uint8_t rx_complete;            /* 帧接收完成标志 */
     uint8_t tx_buf[MB_TX_BUF_SIZE];
+    volatile uint8_t tx_busy;                /* 发送忙标志(中断发送中, 防止重入) */
     uint8_t slave_addr;
     MotorControl_t *motor;
 

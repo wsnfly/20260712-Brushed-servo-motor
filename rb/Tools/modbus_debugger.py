@@ -279,6 +279,24 @@ class ModbusDebuggerApp:
     REG_SPEED_ACQ_TYPE3 = 0x009E        # 通道3采集类型
     REG_SPEED_ACQ_TYPE4 = 0x009F        # 通道4采集类型
 
+    # 开机自动零点电流校准(新增)
+    # 0=关闭(默认): 使用Flash保存的offset, 手动校准后存Flash
+    # 1=开启: 每次开机自动校准, 结果不存Flash(避免频繁烧写)
+    REG_AUTO_CALIB_CURRENT = 0x00A0     # 开机自动零点电流校准: 0=关闭, 1=开启
+
+    # 电子齿轮(脉冲倍频/分频, 新增)
+    # 实际移动量 = 输入脉冲 × (分子/分母)
+    # 倍频: 分子>分母, 分频: 分子<分母
+    REG_GEAR_NUMERATOR = 0x00A1         # 电子齿轮分子(1~65535, 默认1)
+    REG_GEAR_DENOMINATOR = 0x00A2       # 电子齿轮分母(1~65535, 默认1)
+
+    # 中断优先级配置(新增) - STM32F103有4位抢占优先级(0~15), 数值越小优先级越高
+    REG_IRQ_PRIO_USART1 = 0x00A3        # USART1中断优先级(0~15, 默认1)
+    REG_IRQ_PRIO_TIM1 = 0x00A4          # TIM1中断优先级(0~15, 默认2)
+    REG_IRQ_PRIO_TIM2 = 0x00A5          # TIM2中断优先级(0~15, 默认3)
+    REG_IRQ_PRIO_EXTI4 = 0x00A6         # EXTI4中断优先级(0~15, 默认1)
+    REG_IRQ_PRIO_EXTI9_5 = 0x00A7       # EXTI9_5中断优先级(0~15, 默认1)
+
     REG_STALL_PROT_EN = 0x0040          # 堵转保护使能: 0=关闭, 1=开启
     REG_STALL_ERR_LIMIT = 0x0041        # 堵转误差阈值(位置=脉冲, 速度=脉冲/秒)
     REG_STALL_TIME = 0x0042             # 堵转持续时长(单位=PID周期5ms)
@@ -389,6 +407,12 @@ class ModbusDebuggerApp:
     REG_PID_D_L = 0x0110
     REG_CURRENT_ACTUAL = 0x0111          # 实际电流(相对值×10, 有符号, ±10000=±8.25A)
     REG_CURRENT_TARGET_RO = 0x0112       # 电流目标(相对值×10, 有符号)
+
+    # 系统时间寄存器(只读, 64位, 单位0.1ms)
+    REG_SYS_TIME_H3 = 0x0125
+    REG_SYS_TIME_H2 = 0x0126
+    REG_SYS_TIME_L2 = 0x0127
+    REG_SYS_TIME_L1 = 0x0128
     
     # 模式定义
     MODE_POSITION = 0
@@ -567,6 +591,14 @@ class ModbusDebuggerApp:
         (0x009D, "REG_SPEED_ACQ_TYPE2", "通道2采集类型", "编码同0x003E"),
         (0x009E, "REG_SPEED_ACQ_TYPE3", "通道3采集类型", "编码同0x003E"),
         (0x009F, "REG_SPEED_ACQ_TYPE4", "通道4采集类型", "编码同0x003E"),
+        (0x00A0, "REG_AUTO_CALIB_CURRENT", "开机自动零点校准", "0=关闭,1=开启"),
+        (0x00A1, "REG_GEAR_NUMERATOR", "电子齿轮分子", "1~65535, 默认1"),
+        (0x00A2, "REG_GEAR_DENOMINATOR", "电子齿轮分母", "1~65535, 默认1"),
+        (0x00A3, "REG_IRQ_PRIO_USART1", "USART1中断优先级", "0~15, 默认1"),
+        (0x00A4, "REG_IRQ_PRIO_TIM1", "TIM1中断优先级", "0~15, 默认2"),
+        (0x00A5, "REG_IRQ_PRIO_TIM2", "TIM2中断优先级", "0~15, 默认3"),
+        (0x00A6, "REG_IRQ_PRIO_EXTI4", "EXTI4中断优先级", "0~15, 默认1"),
+        (0x00A7, "REG_IRQ_PRIO_EXTI9_5", "EXTI9_5中断优先级", "0~15, 默认1"),
     ]
 
     # 写入全部寄存器时跳过的触发型/只读寄存器集合
@@ -605,6 +637,7 @@ class ModbusDebuggerApp:
             'io': tk.BooleanVar(value=True),
             'flags': tk.BooleanVar(value=True),
             'step': tk.BooleanVar(value=True),
+            'sys_time': tk.BooleanVar(value=True),
         }
 
         # 监控频率设置变量（控制monitor_loop的读取间隔）
@@ -943,6 +976,60 @@ class ModbusDebuggerApp:
         ttk.Button(btn_frame, text="读取引脚配置", command=self.read_pin_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="写入引脚配置", command=self.write_pin_config).pack(side=tk.LEFT, padx=5)
 
+        # 电子齿轮(脉冲倍频/分频)配置
+        gear_frame = ttk.LabelFrame(left_frame, text="电子齿轮 (脉冲倍频/分频)", padding=10)
+        gear_frame.pack(fill=tk.X, pady=5)
+
+        ttk.Label(gear_frame, text="分子(倍频):").grid(row=0, column=0, padx=5, pady=2, sticky=tk.W)
+        self.gear_num_var = tk.StringVar(value="")
+        ttk.Entry(gear_frame, textvariable=self.gear_num_var, width=10).grid(row=0, column=1, padx=5, pady=2)
+        ttk.Label(gear_frame, text="分母(分频):").grid(row=0, column=2, padx=5, pady=2, sticky=tk.W)
+        self.gear_den_var = tk.StringVar(value="")
+        ttk.Entry(gear_frame, textvariable=self.gear_den_var, width=10).grid(row=0, column=3, padx=5, pady=2)
+        ttk.Label(gear_frame, text="实际移动 = 输入脉冲 × (分子/分母)",
+                  foreground="blue").grid(row=0, column=4, padx=5, pady=2, sticky=tk.W)
+
+        ttk.Label(gear_frame, text="当前比率:", foreground="gray").grid(row=1, column=0, padx=5, pady=2, sticky=tk.W)
+        self.gear_ratio_display = ttk.Label(gear_frame, text="1:1", foreground="blue")
+        self.gear_ratio_display.grid(row=1, column=1, columnspan=2, padx=5, pady=2, sticky=tk.W)
+
+        gear_btn_frame = ttk.Frame(gear_frame)
+        gear_btn_frame.grid(row=2, column=0, columnspan=5, pady=5)
+        ttk.Button(gear_btn_frame, text="读取齿轮比", command=self.read_gear_ratio).pack(side=tk.LEFT, padx=5)
+        ttk.Button(gear_btn_frame, text="写入齿轮比", command=self.write_gear_ratio).pack(side=tk.LEFT, padx=5)
+        ttk.Button(gear_btn_frame, text="恢复1:1", command=self.reset_gear_ratio).pack(side=tk.LEFT, padx=5)
+
+        # 常用倍频/分频快捷按钮
+        ttk.Label(gear_frame, text="快捷设置:", foreground="gray").grid(row=3, column=0, padx=5, pady=2, sticky=tk.W)
+        quick_frame = ttk.Frame(gear_frame)
+        quick_frame.grid(row=3, column=1, columnspan=4, padx=5, pady=2, sticky=tk.W)
+        for label, num, den in [("2倍频", 2, 1), ("4倍频", 4, 1), ("1/2分频", 1, 2), ("1/4分频", 1, 4), ("3/2", 3, 2)]:
+            ttk.Button(quick_frame, text=label, width=8,
+                       command=lambda n=num, d=den: self.set_gear_quick(n, d)).pack(side=tk.LEFT, padx=2)
+
+        # 中断优先级配置(新增)
+        irq_frame = ttk.LabelFrame(left_frame, text="中断优先级配置 (0~15, 数值越小优先级越高)", padding=10)
+        irq_frame.pack(fill=tk.X, pady=5)
+
+        irq_items = [
+            ("USART1 (串口通信):", "irq_prio_usart1_var", "1"),
+            ("TIM1 (PID 100us):", "irq_prio_tim1_var", "2"),
+            ("TIM2 (步进加减速):", "irq_prio_tim2_var", "3"),
+            ("EXTI4 (PB4脉冲):", "irq_prio_exti4_var", "1"),
+            ("EXTI9_5 (PB5脉冲):", "irq_prio_exti9_5_var", "1"),
+        ]
+        for i, (label, var_name, default) in enumerate(irq_items):
+            ttk.Label(irq_frame, text=label).grid(row=i, column=0, padx=5, pady=2, sticky=tk.W)
+            var = tk.StringVar(value=default)
+            setattr(self, var_name, var)
+            ttk.Spinbox(irq_frame, from_=0, to=15, textvariable=var, width=5).grid(row=i, column=1, padx=5, pady=2)
+
+        irq_btn_frame = ttk.Frame(irq_frame)
+        irq_btn_frame.grid(row=len(irq_items), column=0, columnspan=2, pady=5)
+        ttk.Button(irq_btn_frame, text="读取优先级", command=self.read_irq_prio).pack(side=tk.LEFT, padx=5)
+        ttk.Button(irq_btn_frame, text="写入优先级", command=self.write_irq_prio).pack(side=tk.LEFT, padx=5)
+        ttk.Button(irq_btn_frame, text="恢复默认", command=self.reset_irq_prio).pack(side=tk.LEFT, padx=5)
+
         # PC2/PC3 ADC功能配置
         adc_frame = ttk.LabelFrame(left_frame, text="PC2/PC3 ADC功能配置 (冲突时PC2优先)", padding=10)
         adc_frame.pack(fill=tk.X, pady=5)
@@ -1132,8 +1219,17 @@ class ModbusDebuggerApp:
         ttk.Label(cur_frame, text="0=关闭, 防止静止时细微电流",
                   foreground="blue").grid(row=6, column=2, columnspan=4, padx=5, pady=2, sticky=tk.W)
 
+        # 开机自动零点电流校准(新增): 勾选后每次开机自动校准, 不存Flash
+        self.auto_calib_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cur_frame, text="开机自动校准零点电流",
+                        variable=self.auto_calib_var,
+                        command=self.on_auto_calib_toggle).grid(row=7, column=0, columnspan=3,
+                                                                 padx=5, pady=2, sticky=tk.W)
+        ttk.Label(cur_frame, text="开启=每次开机校准(不存Flash), 关闭=手动校准(存Flash)",
+                  foreground="gray").grid(row=7, column=3, columnspan=3, padx=5, pady=2, sticky=tk.W)
+
         cur_btn_frame = ttk.Frame(cur_frame)
-        cur_btn_frame.grid(row=7, column=0, columnspan=4, pady=5)
+        cur_btn_frame.grid(row=8, column=0, columnspan=4, pady=5)
         ttk.Button(cur_btn_frame, text="读取参数", command=self.read_current_loop_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(cur_btn_frame, text="写入参数", command=self.write_current_loop_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(cur_btn_frame, text="过流复位", command=self.reset_over_current).pack(side=tk.LEFT, padx=5)
@@ -1422,17 +1518,24 @@ class ModbusDebuggerApp:
         self.status_labels['pb5_level'].grid(row=4, column=9, padx=5, pady=2, sticky=tk.W)
         self.status_group_widgets['io'].extend([lbl, self.status_labels['pb5_level']])
 
-        # 最右侧的监控开关按钮（column=10, 跨5行，开启/关闭读取实时状态）
-        self.monitor_btn = ttk.Button(status_frame, text="开始\n监控", command=self.toggle_monitor, width=8)
-        self.monitor_btn.grid(row=0, column=10, rowspan=5, padx=10, pady=5, sticky="nsew")
+        # 开机时间(放在ADC列第5行, 64位系统时间, 单位0.1ms)
+        lbl = ttk.Label(status_frame, text="开机时间:")
+        lbl.grid(row=5, column=8, padx=15, pady=2, sticky=tk.W)
+        self.status_labels['sys_time'] = ttk.Label(status_frame, text="00:00:00.0", foreground="teal", font=("Arial", 12, "bold"))
+        self.status_labels['sys_time'].grid(row=5, column=9, padx=5, pady=2, sticky=tk.W)
+        self.status_group_widgets['sys_time'].extend([lbl, self.status_labels['sys_time']])
 
-        # 状态项显示选项（复选框行，row=5）
+        # 最右侧的监控开关按钮（column=10, 跨6行，开启/关闭读取实时状态）
+        self.monitor_btn = ttk.Button(status_frame, text="开始\n监控", command=self.toggle_monitor, width=8)
+        self.monitor_btn.grid(row=0, column=10, rowspan=6, padx=10, pady=5, sticky="nsew")
+
+        # 状态项显示选项（复选框行，row=6）
         opt_frame = ttk.Frame(status_frame)
-        opt_frame.grid(row=5, column=0, columnspan=11, pady=2, sticky=tk.W)
+        opt_frame.grid(row=6, column=0, columnspan=11, pady=2, sticky=tk.W)
         ttk.Label(opt_frame, text="显示:").pack(side=tk.LEFT, padx=2)
         for key, label in [('position', '位置'), ('speed', '速度'), ('mode', '模式'), ('pwm', 'PWM'),
                            ('pid', 'PID'), ('current', '电流'), ('adc', 'ADC'), ('io', 'IO'), ('flags', '标志'),
-                           ('step', '步进')]:
+                           ('step', '步进'), ('sys_time', '时间')]:
             ttk.Checkbutton(opt_frame, text=label, variable=self.monitor_options[key],
                             command=self.update_status_visibility).pack(side=tk.LEFT, padx=3)
 
@@ -2613,6 +2716,189 @@ class ModbusDebuggerApp:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"写入引脚配置失败: {str(e)}"))
         threading.Thread(target=do_write, daemon=True).start()
 
+    # ========== 电子齿轮(脉冲倍频/分频) ==========
+
+    def update_gear_ratio_display(self):
+        """更新当前比率显示"""
+        try:
+            num = int(self.gear_num_var.get())
+            den = int(self.gear_den_var.get())
+            if den == 0:
+                self.gear_ratio_display.config(text="无效(分母=0)")
+                return
+            ratio = num / den
+            if ratio == int(ratio):
+                self.gear_ratio_display.config(text=f"{num}:{den} = {int(ratio)}x")
+            else:
+                self.gear_ratio_display.config(text=f"{num}:{den} = {ratio:.4f}x")
+        except ValueError:
+            self.gear_ratio_display.config(text="?")
+
+    def read_gear_ratio(self):
+        """读取电子齿轮倍频/分频系数"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        def do_read():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_GEAR_NUMERATOR, 2)
+                        num = data[0]
+                        den = data[1]
+                        def update_ui():
+                            self.gear_num_var.set(str(num))
+                            self.gear_den_var.set(str(den))
+                            self.update_gear_ratio_display()
+                            self.log(f"读取电子齿轮: 分子={num}, 分母={den}, 比率={num/den if den else '无效'}")
+                        self.root.after(0, update_ui)
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"读取电子齿轮失败: {str(e)}"))
+        threading.Thread(target=do_read, daemon=True).start()
+
+    def write_gear_ratio(self):
+        """写入电子齿轮倍频/分频系数"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        try:
+            num = int(self.gear_num_var.get())
+            den = int(self.gear_den_var.get())
+        except ValueError:
+            messagebox.showerror("错误", "分子和分母必须是整数")
+            return
+        if num < 1 or num > 65535:
+            messagebox.showerror("错误", "分子范围: 1~65535")
+            return
+        if den < 1 or den > 65535:
+            messagebox.showerror("错误", "分母范围: 1~65535")
+            return
+        def do_write():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_GEAR_NUMERATOR, num)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_GEAR_DENOMINATOR, den)
+                        ratio = num / den
+                        self.root.after(0, lambda: self.log(
+                            f"写入电子齿轮: 分子={num}, 分母={den}, 比率={ratio:.4f}x"
+                            f"({'倍频' if num > den else '分频' if num < den else '直通'})"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"写入电子齿轮失败: {str(e)}"))
+        threading.Thread(target=do_write, daemon=True).start()
+
+    def reset_gear_ratio(self):
+        """恢复电子齿轮为1:1(直通)"""
+        self.gear_num_var.set("1")
+        self.gear_den_var.set("1")
+        self.update_gear_ratio_display()
+        if self.modbus:
+            self.write_gear_ratio()
+
+    def set_gear_quick(self, num, den):
+        """快捷设置齿轮比"""
+        self.gear_num_var.set(str(num))
+        self.gear_den_var.set(str(den))
+        self.update_gear_ratio_display()
+        if self.modbus:
+            self.write_gear_ratio()
+
+    # ========== 中断优先级配置 ==========
+
+    # 中断优先级寄存器与UI变量名映射
+    IRQ_PRIO_MAP = [
+        (REG_IRQ_PRIO_USART1, "irq_prio_usart1_var", "USART1"),
+        (REG_IRQ_PRIO_TIM1, "irq_prio_tim1_var", "TIM1"),
+        (REG_IRQ_PRIO_TIM2, "irq_prio_tim2_var", "TIM2"),
+        (REG_IRQ_PRIO_EXTI4, "irq_prio_exti4_var", "EXTI4"),
+        (REG_IRQ_PRIO_EXTI9_5, "irq_prio_exti9_5_var", "EXTI9_5"),
+    ]
+    # 默认值
+    IRQ_PRIO_DEFAULTS = {"irq_prio_usart1_var": "1", "irq_prio_tim1_var": "2",
+                         "irq_prio_tim2_var": "3", "irq_prio_exti4_var": "1", "irq_prio_exti9_5_var": "1"}
+
+    def read_irq_prio(self):
+        """读取5个中断优先级寄存器"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        def do_read():
+            if self.serial_lock.acquire(timeout=0.5):
+                try:
+                    # 连续读取0x00A3~0x00A7共5个寄存器
+                    data = self.modbus.read_holding_registers(
+                        self.get_slave_addr(), self.REG_IRQ_PRIO_USART1, 5)
+                    if data and len(data) >= 5:
+                        vals = [v if v <= 15 else (v - 65536 if v > 32768 else v) for v in data[:5]]
+                        updates = {}
+                        for i, (reg, var_name, name) in enumerate(self.IRQ_PRIO_MAP):
+                            updates[var_name] = str(vals[i])
+                        def apply():
+                            for var_name, val in updates.items():
+                                getattr(self, var_name).set(val)
+                            self.log(f"读取中断优先级: " + ", ".join(
+                                f"{name}={val}" for (_, _, name), val in zip(self.IRQ_PRIO_MAP, vals)))
+                        self.root.after(0, apply)
+                    else:
+                        self.root.after(0, lambda: messagebox.showerror("错误", "读取中断优先级失败: 数据长度不足"))
+                except Exception as e:
+                    self.root.after(0, lambda: messagebox.showerror("错误", f"读取中断优先级失败: {str(e)}"))
+                finally:
+                    self.serial_lock.release()
+            else:
+                self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+        threading.Thread(target=do_read, daemon=True).start()
+
+    def write_irq_prio(self):
+        """写入5个中断优先级寄存器"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            return
+        # 校验
+        vals = []
+        for reg, var_name, name in self.IRQ_PRIO_MAP:
+            try:
+                v = int(getattr(self, var_name).get())
+                if v < 0 or v > 15:
+                    messagebox.showwarning("警告", f"{name}优先级必须在0~15之间")
+                    return
+                vals.append(v)
+            except ValueError:
+                messagebox.showwarning("警告", f"{name}优先级必须是整数")
+                return
+        def do_write():
+            if self.serial_lock.acquire(timeout=0.5):
+                try:
+                    for (reg, var_name, name), v in zip(self.IRQ_PRIO_MAP, vals):
+                        self.modbus.write_single_register(self.get_slave_addr(), reg, v)
+                    self.root.after(0, lambda: self.log(
+                        "写入中断优先级: " + ", ".join(f"{name}={v}" for (_, _, name), v in zip(self.IRQ_PRIO_MAP, vals))))
+                except Exception as e:
+                    self.root.after(0, lambda: messagebox.showerror("错误", f"写入中断优先级失败: {str(e)}"))
+                finally:
+                    self.serial_lock.release()
+            else:
+                self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+        threading.Thread(target=do_write, daemon=True).start()
+
+    def reset_irq_prio(self):
+        """恢复中断优先级为默认值"""
+        for var_name, default in self.IRQ_PRIO_DEFAULTS.items():
+            getattr(self, var_name).set(default)
+        if self.modbus:
+            self.write_irq_prio()
+
     # ========== PC2/PC3 ADC功能配置 ==========
 
     def read_adc_config(self):
@@ -2947,6 +3233,11 @@ class ModbusDebuggerApp:
                         pos_ki_cur = to_float_signed(pid_cur_data[4], 100.0)
                         pos_kd_cur = to_float_signed(pid_cur_data[5], 1000.0)
 
+                        # 读取开机自动零点校准 (0x00A0, 单独读)
+                        ac_data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_AUTO_CALIB_CURRENT, 1)
+                        auto_calib = ac_data[0] != 0
+
                         def update_ui():
                             self.cur_loop_en_var.set("开启" if en else "关闭")
                             self.cur_kp_var.set(f"{kp:.2f}")
@@ -2964,13 +3255,16 @@ class ModbusDebuggerApp:
                             self.pos_kp_cur_var.set(f"{pos_kp_cur:.2f}")
                             self.pos_ki_cur_var.set(f"{pos_ki_cur:.2f}")
                             self.pos_kd_cur_var.set(f"{pos_kd_cur:.3f}")
+                            # 开机自动零点校准
+                            self.auto_calib_var.set(auto_calib)
                             self.log(
                                 f"读取电流环: 使能={'开启' if en else '关闭'}, "
                                 f"Kp={kp:.2f}, Ki={ki:.2f}, Kd={kd:.3f}, "
                                 f"零点={offset}, 系数={scale:.4f}, "
                                 f"过流={ocl_A:.2f}A, 限幅={mc_A:.2f}A, 死区={cdz_A:.3f}A, "
                                 f"速度PID(电流模式)={spd_kp_cur:.2f}/{spd_ki_cur:.2f}/{spd_kd_cur:.3f}, "
-                                f"位置PID(电流模式)={pos_kp_cur:.2f}/{pos_ki_cur:.2f}/{pos_kd_cur:.3f}")
+                                f"位置PID(电流模式)={pos_kp_cur:.2f}/{pos_ki_cur:.2f}/{pos_kd_cur:.3f}, "
+                                f"开机自动校准={'开启' if auto_calib else '关闭'}")
                         self.root.after(0, update_ui)
                     finally:
                         self.serial_lock.release()
@@ -3154,6 +3448,32 @@ class ModbusDebuggerApp:
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("错误", f"过流复位失败: {str(e)}"))
         threading.Thread(target=do_reset, daemon=True).start()
+
+    def on_auto_calib_toggle(self):
+        """开机自动零点电流校准开关: 写入0x00A0寄存器
+        0=关闭(默认): 使用Flash保存的offset, 手动校准后存Flash
+        1=开启: 每次开机自动校准, 结果不存Flash(避免频繁烧写)"""
+        if not self.modbus:
+            messagebox.showwarning("警告", "请先连接串口")
+            self.auto_calib_var.set(not self.auto_calib_var.get())  # 恢复状态
+            return
+        val = 1 if self.auto_calib_var.get() else 0
+        def do_write():
+            try:
+                if self.serial_lock.acquire(timeout=1.0):
+                    try:
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_AUTO_CALIB_CURRENT, val)
+                        self.root.after(0, lambda: self.log(
+                            f"开机自动零点校准: {'开启' if val else '关闭'}"
+                            f"({'每次开机校准, 不存Flash' if val else '手动校准, 存Flash'})"))
+                    finally:
+                        self.serial_lock.release()
+                else:
+                    self.root.after(0, lambda: messagebox.showwarning("警告", "串口忙"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("错误", f"设置自动校准失败: {str(e)}"))
+        threading.Thread(target=do_write, daemon=True).start()
 
     def calibrate_current_offset(self):
         """自动零点标定: 发送0xFFFF到REG_CUR_OFFSET触发固件自动标定
@@ -3403,6 +3723,12 @@ class ModbusDebuggerApp:
                     if self.monitor_options['step'].get():
                         step_data = self.modbus.read_holding_registers(
                             self.get_slave_addr(), self.REG_STEP_TARGET_POS_H3, 28)
+
+                    # 第7批: 系统时间 (仅sys_time勾选时读, 0x0125~0x0128共4个寄存器)
+                    sys_time_data = None
+                    if self.monitor_options['sys_time'].get():
+                        sys_time_data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_SYS_TIME_H3, 4)
                 finally:
                     self.serial_lock.release()
 
@@ -3495,6 +3821,13 @@ class ModbusDebuggerApp:
                     supply_voltage_raw = data[19]   # 供电电压(单位0.01V)
                     ext_adc1_raw = data[20]         # 外部ADC1(PC2, 0~4095)
                     ext_adc2_raw = data[21]         # 外部ADC2(PC3, 0~4095)
+
+                # 解析系统时间(64位无符号, 直接显示原始计数值, 单位0.1ms)
+                sys_time_str = ""
+                if sys_time_data is not None and len(sys_time_data) >= 4:
+                    sys_time_raw = (sys_time_data[0] << 48) | (sys_time_data[1] << 32) | \
+                                   (sys_time_data[2] << 16) | sys_time_data[3]
+                    sys_time_str = str(sys_time_raw)
 
                 # 派生状态值
                 start_flag = start_flag_data[0] != 0 if start_flag_data is not None else False
@@ -3623,6 +3956,10 @@ class ModbusDebuggerApp:
                     self.root.after(0, lambda ed=encoder_dir: self.status_labels['encoder_dir'].config(
                         text="反转" if ed else "正常"
                     ))
+
+                # 开机时间标签更新
+                if self.monitor_options['sys_time'].get() and sys_time_str:
+                    self.root.after(0, lambda s=sys_time_str: self.status_labels['sys_time'].config(text=s))
 
                 # === 频率控制 ===
                 # 支持下拉列表值(20ms/50ms/...)和手动输入(如150ms/0.5s/2s/300)
@@ -4770,6 +5107,28 @@ class ModbusDebuggerApp:
                         16: f"CH{ch_num}:电流环关-位置P", 17: f"CH{ch_num}:电流环关-位置I", 18: f"CH{ch_num}:电流环关-位置D",
                         19: f"CH{ch_num}:电流环关-速度P", 20: f"CH{ch_num}:电流环关-速度I", 21: f"CH{ch_num}:电流环关-速度D",
                         22: f"CH{ch_num}:位置误差", 23: f"CH{ch_num}:速度误差"}.get(val, str(val))
+
+            # === 0x00A0: 开机自动零点电流校准 ===
+            elif addr == 0x00A0:  # REG_AUTO_CALIB_CURRENT
+                return {0: "0=关闭(手动校准,存Flash)", 1: "1=开启(每次开机校准,不存Flash)"}.get(val, str(val))
+
+            # === 0x00A1~0x00A2: 电子齿轮倍频/分频 ===
+            elif addr == 0x00A1:  # REG_GEAR_NUMERATOR
+                return f"分子={val} (1~65535)"
+            elif addr == 0x00A2:  # REG_GEAR_DENOMINATOR
+                return f"分母={val} (1~65535)"
+
+            # === 0x00A3~0x00A7: 中断优先级配置 ===
+            elif addr == 0x00A3:  # REG_IRQ_PRIO_USART1
+                return f"USART1优先级={val} (0~15, 数值越小越高)"
+            elif addr == 0x00A4:  # REG_IRQ_PRIO_TIM1
+                return f"TIM1优先级={val} (0~15, 数值越小越高)"
+            elif addr == 0x00A5:  # REG_IRQ_PRIO_TIM2
+                return f"TIM2优先级={val} (0~15, 数值越小越高)"
+            elif addr == 0x00A6:  # REG_IRQ_PRIO_EXTI4
+                return f"EXTI4优先级={val} (0~15, 数值越小越高)"
+            elif addr == 0x00A7:  # REG_IRQ_PRIO_EXTI9_5
+                return f"EXTI9_5优先级={val} (0~15, 数值越小越高)"
 
             # === 0x0040~0x004F: 堵转/电流环/PC2PC3 ===
             elif addr == 0x0040:  # REG_STALL_PROT_EN - 堵转保护使能

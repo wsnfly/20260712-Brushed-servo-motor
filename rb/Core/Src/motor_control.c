@@ -164,6 +164,17 @@ typedef struct {
     uint32_t cur_kff;
     /* 位置环速度前馈系数(新增): 步进加减速模式消除积分windup抖动 */
     uint32_t pos_kff;
+    /* 开机自动零点电流校准(新增, 加在末尾不破坏已有Flash偏移) */
+    uint32_t auto_calib_current_on_boot;
+    /* 电子齿轮倍频/分频系数(新增, 加在末尾不破坏已有Flash偏移) */
+    uint32_t gear_num;     /* 电子齿轮分子(1~65535) */
+    uint32_t gear_den;     /* 电子齿轮分母(1~65535) */
+    /* 中断优先级配置(新增, 加在末尾不破坏已有Flash偏移) */
+    uint32_t irq_prio_usart1;
+    uint32_t irq_prio_tim1;
+    uint32_t irq_prio_tim2;
+    uint32_t irq_prio_exti4;
+    uint32_t irq_prio_exti9_5;
 } FlashConfig_t;
 
 typedef enum {
@@ -331,6 +342,20 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         /* 加载位置环速度前馈系数(新增): NaN检查, 无效时默认0(关闭) */
         f = u32_to_float(cfg->pos_kff);
         if (f == f && f >= 0.0f) mc->pos_Kff = f;
+        /* 加载开机自动零点电流校准(新增) */
+        mc->auto_calib_current_on_boot = (cfg->auto_calib_current_on_boot != 0) ? 1 : 0;
+        /* 加载电子齿轮倍频/分频系数(新增): 分母为0视为无效, 使用默认1:1 */
+        if (cfg->gear_den >= 1 && cfg->gear_den <= 65535 &&
+            cfg->gear_num >= 1 && cfg->gear_num <= 65535) {
+            mc->gear_num = (uint16_t)cfg->gear_num;
+            mc->gear_den = (uint16_t)cfg->gear_den;
+        }
+        /* 加载中断优先级配置(新增): 范围0~15, 超出保留默认值 */
+        if (cfg->irq_prio_usart1 <= 15) mc->irq_prio_usart1 = (uint8_t)cfg->irq_prio_usart1;
+        if (cfg->irq_prio_tim1 <= 15) mc->irq_prio_tim1 = (uint8_t)cfg->irq_prio_tim1;
+        if (cfg->irq_prio_tim2 <= 15) mc->irq_prio_tim2 = (uint8_t)cfg->irq_prio_tim2;
+        if (cfg->irq_prio_exti4 <= 15) mc->irq_prio_exti4 = (uint8_t)cfg->irq_prio_exti4;
+        if (cfg->irq_prio_exti9_5 <= 15) mc->irq_prio_exti9_5 = (uint8_t)cfg->irq_prio_exti9_5;
 
         if (cfg->target_pos_magic == FLASH_TARGET_MAGIC) {
             mc->pin4_target_pos = (int64_t)(((uint64_t)cfg->pin4_target_pos_h << 32) | cfg->pin4_target_pos_l);
@@ -513,6 +538,17 @@ void MotorControl_SaveConfig(MotorControl_t *mc)
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 296, float_to_u32(mc->cur_Kff));
     /* 保存位置环速度前馈系数(新增) */
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 300, float_to_u32(mc->pos_Kff));
+    /* 保存开机自动零点电流校准(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 304, (uint32_t)mc->auto_calib_current_on_boot);
+    /* 保存电子齿轮倍频/分频系数(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 308, (uint32_t)mc->gear_num);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 312, (uint32_t)mc->gear_den);
+    /* 保存中断优先级配置(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 316, (uint32_t)mc->irq_prio_usart1);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 320, (uint32_t)mc->irq_prio_tim1);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 324, (uint32_t)mc->irq_prio_tim2);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 328, (uint32_t)mc->irq_prio_exti4);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 332, (uint32_t)mc->irq_prio_exti9_5);
 
     HAL_FLASH_Lock();
 }
@@ -734,6 +770,19 @@ void MotorControl_Init(MotorControl_t *mc,
     mc->cur_Kff = 0.0f;  /* 默认关闭前馈, 用户通过Modbus(0x009B)设置, 建议150~250(=0.015~0.025) */
     mc->pos_Kff = 0.0f;  /* 默认关闭位置环速度前馈, 用户通过Modbus(0x009C)设置 */
     mc->prev_target_position = 0;
+    mc->auto_calib_current_on_boot = 0;  /* 默认关闭开机自动校准, 手动校准后保存Flash */
+    /* 电子齿轮默认1:1(直通), 不倍频不分频 */
+    mc->gear_num = 1;       /* 分子=1 */
+    mc->gear_den = 1;       /* 分母=1 */
+    mc->gear_frac = 0;      /* 小数累加器清零 */
+    /* 中断优先级默认值(与原硬编码值一致, LoadConfig后从Flash覆盖)
+     * USART1=1(通信最高, 避免ORE丢包), TIM1=2(PID 100μs),
+     * TIM2=3(步进加减速最低), EXTI4/9_5=1(脉冲输入, 与TIM1同级不互抢) */
+    mc->irq_prio_usart1 = 1;
+    mc->irq_prio_tim1 = 2;
+    mc->irq_prio_tim2 = 3;
+    mc->irq_prio_exti4 = 1;
+    mc->irq_prio_exti9_5 = 1;
     mc->current_offset = 2048;
     mc->current_scale = 1000.0f / 2048.0f;
     mc->current_loop_en = 0;
@@ -2262,6 +2311,21 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
         int32_t pulses = pulse_accumulator;
         pulse_accumulator = 0;
         __enable_irq();
+
+        /* 电子齿轮(倍频/分频): 实际移动量 = 输入脉冲 × (gear_num / gear_den)
+         * 使用小数累加器消除整数除法截断误差:
+         *   gear_frac += pulses * gear_num
+         *   actual = gear_frac / gear_den
+         *   gear_frac -= actual * gear_den
+         * 例如 1/2分频: 第1个脉冲gear_frac=1, actual=0; 第2个gear_frac=2, actual=1
+         * 例如 3/2倍频: 第1个脉冲gear_frac=3, actual=1, 余1; 第2个gear_frac=4, actual=2, 余0 */
+        if (mc->gear_num != 1 || mc->gear_den != 1) {
+            mc->gear_frac += (int64_t)pulses * (int32_t)mc->gear_num;
+            int32_t actual = (int32_t)(mc->gear_frac / (int32_t)mc->gear_den);
+            mc->gear_frac -= actual * (int32_t)mc->gear_den;
+            pulses = actual;
+        }
+
         if (mc->step_accel_en && MotorControl_IsPositionBasedMode(mc->mode) && !MotorControl_IsHoming()) {
             /* 步进加减速: 脉冲累加到yudingweizhi, 算法生成平滑轨迹 */
             __disable_irq();

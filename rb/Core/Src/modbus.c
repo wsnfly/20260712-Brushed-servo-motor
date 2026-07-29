@@ -80,6 +80,12 @@ HAL_StatusTypeDef MODBUS_ApplyBaudRate(MB_Context_t *ctx, uint32_t baud_rate)
         return HAL_ERROR;
     }
 
+    /* 中止可能正在进行的发送, 复位DE和tx_busy(波特率切换会DeInit UART) */
+    if (ctx->tx_busy) {
+        HAL_UART_AbortTransmit_IT(&huart1);
+        ctx->tx_busy = 0;
+        HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_RESET);
+    }
     HAL_UART_AbortReceive(&huart1);
     HAL_UART_DeInit(&huart1);
     huart1.Init.BaudRate = baud_rate;
@@ -157,6 +163,7 @@ void MODBUS_Init(MB_Context_t *ctx, uint8_t slave_addr, MotorControl_t *motor)
     ctx->motor = motor;
     ctx->rx_count = 0;
     ctx->error_count = 0;
+    ctx->tx_busy = 0;
     start_flag_set = 0;
     pending_control_word = motor->mode & CTRL_MODE_MASK;
     pending_target_pos = 0;
@@ -229,26 +236,39 @@ void MODBUS_OnTimeoutTick(MB_Context_t *ctx)
 }
 
 /**
-  * @brief  发送响应
+  * @brief  发送响应（中断发送 + 硬件TC回调控制DE）
+  * @note   改为非阻塞中断发送:
+  *         1. 数据拷贝到ctx->tx_buf(静态缓冲区, 解决局部数组生命周期问题)
+  *         2. DE=1拉高, 清TC标志, HAL_UART_Transmit_IT启动中断发送(立即返回)
+  *         3. 发送完成由硬件TC中断触发 HAL_UART_TxCpltCallback, 在回调中DE=0
+  *         4. tx_busy标志防止上一帧未发完时重入(丢弃新帧, MODBUS从机不会主动发送)
+  *         优势: CPU不阻塞等待发送完成, DE拉低时机由硬件TC精确控制
   */
 void MODBUS_SendResponse(MB_Context_t *ctx, uint8_t *data, uint8_t len)
 {
-    /* 添加CRC */
-    uint16_t crc = MODBUS_CalcCRC(data, len);
-    data[len++] = crc & 0xFF;        /* CRC低字节 */
-    data[len++] = (crc >> 8) & 0xFF; /* CRC高字节 */
+    /* 上一次发送未完成: 丢弃本次(从机不会主动发送, 仅在响应时重入) */
+    if (ctx->tx_busy) {
+        return;
+    }
 
-    /* RS485方向控制: DE=1发送, 发送完成后立即回到接收 */
+    /* 拷贝到静态发送缓冲区(添加CRC), 解决调用方局部数组生命周期问题 */
+    if (len + 2 > MB_TX_BUF_SIZE) {
+        return;  /* 缓冲区不足, 保护 */
+    }
+    memcpy(ctx->tx_buf, data, len);
+    uint16_t crc = MODBUS_CalcCRC(ctx->tx_buf, len);
+    ctx->tx_buf[len++] = crc & 0xFF;        /* CRC低字节 */
+    ctx->tx_buf[len++] = (crc >> 8) & 0xFF; /* CRC高字节 */
+
+    /* 启动中断发送: DE拉高 → 清TC → Transmit_IT(非阻塞) → 回调中DE拉低 */
+    ctx->tx_busy = 1;
     HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_SET);
     __HAL_UART_CLEAR_FLAG(&huart1, UART_FLAG_TC);
-    HAL_StatusTypeDef status = HAL_UART_Transmit(&huart1, data, len, 100);
-    uint32_t start_tick = HAL_GetTick();
-    while (status == HAL_OK && __HAL_UART_GET_FLAG(&huart1, UART_FLAG_TC) == RESET) {
-        if (HAL_GetTick() - start_tick > 10U) {
-            break;
-        }
+    if (HAL_UART_Transmit_IT(&huart1, ctx->tx_buf, len) != HAL_OK) {
+        /* 启动失败: 立即恢复DE和标志, 避免卡死 */
+        ctx->tx_busy = 0;
+        HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_RESET);
     }
-    HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_RESET);
 }
 
 /**
@@ -271,8 +291,8 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
 {
     MotorControl_t *mc = ctx->motor;
     
-    /* 状态寄存器（只读） */
-    if (addr >= 0x0100 && addr <= 0x0124) {
+    /* 状态寄存器（只读） 0x0100~0x0128 (含系统时间) */
+    if (addr >= 0x0100 && addr <= REG_SYS_TIME_L1) {
         switch (addr) {
             case REG_CURRENT_POS_H3:
                 return (uint16_t)(Encoder_GetCount() >> 48);
@@ -376,6 +396,22 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
                 return (uint16_t)(int16_t)(mc->current_target * 10.0f);
             case REG_CURRENT_ACTUAL_DISP:
                 return (uint16_t)(int16_t)(mc->current_actual * 10.0f);
+
+            /* 系统时间(只读, 64位, 单位0.1ms)
+             * 原子读取sys_time_100us后按大端序拆分到4个寄存器 */
+            case REG_SYS_TIME_H3:
+            case REG_SYS_TIME_H2:
+            case REG_SYS_TIME_L2:
+            case REG_SYS_TIME_L1: {
+                int64_t t = SYS_GetTime100us();
+                switch (addr) {
+                    case REG_SYS_TIME_H3: return (uint16_t)((uint64_t)t >> 48);
+                    case REG_SYS_TIME_H2: return (uint16_t)((uint64_t)t >> 32);
+                    case REG_SYS_TIME_L2: return (uint16_t)((uint64_t)t >> 16);
+                    case REG_SYS_TIME_L1: return (uint16_t)((uint64_t)t & 0xFFFF);
+                    default: return 0;
+                }
+            }
         }
     }
 
@@ -417,6 +453,36 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
             case REG_SPEED_ACQ_TYPE4:
                 return mc->speed_acq_type4;
         }
+    }
+
+    /* 开机自动零点电流校准寄存器 0x00A0 (新增) */
+    if (addr == REG_AUTO_CALIB_CURRENT) {
+        return mc->auto_calib_current_on_boot;
+    }
+
+    /* 电子齿轮倍频/分频寄存器 0x00A1~0x00A2 (新增) */
+    if (addr == REG_GEAR_NUMERATOR) {
+        return mc->gear_num;
+    }
+    if (addr == REG_GEAR_DENOMINATOR) {
+        return mc->gear_den;
+    }
+
+    /* 中断优先级配置寄存器 0x00A3~0x00A7 (新增) */
+    if (addr == REG_IRQ_PRIO_USART1) {
+        return mc->irq_prio_usart1;
+    }
+    if (addr == REG_IRQ_PRIO_TIM1) {
+        return mc->irq_prio_tim1;
+    }
+    if (addr == REG_IRQ_PRIO_TIM2) {
+        return mc->irq_prio_tim2;
+    }
+    if (addr == REG_IRQ_PRIO_EXTI4) {
+        return mc->irq_prio_exti4;
+    }
+    if (addr == REG_IRQ_PRIO_EXTI9_5) {
+        return mc->irq_prio_exti9_5;
     }
 
     /* 堵转保护寄存器 0x0040~0x0044 */
@@ -795,8 +861,8 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
     MotorControl_t *mc = ctx->motor;
     uint8_t need_apply = 0;  /* 标记是否需要立即应用目标值 */
     
-    /* 只读寄存器 */
-    if (addr >= 0x0100 && addr <= 0x0115) {
+    /* 只读寄存器 0x0100~0x0128 (状态寄存器, 含系统时间) */
+    if (addr >= 0x0100 && addr <= REG_SYS_TIME_L1) {
         return;
     }
     /* 转速数据寄存器只读 0x0200~0x03FF */
@@ -1498,6 +1564,52 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
         }
     }
 
+    /* 开机自动零点电流校准寄存器写入 0x00A0 (新增)
+     * 0=关闭: 使用Flash保存的offset, 手动校准(写0x004D=0xFFFF)后存Flash
+     * 1=开启: 每次开机自动校准零点电流, 结果不存Flash(避免频繁烧写)
+     * 设置本身需要保存到Flash, 使下次开机按此配置执行 */
+    if (addr == REG_AUTO_CALIB_CURRENT) {
+        mc->auto_calib_current_on_boot = (value != 0) ? 1 : 0;
+        config_dirty = 1;
+    }
+
+    /* 电子齿轮倍频/分频寄存器写入 0x00A1~0x00A2 (新增)
+     * 分子/分母均为1~65535, 分母不允许为0
+     * 修改齿轮比时清零小数累加器, 避免旧余数影响新比例 */
+    if (addr == REG_GEAR_NUMERATOR) {
+        if (value >= 1) {
+            mc->gear_num = value;
+            mc->gear_frac = 0;  /* 清零余数累加器 */
+            config_dirty = 1;
+        }
+    }
+    if (addr == REG_GEAR_DENOMINATOR) {
+        if (value >= 1) {
+            mc->gear_den = value;
+            mc->gear_frac = 0;  /* 清零余数累加器 */
+            config_dirty = 1;
+        }
+    }
+
+    /* 中断优先级寄存器写入 0x00A3~0x00A7 (新增)
+     * 范围0~15, 修改后立即生效并保存Flash
+     * HAL_NVIC_SetPriority可在任何上下文调用(仅写NVIC寄存器, 线程安全) */
+    if (addr == REG_IRQ_PRIO_USART1) {
+        if (value <= 15) { mc->irq_prio_usart1 = (uint8_t)value; HAL_NVIC_SetPriority(USART1_IRQn, value, 0); config_dirty = 1; }
+    }
+    if (addr == REG_IRQ_PRIO_TIM1) {
+        if (value <= 15) { mc->irq_prio_tim1 = (uint8_t)value; HAL_NVIC_SetPriority(TIM1_UP_IRQn, value, 0); config_dirty = 1; }
+    }
+    if (addr == REG_IRQ_PRIO_TIM2) {
+        if (value <= 15) { mc->irq_prio_tim2 = (uint8_t)value; HAL_NVIC_SetPriority(TIM2_IRQn, value, 0); config_dirty = 1; }
+    }
+    if (addr == REG_IRQ_PRIO_EXTI4) {
+        if (value <= 15) { mc->irq_prio_exti4 = (uint8_t)value; HAL_NVIC_SetPriority(EXTI4_IRQn, value, 0); config_dirty = 1; }
+    }
+    if (addr == REG_IRQ_PRIO_EXTI9_5) {
+        if (value <= 15) { mc->irq_prio_exti9_5 = (uint8_t)value; HAL_NVIC_SetPriority(EXTI9_5_IRQn, value, 0); config_dirty = 1; }
+    }
+
     /* 如果需要立即应用目标值 */
     if (need_apply) {
         MODBUS_ApplyTarget(ctx);
@@ -1514,12 +1626,15 @@ static void MODBUS_ProcessReadHoldingRegs(MB_Context_t *ctx, uint16_t start_addr
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
     }
-    /* 检查地址范围：控制寄存器 0x0000~0x0090, 状态寄存器 0x0100~0x0124, 数据寄存器 0x0200~0x15FF
-     * 注: 0x006A=REG_ADC_FILTER_SIZE(外部ADC滤波), 0x006B~0x0090=步进加减速参数, 必须包含在可读范围内
-     * 状态区扩展至0x0124: 包含三环PID调试寄存器(0x0116~0x0121)和级联目标速度(0x0122~0x0124) */
+    /* 检查地址范围：控制寄存器 0x0000~0x00A7, 状态寄存器 0x0100~0x0128, 数据寄存器 0x0200~0x15FF
+     * 注: 0x006A=REG_ADC_FILTER_SIZE(外部ADC滤波), 0x006B~0x0090=步进加减速参数,
+     *     0x009B=电流环前馈, 0x009C~0x009F=多通道采集, 0x00A0=开机自动校准,
+     *     0x00A1~0x00A2=电子齿轮倍频/分频, 0x00A3~0x00A7=中断优先级配置
+     * 状态区扩展至0x0128: 三环PID调试寄存器(0x0116~0x0121), 级联目标速度(0x0122~0x0124),
+     *                     系统时间(0x0125~0x0128, 单位0.1ms) */
     uint16_t end_addr = start_addr + quantity - 1;
     if (!((start_addr <= REG_STEP_END && end_addr <= REG_STEP_END) ||
-          (start_addr >= 0x0100 && end_addr <= 0x0124) ||
+          (start_addr >= 0x0100 && end_addr <= REG_SYS_TIME_L1) ||
           (start_addr >= REG_SPEED_DATA_BASE && end_addr <= REG_SPEED_DATA_END))) {
         MODBUS_SendException(ctx, MB_FUNC_READ_HOLDING_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;
@@ -1549,8 +1664,10 @@ static void MODBUS_ProcessWriteSingleReg(MB_Context_t *ctx, uint16_t addr, uint1
 {
     uint8_t old_slave_addr = ctx->slave_addr;
 
-    /* 检查地址范围 (控制寄存器 0x0000~0x0090 可写, 状态/数据寄存器只读)
+    /* 检查地址范围 (控制寄存器 0x0000~0x00A7 可写, 状态/数据寄存器只读)
      * 注: 0x006A=REG_ADC_FILTER_SIZE(外部ADC滤波), 0x006B~0x0090=步进加减速参数,
+     *     0x009B=电流环前馈, 0x009C~0x009F=多通道采集, 0x00A0=开机自动校准,
+     *     0x00A1~0x00A2=电子齿轮倍频/分频, 0x00A3~0x00A7=中断优先级配置
      *     其中0x0077~0x0090为只读运行状态, 写入会被忽略 */
     if (addr > REG_STEP_END) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_SINGLE_REG, MB_EX_ILLEGAL_DATA_ADDRESS);
@@ -1580,7 +1697,7 @@ static void MODBUS_ProcessWriteMultipleRegs(MB_Context_t *ctx, uint16_t start_ad
     MotorControl_t *mc = ctx->motor;
     uint8_t old_slave_addr = ctx->slave_addr;
     pending_baud_rate = 0;
-    /* 检查地址范围 (控制寄存器 0x0000~0x0090 可写) */
+    /* 检查地址范围 (控制寄存器 0x0000~0x00A7 可写) */
     if (quantity > 125 || start_addr + quantity > REG_STEP_END + 1) {
         MODBUS_SendException(ctx, MB_FUNC_WRITE_MULTIPLE_REGS, MB_EX_ILLEGAL_DATA_ADDRESS);
         return;

@@ -303,6 +303,33 @@ typedef struct {
      * 效果: 积分不再需要windup, 消除周期性抖动 */
     int64_t prev_target_position; /* 上次目标位置(用于计算目标速度) */
     float   pos_Kff;              /* 位置环速度前馈系数(脉冲/秒→输出, 0=关闭) */
+
+    /* ========== 开机自动零点电流校准(新增) ==========
+     * 0=关闭(默认): 使用Flash中保存的offset, 手动校准后保存到Flash
+     * 1=开启: 每次开机自动校准零点电流, 结果仅用于本次运行不保存Flash
+     *         避免频繁烧写Flash, 适合零点会随温度漂移的场景 */
+    uint8_t auto_calib_current_on_boot;
+
+    /* ========== 电子齿轮(脉冲倍频/分频, 新增) ==========
+     * 外部脉冲输入后, 实际移动量 = 输入脉冲 × (gear_num / gear_den)
+     * 倍频: gear_num > gear_den, 例如 2/1 = 每个输入脉冲移动2步
+     * 分频: gear_num < gear_den, 例如 1/2 = 每2个输入脉冲移动1步
+     * 适用场景: 脉冲输入检测频率受限(如3KHz), 通过倍频提高等效速度,
+     *           或通过分频配合高频脉冲源实现精细分辨率
+     * gear_frac为小数累加器(运行时), 不保存Flash */
+    uint16_t gear_num;     /* 电子齿轮分子(倍频系数), 1~65535, 默认1 */
+    uint16_t gear_den;     /* 电子齿轮分母(分频系数), 1~65535, 默认1 */
+    int32_t  gear_frac;    /* 小数累加器: 存储gear_num/gear_den的余数部分 */
+
+    /* ========== 中断优先级配置(新增) ==========
+     * STM32F103有4位抢占优先级(0~15), 数值越小优先级越高
+     * 通过上位机可在线调整各中断的抢占优先级, 保存到Flash
+     * 默认: USART1=1(通信最高), TIM1=2(PID), TIM2=3(加减速), EXTI4/9_5=1(脉冲输入) */
+    uint8_t irq_prio_usart1;   /* USART1中断优先级(0~15, 默认1) */
+    uint8_t irq_prio_tim1;     /* TIM1中断优先级(0~15, 默认2) */
+    uint8_t irq_prio_tim2;     /* TIM2中断优先级(0~15, 默认3) */
+    uint8_t irq_prio_exti4;    /* EXTI4中断优先级(0~15, 默认1) */
+    uint8_t irq_prio_exti9_5;  /* EXTI9_5中断优先级(0~15, 默认1) */
 } MotorControl_t;
 
 void MotorControl_Init(MotorControl_t *mc,

@@ -131,6 +131,19 @@ int main(void)
   /* 启动电机控制 */
   Motor_Start();
 
+  /* ========== 开机自动零点电流校准(新增) ==========
+   * 若Flash中使能了auto_calib_current_on_boot(上位机0x00A0=1):
+   *   每次开机自动读取ADC零电流offset, 结果仅用于本次运行, 不保存Flash
+   *   避免频繁烧写Flash, 适合零点会随温度漂移的场景
+   * 若关闭(0x00A0=0, 默认): 使用Flash中保存的offset, 用户手动校准(写0x004D=0xFFFF)后存Flash
+   * 此时Motor_Start已启动ADC DMA, 且TIM1 PID中断尚未启动, 电机无电流, 是校准最佳时机 */
+  if (motor.auto_calib_current_on_boot) {
+    /* 等待ADC DMA缓冲区填满(连续转换模式, 10ms足够100个样本刷新多轮) */
+    HAL_Delay(10);
+    MotorControl_AutoCalibrateCurrentOffset(&motor);
+    /* 不调用SaveConfig: 避免每次开机烧写Flash */
+  }
+
   /* 加速表开机加载(新增): 检查Flash中是否有自定义加速表, 有则切换指针 */
   AccTable_LoadOnBoot();
   /* 同步加速表参数到MODBUS缓存: 使上位机读取0x0092~0x0097时能读到Flash中的实际参数,
@@ -155,19 +168,19 @@ int main(void)
    * 注: TIM2已释放可作其他用途, 由EXTI4/EXTI9_5中断直接处理脉冲边沿 */
   MotorControl_UpdateIrqPriority();
 
-  /* 中断优先级配置(CubeMX重新生成后需重新设置, 否则会被MspInit的默认值覆盖)
+  /* 中断优先级配置: 使用Flash中保存的值(可通过上位机MODBUS寄存器0x00A3~0x00A7在线调整)
+   * 默认值(与原硬编码一致): USART1=1, TIM1=2, TIM2=3, EXTI4=1, EXTI9_5=1
    * 优先级原则(数值小=优先级高):
-   *   USART1=0 (最高) - 串口字节到达必须立即处理, 避免ORE溢出丢包
-   *   TIM1_UP=1       - 100μs周期PID, 被USART1短时抢占(<5μs)不影响控制
-   *   EXTI4/EXTI9_5=1 - 脉冲输入, 与TIM1同级不互相抢占, 靠硬件PR锁存保证不丢边沿
-   *                    不能设为0(高于TIM1), 否则高频脉冲会频繁打断PID导致周期抖动
-   * 注: MX_GPIO_Init设EXTI=0(最高), 此处覆盖为1(与TIM1同级), 防止脉冲中断抢占PID
-   * 注: stm32f1xx_hal_msp.c中HAL MSP init设TIM1=2/USART1=3, 此处覆盖为正确值 */
-  HAL_NVIC_SetPriority(USART1_IRQn, 1, 0);
-  HAL_NVIC_SetPriority(TIM1_UP_IRQn, 2, 0);
-  HAL_NVIC_SetPriority(TIM2_IRQn, 3, 0);   /* TIM2步进加减速: 最低优先级, 不抢PID和通信 */
-  HAL_NVIC_SetPriority(EXTI4_IRQn, 1, 0);
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 1, 0);
+   *   USART1 - 串口字节到达必须立即处理, 避免ORE溢出丢包
+   *   TIM1_UP - 100μs周期PID
+   *   EXTI4/EXTI9_5 - 脉冲输入, 靠硬件PR锁存保证不丢边沿
+   * 注: MX_GPIO_Init设EXTI=0(最高), stm32f1xx_hal_msp.c设TIM1=2/USART1=3,
+   *     此处用Flash配置值覆盖MspInit的默认值 */
+  HAL_NVIC_SetPriority(USART1_IRQn, motor.irq_prio_usart1, 0);
+  HAL_NVIC_SetPriority(TIM1_UP_IRQn, motor.irq_prio_tim1, 0);
+  HAL_NVIC_SetPriority(TIM2_IRQn, motor.irq_prio_tim2, 0);
+  HAL_NVIC_SetPriority(EXTI4_IRQn, motor.irq_prio_exti4, 0);
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, motor.irq_prio_exti9_5, 0);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -206,13 +219,13 @@ int main(void)
 	  /* 每5秒在位置0和10000之间来回切换 */
 	  static int64_t last_2s = 0;
 	  static int64_t weizhi = 0;
-//	  if (now - last_2s >= 5000) {
-//		  last_2s = now;
-//		  if(weizhi == 10000) weizhi = 0;
-//		  else weizhi = 10000;
-//		  MotorControl_SetTarget(&motor, weizhi);
-//		  MODBUS_SyncTargetPosition(weizhi);
-//	  }
+	  if (now - last_2s >= 1000) {
+		  last_2s = now;
+		  if(weizhi == 1000) weizhi = 0;
+		  else weizhi = 1000;
+		  MotorControl_SetTarget(&motor, weizhi);
+		  MODBUS_SyncTargetPosition(weizhi);
+	  }
 
 
 
@@ -695,7 +708,30 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
-  * @brief  UART接收完成回调（每收到1字节触发�?????
+  * @brief  UART发送完成回调（硬件TC标志触发）
+  *         中断发送模式下, 最后一个字节停止位移出后硬件置TC,
+  *         HAL_UART_IRQHandler调用本回调. 在此精确控制RS485 DE拉低.
+  * @note   相比原轮询TC方案, 此方案DE拉低时机由硬件精确触发, 无CPU轮询延迟.
+  *         回调在中断上下文执行, 延迟仅~1-2μs.
+  */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1) {
+        /* RS485方向切换: 发送完成, DE=0回到接收模式 */
+        HAL_GPIO_WritePin(DE_GPIO_Port, DE_Pin, GPIO_PIN_RESET);
+        mb_ctx.tx_busy = 0;
+
+        /* 发送期间若接收被关闭(gState=BUSY_TX导致HAL_UART_Receive_IT失败),
+         * 现在发送完成gState已回READY, 确保接收已重启.
+         * 若接收已在运行(RxState=BUSY_RX), 跳过避免重复启动. */
+        if (huart->RxState != HAL_UART_STATE_BUSY_RX) {
+            HAL_UART_Receive_IT(&huart1, &mb_ctx.rx_byte, 1);
+        }
+    }
+}
+
+/**
+  * @brief  UART接收完成回调（每收到1字节触发）
   *         将字节存入MODBUS接收缓冲区，并重新启动下�?????字节接收
   */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
