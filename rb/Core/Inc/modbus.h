@@ -256,7 +256,7 @@
 #define REG_ACC_TABLE_STATUS          0x0099  /* 状态(只读) */
 #define REG_ACC_TABLE_PROGRESS        0x009A  /* 进度(只读, 0~1000) */
 #define REG_STEP_BASE                 REG_STEP_MAX_SPEED_H3  /* 加减速寄存器区起始地址 */
-#define REG_STEP_END                  0x00A7  /* 寄存器区结束地址(含前馈0x009B + 多通道0x009C~0x009F + 自动校准0x00A0 + 电子齿轮0x00A1~0x00A2 + 中断优先级0x00A3~0x00A7) */
+#define REG_STEP_END                  0x00A9  /* 寄存器区结束地址(含前馈0x009B + 多通道0x009C~0x009F + 自动校准0x00A0 + 电子齿轮0x00A1~0x00A2 + 中断优先级0x00A3~0x00A7 + 双向复位居中容差/超时0x00A8~0x00A9) */
 
 /* 电流环前馈系数(新增) 0x009B
  * 速度前馈(反电动势补偿): PWM += Kff * velocity
@@ -297,7 +297,15 @@
 #define REG_IRQ_PRIO_EXTI4            0x00A6  /* EXTI4中断优先级(0~15, 默认1) */
 #define REG_IRQ_PRIO_EXTI9_5          0x00A7  /* EXTI9_5中断优先级(0~15, 默认1) */
 
-#define REG_CALIB_CURRENT_END         0x00A7  /* 寄存器区结束地址(含中断优先级) */
+/* 双向复位居中容差/超时寄存器(新增) 0x00A8~0x00A9
+ * 解决堵转双向复位后"差步导致原点偏移/复位无法结束"问题:
+ *   - REG_HOME_CENTER_TOLERANCE: 到位误差容差(脉冲), 默认2. 误差在此范围内即判定复位成功.
+ *   - REG_HOME_CENTER_TIMEOUT: 到位超时(单位=5ms tick, 0=不启用). 超过该时间仍未到位,
+ *     强制视为复位成功, 原点直接采用计算出的中点+偏置位置, 避免一直差步卡死. */
+#define REG_HOME_CENTER_TOLERANCE     0x00A8  /* 双向复位居中到位误差容差(脉冲, 默认10) */
+#define REG_HOME_CENTER_TIMEOUT       0x00A9  /* 双向复位居中到位超时(5ms tick, 默认200=1秒, 0=不启用) */
+
+#define REG_CALIB_CURRENT_END         0x00A9  /* 寄存器区结束地址(含双向复位居中容差/超时) */
 
 /* 数据寄存器 (只读) - 采集缓冲区 0x0200~0x15FF (5120个int16_t, 10KB) */
 #define REG_SPEED_DATA_BASE          0x0200  /* 采集数据起始地址 */

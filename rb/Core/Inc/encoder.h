@@ -39,6 +39,10 @@ float Encoder_GetSpeed(void);
 /* 编码器清零(CNT/prev/total 原子清零, 关全局中断) */
 void Encoder_Reset(void);
 
+/* 设置编码器绝对计数(含方向取反, 关全局中断原子写入).
+ * 用于复位完成后将原点设定为计算出的位置, 而非实际停留位置. */
+void Encoder_SetCount(int64_t count);
+
 /* TIM3溢出中断已弃用, 保留空函数避免链接错误 */
 void Encoder_OverflowHandler(void);
 

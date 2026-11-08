@@ -175,6 +175,9 @@ typedef struct {
     uint32_t irq_prio_tim2;
     uint32_t irq_prio_exti4;
     uint32_t irq_prio_exti9_5;
+    /* 双向复位居中容差/超时(新增, 加在末尾不破坏已有Flash偏移) */
+    uint32_t home_center_tolerance;
+    uint32_t home_center_timeout;
 } FlashConfig_t;
 
 typedef enum {
@@ -356,6 +359,13 @@ void MotorControl_LoadConfig(MotorControl_t *mc)
         if (cfg->irq_prio_tim2 <= 15) mc->irq_prio_tim2 = (uint8_t)cfg->irq_prio_tim2;
         if (cfg->irq_prio_exti4 <= 15) mc->irq_prio_exti4 = (uint8_t)cfg->irq_prio_exti4;
         if (cfg->irq_prio_exti9_5 <= 15) mc->irq_prio_exti9_5 = (uint8_t)cfg->irq_prio_exti9_5;
+        /* 加载双向复位居中容差/超时(新增): 容差1~1000脉冲, 超时0=不启用 */
+        if (cfg->home_center_tolerance >= 1 && cfg->home_center_tolerance <= 1000) {
+            mc->home_center_tolerance = (int32_t)cfg->home_center_tolerance;
+        }
+        if (cfg->home_center_timeout <= 1000000) {
+            mc->home_center_timeout = cfg->home_center_timeout;
+        }
 
         if (cfg->target_pos_magic == FLASH_TARGET_MAGIC) {
             mc->pin4_target_pos = (int64_t)(((uint64_t)cfg->pin4_target_pos_h << 32) | cfg->pin4_target_pos_l);
@@ -549,6 +559,9 @@ void MotorControl_SaveConfig(MotorControl_t *mc)
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 324, (uint32_t)mc->irq_prio_tim2);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 328, (uint32_t)mc->irq_prio_exti4);
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 332, (uint32_t)mc->irq_prio_exti9_5);
+    /* 保存双向复位居中容差/超时(新增) */
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 336, (uint32_t)mc->home_center_tolerance);
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, addr + 340, (uint32_t)mc->home_center_timeout);
 
     HAL_FLASH_Lock();
 }
@@ -556,6 +569,9 @@ void MotorControl_SaveConfig(MotorControl_t *mc)
 static uint8_t motor_running = 0;
 static float current_velocity = 0.0f;
 static float ramped_target_speed = 0.0f;
+/* 双向复位完成后原点偏移(逻辑计数): 非0时FinishHoming用Encoder_SetCount设置原点,
+ * 使原点对应计算出的target位置而非实际停留位置; 0=当前位置清零(原行为) */
+static int64_t homing_origin_offset = 0;
 
 /* ========== 64位编码器累计计数已拆分至 encoder 模块(encoder.c) ==========
  * 原理: TIM1 100μs中断里对TIM3->CNT做int16_t差分累加, 合成64位无歧义位置.
@@ -724,6 +740,8 @@ void MotorControl_Init(MotorControl_t *mc,
     mc->home_auto_start = 1;
     mc->home_precision_speed = 100;
     mc->home_precision_cycles = 3;
+    mc->home_center_tolerance = 10;    /* 双向复位居中到位误差容差(脉冲), 默认10 */
+    mc->home_center_timeout = 200;     /* 双向复位居中到位超时(5ms tick), 默认200=1秒 */
     mc->pin4_func = PIN_FUNC_PULSE;
     mc->pin4_polarity = POLARITY_ACTIVE_HIGH;
     mc->pin4_limit_dir = 0;
@@ -883,17 +901,34 @@ static void MotorControl_ClearMotionState(MotorControl_t *mc)
 
 static void MotorControl_FinishHoming(MotorControl_t *mc, uint8_t failed)
 {
+    int64_t origin = 0;
     homing_failed = failed;
     homing_state = HOMING_IDLE;
-    Encoder_Reset();
-    MotorControl_ClearMotionState(mc);
+    if (failed) {
+        Encoder_Reset();
+        MotorControl_ClearMotionState(mc);
+    } else if (homing_origin_offset != 0) {
+        /* 双向复位: 原点设为计算出的target位置(offset = 当前位置 - target),
+         * 使target处对应0, 即使电机未精确停在target(差步)也以计算值为原点.
+         * 同步目标/上次位置到offset, 保证PID误差为0, 电机保持不动. */
+        origin = homing_origin_offset;
+        homing_origin_offset = 0;
+        Encoder_SetCount(origin);
+        MotorControl_ClearMotionState(mc);
+        mc->prev_position = origin;
+        mc->target_position = origin;
+        mc->prev_target_position = origin;
+    } else {
+        Encoder_Reset();
+        MotorControl_ClearMotionState(mc);
+    }
     mc->speed_loop_active = 0;
     mc->current_target = 0.0f;
     mc->mode = mode_before_homing;
-    /* 步进加减速: 复位完成后编码器已清零, 同步算法位置到0,
-     * 防止yudingweizhi残留导致复位后电机突然转动 */
+    /* 步进加减速: 复位完成后同步算法位置到原点(双向复位为计算出的target,
+     * 其余为0), 防止yudingweizhi残留导致复位后电机突然转动 */
     if (mc->step_accel_en) {
-        StepAccel_SyncPosition(0);
+        StepAccel_SyncPosition(origin);
     }
     MotorControl_SetOutput(mc, 0);
 }
@@ -966,6 +1001,7 @@ void MotorControl_StartHoming(MotorControl_t *mc)
         homing_stall_ticks = 0;
         homing_start_position = Encoder_GetCount();
         mode_before_homing = mc->mode;
+        homing_origin_offset = 0;
         bidir_neg_position = 0;
         bidir_pos_position = 0;
 
@@ -2060,6 +2096,10 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
             int64_t center = (bidir_neg_position + bidir_pos_position) / 2;
             int64_t target = center + (int64_t)mc->home_back_distance;
             homing_state = HOMING_BIDIR_CENTER;
+            homing_ticks = 0;   /* 关键: 重置居中超时计时起点, 否则正/负方向搜索阶段累计的
+                                 * homing_ticks(常>200)会让回中阶段超时立刻触发,
+                                 * 复位瞬间判定成功, 电机根本走不回中点. */
+            homing_stall_ticks = 0;
             mc->mode = POSITION_MODE;
             mc->target_position = target;
             mc->current_target = 0.0f;
@@ -2080,9 +2120,35 @@ int16_t MotorControl_Update(MotorControl_t *mc, int64_t current_position)
 
     if (homing_state == HOMING_BIDIR_CENTER) {
         int64_t err = mc->target_position - current_position;
-        if (abs64(err) <= 2) {
-            MotorControl_FinishHoming(mc, 0);  /* 到位, 清零编码器设原点 */
+        int32_t tol = (mc->home_center_tolerance > 0) ? mc->home_center_tolerance : 2;
+        /* 到位判定1: 满足误差容差 → 立即成功.
+         * 堵转复位后编码器存在累计误差(差步), 可能无法精确停在目标位置,
+         * 容差范围内即判定到位, 原点直接采用计算出的 target 位置(center+偏置). */
+        if (abs64(err) <= tol) {
+            homing_origin_offset = current_position - mc->target_position;
+            MotorControl_FinishHoming(mc, 0);
             return 0;
+        }
+        /* 到位判定2: 超时兜底. 仅在电机已"收敛"(速度近0, 即差步卡住无法精确到位)时计时,
+         * 若仍在物理回中途中(速度较大)则清零不计时, 避免复位在电机走回中点前就判定成功,
+         * 从而保证"两端到头后电机一定回到中点附近". */
+        if (mc->home_center_timeout > 0) {
+            int32_t effective_home_speed = mc->home_speed;
+            if (mc->max_run_speed > 0 && effective_home_speed > mc->max_run_speed) {
+                effective_home_speed = mc->max_run_speed;
+            }
+            int32_t stall_speed = effective_home_speed / 10;
+            if (stall_speed < 5) stall_speed = 5;
+            if (fabsf(mc->velocity) <= (float)stall_speed) {
+                homing_ticks++;
+                if (homing_ticks > mc->home_center_timeout) {
+                    homing_origin_offset = current_position - mc->target_position;
+                    MotorControl_FinishHoming(mc, 0);
+                    return 0;
+                }
+            } else {
+                homing_ticks = 0;  /* 仍在运动中, 不计时 */
+            }
         }
     }
 

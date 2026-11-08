@@ -5,3 +5,4 @@
 ../Core/Src/encoder.c:64:9:Encoder_GetCount	2
 ../Core/Src/encoder.c:83:7:Encoder_GetSpeed	3
 ../Core/Src/encoder.c:94:6:Encoder_Reset	1
+../Core/Src/encoder.c:108:6:Encoder_SetCount	2

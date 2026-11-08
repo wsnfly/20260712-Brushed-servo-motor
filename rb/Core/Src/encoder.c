@@ -104,3 +104,20 @@ void Encoder_Reset(void)
     encoder_total_count = 0;
     __set_PRIMASK(primask);
 }
+
+void Encoder_SetCount(int64_t count)
+{
+    /* 将编码器绝对计数设为指定值(逻辑计数, 含方向取反, 与Encoder_GetCount对称).
+     * 存储原始值: 方向反转时取反存储, 读取时再取反得到相同逻辑计数.
+     * 与Reset不同: 不强制TIM3->CNT清零, 而是同步cnt_prev为当前CNT,
+     * 保证后续Synthesize的差分delta从当前CNT继续累加, 不产生跳变.
+     * 用于复位完成后将原点设定为计算出的位置. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    if (encoder_dir_reversed) {
+        count = -count;
+    }
+    encoder_total_count = count;
+    encoder_cnt_prev = (uint16_t)TIM3->CNT;
+    __set_PRIMASK(primask);
+}

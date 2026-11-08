@@ -279,6 +279,13 @@ class ModbusDebuggerApp:
     REG_SPEED_ACQ_TYPE3 = 0x009E        # 通道3采集类型
     REG_SPEED_ACQ_TYPE4 = 0x009F        # 通道4采集类型
 
+    # 双向复位居中容差/超时寄存器(新增) 0x00A8~0x00A9
+    # 解决堵转双向复位后"差步导致原点偏移/复位无法结束"问题:
+    #   - REG_HOME_CENTER_TOLERANCE: 回中到位误差容差(步, 默认10). 误差在此范围内即判定复位成功.
+    #   - REG_HOME_CENTER_TIMEOUT: 回中到位超时(单位=5ms tick, 默认200=1秒, 0=不启用). 差步卡住时兜底结束.
+    REG_HOME_CENTER_TOLERANCE = 0x00A8  # 双向复位居中到位误差容差(步, 默认10)
+    REG_HOME_CENTER_TIMEOUT = 0x00A9    # 双向复位居中到位超时(5ms tick, 默认200=1秒, 0=不启用)
+
     # 开机自动零点电流校准(新增)
     # 0=关闭(默认): 使用Flash保存的offset, 手动校准后存Flash
     # 1=开启: 每次开机自动校准, 结果不存Flash(避免频繁烧写)
@@ -599,6 +606,8 @@ class ModbusDebuggerApp:
         (0x00A5, "REG_IRQ_PRIO_TIM2", "TIM2中断优先级", "0~15, 默认3"),
         (0x00A6, "REG_IRQ_PRIO_EXTI4", "EXTI4中断优先级", "0~15, 默认1"),
         (0x00A7, "REG_IRQ_PRIO_EXTI9_5", "EXTI9_5中断优先级", "0~15, 默认1"),
+        (0x00A8, "REG_HOME_CENTER_TOLERANCE", "回中到位误差容差", "步, 默认10 (1~1000)"),
+        (0x00A9, "REG_HOME_CENTER_TIMEOUT", "回中到位超时", "×5ms, 默认200=1秒, 0=禁用"),
     ]
 
     # 写入全部寄存器时跳过的触发型/只读寄存器集合
@@ -918,6 +927,14 @@ class ModbusDebuggerApp:
         ttk.Label(other_frame, text="复位偏置:").grid(row=13, column=0, padx=5, pady=2)
         self.home_back_distance_var = tk.StringVar(value="")
         ttk.Entry(other_frame, textvariable=self.home_back_distance_var, width=10).grid(row=13, column=1, padx=5, pady=2)
+
+        # 双向复位居中参数(新增): 误差容差 + 超时, 解决堵转双向复位差步导致复位无法结束/原点偏移
+        ttk.Label(other_frame, text="复位容差(步):").grid(row=15, column=0, padx=5, pady=2)
+        self.home_center_tolerance_var = tk.StringVar(value="")
+        ttk.Entry(other_frame, textvariable=self.home_center_tolerance_var, width=10).grid(row=15, column=1, padx=5, pady=2)
+        ttk.Label(other_frame, text="复位超时(×5ms):").grid(row=15, column=2, padx=5, pady=2)
+        self.home_center_timeout_var = tk.StringVar(value="")
+        ttk.Entry(other_frame, textvariable=self.home_center_timeout_var, width=10).grid(row=15, column=3, padx=5, pady=2)
 
         ttk.Label(other_frame, text="开机自复位:").grid(row=14, column=0, padx=5, pady=2)
         self.home_auto_start_var = tk.StringVar(value="")
@@ -2345,6 +2362,8 @@ class ModbusDebuggerApp:
         if not self.home_precision_cycles_var.get().strip(): empty_fields.append("检测次数")
         if not self.home_max_distance_var.get().strip(): empty_fields.append("最大距离")
         if not self.home_back_distance_var.get().strip(): empty_fields.append("复位偏置")
+        if not self.home_center_tolerance_var.get().strip(): empty_fields.append("复位容差")
+        if not self.home_center_timeout_var.get().strip(): empty_fields.append("复位超时")
         if not self.home_auto_start_var.get().strip(): empty_fields.append("开机自复位")
         if empty_fields:
             messagebox.showwarning(
@@ -2376,6 +2395,8 @@ class ModbusDebuggerApp:
                         home_auto_start = 1 if self.home_auto_start_var.get() == "开启" else 0
                         home_precision_speed = int(self.home_precision_speed_var.get())
                         home_precision_cycles = int(self.home_precision_cycles_var.get())
+                        home_center_tolerance = int(self.home_center_tolerance_var.get())
+                        home_center_timeout = int(self.home_center_timeout_var.get())
                         home_values = [
                             home_mode,
                             home_dir,
@@ -2403,6 +2424,8 @@ class ModbusDebuggerApp:
                             self.get_slave_addr(), self.REG_HOME_PRECISION_SPEED_H,
                             [(home_precision_speed >> 16) & 0xFFFF, home_precision_speed & 0xFFFF])
                         self.modbus.write_single_register(self.get_slave_addr(), self.REG_HOME_PRECISION_CYCLES, home_precision_cycles)
+                        self.modbus.write_single_register(self.get_slave_addr(), self.REG_HOME_CENTER_TOLERANCE, home_center_tolerance)
+                        self.modbus.write_single_register(self.get_slave_addr(), self.REG_HOME_CENTER_TIMEOUT, home_center_timeout)
 
                         hm_name = {0: "关闭", 1: "堵转", 2: "精确复位", 3: "双向堵转复位", 4: "双向传感器居中"}
                         self.root.after(0, lambda: self.log(
@@ -2441,6 +2464,8 @@ class ModbusDebuggerApp:
                             self.get_slave_addr(), self.REG_MAX_RUN_SPEED_H, 2)
                         precision_data = self.modbus.read_holding_registers(
                             self.get_slave_addr(), self.REG_HOME_PRECISION_SPEED_H, 3)
+                        center_data = self.modbus.read_holding_registers(
+                            self.get_slave_addr(), self.REG_HOME_CENTER_TOLERANCE, 2)
                         dead_zone = data[0]
                         max_output = data[1]
                         max_run_speed = (max_run_data[0] << 16) | max_run_data[1]
@@ -2458,6 +2483,8 @@ class ModbusDebuggerApp:
                         home_auto_start = home_data[10]
                         home_precision_speed = (precision_data[0] << 16) | precision_data[1]
                         home_precision_cycles = precision_data[2]
+                        home_center_tolerance = center_data[0]
+                        home_center_timeout = center_data[1]
 
                         hm_display = {0: "关闭", 1: "堵转", 2: "精确复位", 3: "双向堵转复位", 4: "双向传感器居中"}
                         def update_ui():
@@ -2476,13 +2503,16 @@ class ModbusDebuggerApp:
                             self.home_auto_start_var.set("开启" if home_auto_start else "关闭")
                             self.home_precision_speed_var.set(str(home_precision_speed))
                             self.home_precision_cycles_var.set(str(home_precision_cycles))
+                            self.home_center_tolerance_var.set(str(home_center_tolerance))
+                            self.home_center_timeout_var.set(str(home_center_timeout))
                             self.log(
                                 f"读取参数: 死区={dead_zone}, 最大输出={max_output}, "
                                 f"最大运行速度={max_run_speed}, "
                                 f"启动模式={'标志位' if start_mode else '直接'}, "
                                 f"电机={'反转' if motor_dir else '正转'}, "
                                 f"编码器={'反转' if encoder_dir else '正常'}, "
-                                f"复位={hm_display.get(home_mode, '?')}")
+                                f"复位={hm_display.get(home_mode, '?')}, "
+                                f"容差={home_center_tolerance}步, 超时={home_center_timeout}×5ms")
                         self.root.after(0, update_ui)
                     finally:
                         self.serial_lock.release()
@@ -2545,6 +2575,10 @@ class ModbusDebuggerApp:
                             [0, 100])
                         self.modbus.write_single_register(
                             self.get_slave_addr(), self.REG_HOME_PRECISION_CYCLES, 3)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_HOME_CENTER_TOLERANCE, 10)
+                        self.modbus.write_single_register(
+                            self.get_slave_addr(), self.REG_HOME_CENTER_TIMEOUT, 200)
                         self.modbus.write_multiple_registers(
                             self.get_slave_addr(), self.REG_INPUT1_TARGET_SPEED_H,
                             [0, 0, 0, 0])
@@ -2571,6 +2605,8 @@ class ModbusDebuggerApp:
                             self.home_auto_start_var.set("开启")
                             self.home_precision_speed_var.set("100")
                             self.home_precision_cycles_var.set("3")
+                            self.home_center_tolerance_var.set("10")
+                            self.home_center_timeout_var.set("200")
                             self.pin4_func_var.set("脉冲")
                             self.pin4_pol_var.set("高电平")
                             self.pin4_ldir_var.set("停止正方向")
@@ -4911,7 +4947,8 @@ class ModbusDebuggerApp:
                     # 分段读取（每段最多100个寄存器, 避开MODBUS单次125上限留余量）
                     # 第1段: 0x0000~0x0044 (共0x45=69个)
                     # 第2段: 0x0045~0x006A (共0x26=38个, 含ADC滤波窗口REG_ADC_FILTER_SIZE=0x006A)
-                    for start, count in [(0x0000, 0x0045), (0x0045, 0x0026), (0x006B, 0x0026), (0x0091, 0x0001), (0x0092, 0x0009)]:
+                    # 末段: 0x0092~0x00A9 (共0x18=24个, 含回中容差0x00A8/超时0x00A9)
+                    for start, count in [(0x0000, 0x0045), (0x0045, 0x0026), (0x006B, 0x0026), (0x0091, 0x0001), (0x0092, 0x0018)]:
                         try:
                             data = self.modbus.read_holding_registers(
                                 self.get_slave_addr(), start, count)
@@ -5235,6 +5272,10 @@ class ModbusDebuggerApp:
                 return f"窗口={val} ({delay_ms}ms延迟)" if val > 1 else f"窗口={val} (关闭)"
             elif addr == 0x0091:  # REG_STEP_ACCEL_EN - 步进加减速使能
                 return f"{'开启' if val else '关闭'} (原始值:{val})"
+            elif addr == 0x00A8:  # REG_HOME_CENTER_TOLERANCE - 回中到位容差
+                return f"容差={val}步 (原始值:{val})"
+            elif addr == 0x00A9:  # REG_HOME_CENTER_TIMEOUT - 回中到位超时
+                return f"超时={val}×5ms={val*5}ms (原始值:{val})"
 
             return str(val)
         except Exception:
@@ -5477,6 +5518,9 @@ class ModbusDebuggerApp:
                 (0x0069, 'cur_dead_zone_var', lambda v: f"{s16(v) / 10.0 / self._cur_rel_per_amp():.3f}"),
                 # 外部ADC滤波窗口(0x006A): 直接是窗口大小0~128
                 (0x006A, 'adc_filter_size_var', lambda v: str(v)),
+                # 双向复位居中容差/超时(0x00A8~0x00A9, 新增): 均为无符号16位
+                (0x00A8, 'home_center_tolerance_var', lambda v: str(v)),
+                (0x00A9, 'home_center_timeout_var', lambda v: str(v)),
             ]
 
             for addr, var_name, conv in REG_TO_VAR:
@@ -5591,7 +5635,8 @@ class ModbusDebuggerApp:
                 try:
                     reg_dict = {}
                     # 分段读取（与寄存器列表"读取全部"一致，避开MODBUS单次125上限）
-                    for start, count in [(0x0000, 0x0045), (0x0045, 0x0026), (0x006B, 0x0026), (0x0091, 0x0001), (0x0092, 0x0009)]:
+                    # 末段: 0x0092~0x00A9 (共0x18=24个, 含回中容差REG_HOME_CENTER_TOLERANCE/超时REG_HOME_CENTER_TIMEOUT)
+                    for start, count in [(0x0000, 0x0045), (0x0045, 0x0026), (0x006B, 0x0026), (0x0091, 0x0001), (0x0092, 0x0018)]:
                         try:
                             data = self.modbus.read_holding_registers(
                                 self.get_slave_addr(), start, count)

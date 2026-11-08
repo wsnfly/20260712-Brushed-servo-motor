@@ -124,6 +124,8 @@ typedef struct {
     uint8_t home_auto_start;       /* 开机自动复位: 0=关闭, 1=开启 */
     int32_t home_precision_speed;  /* 开关精确复位低速检测速度(脉冲/秒) */
     uint8_t home_precision_cycles; /* 开关精确复位来回检测次数 */
+    int32_t home_center_tolerance; /* 双向复位居中到位误差容差(脉冲), 默认10 */
+    uint32_t home_center_timeout;  /* 双向复位居中到位超时(单位=5ms tick, 默认200=1秒, 0=不启用超时) */
     uint8_t pin4_func;           /* PB4功能 (PinFunc_t) */
     uint8_t pin4_polarity;       /* PB4极性 (PinPolarity_t) */
     uint8_t pin4_limit_dir;      /* PB4限位方向: 0=停止正方向, 1=停止负方向 */

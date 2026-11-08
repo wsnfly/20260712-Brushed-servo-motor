@@ -1,5 +1,5 @@
 ../Core/Inc/motor_control.h:45:23:MotorControl_IsPositionBasedMode	16	static
-../Core/Inc/modbus.h:451:23:SYS_GetTime100us	16	static,ignoring_inline_asm
+../Core/Inc/modbus.h:459:23:SYS_GetTime100us	16	static,ignoring_inline_asm
 ../Core/Src/modbus.c:42:9:MODBUS_IsSupportedBaud	24	static
 ../Core/Src/modbus.c:52:10:MODBUS_EncodeBaud	16	static
 ../Core/Src/modbus.c:57:10:MODBUS_DecodeBaud	24	static
@@ -14,11 +14,11 @@
 ../Core/Src/modbus.c:247:6:MODBUS_SendResponse	32	static
 ../Core/Src/modbus.c:277:13:MODBUS_SendException	24	static
 ../Core/Src/modbus.c:290:17:MODBUS_ReadRegister	112	static,ignoring_inline_asm
-../Core/Src/modbus.c:778:13:MODBUS_ApplyTarget	32	static,ignoring_inline_asm
-../Core/Src/modbus.c:809:13:MODBUS_ApplyMode	24	static
-../Core/Src/modbus.c:838:6:MODBUS_TriggerStartFlag	16	static
-../Core/Src/modbus.c:859:13:MODBUS_WriteRegister	552	static,ignoring_inline_asm
-../Core/Src/modbus.c:1622:13:MODBUS_ProcessReadHoldingRegs	280	static
-../Core/Src/modbus.c:1663:13:MODBUS_ProcessWriteSingleReg	32	static
-../Core/Src/modbus.c:1695:13:MODBUS_ProcessWriteMultipleRegs	48	static
-../Core/Src/modbus.c:1742:6:MODBUS_Process	40	static
+../Core/Src/modbus.c:786:13:MODBUS_ApplyTarget	32	static,ignoring_inline_asm
+../Core/Src/modbus.c:817:13:MODBUS_ApplyMode	24	static
+../Core/Src/modbus.c:846:6:MODBUS_TriggerStartFlag	16	static
+../Core/Src/modbus.c:867:13:MODBUS_WriteRegister	552	static,ignoring_inline_asm
+../Core/Src/modbus.c:1640:13:MODBUS_ProcessReadHoldingRegs	280	static
+../Core/Src/modbus.c:1681:13:MODBUS_ProcessWriteSingleReg	32	static
+../Core/Src/modbus.c:1713:13:MODBUS_ProcessWriteMultipleRegs	48	static
+../Core/Src/modbus.c:1760:6:MODBUS_Process	40	static

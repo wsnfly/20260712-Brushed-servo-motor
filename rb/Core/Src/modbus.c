@@ -485,6 +485,14 @@ static uint16_t MODBUS_ReadRegister(MB_Context_t *ctx, uint16_t addr)
         return mc->irq_prio_exti9_5;
     }
 
+    /* 双向复位居中容差/超时寄存器 0x00A8~0x00A9 (新增) */
+    if (addr == REG_HOME_CENTER_TOLERANCE) {
+        return (uint16_t)mc->home_center_tolerance;
+    }
+    if (addr == REG_HOME_CENTER_TIMEOUT) {
+        return (uint16_t)mc->home_center_timeout;
+    }
+
     /* 堵转保护寄存器 0x0040~0x0044 */
     if (addr >= REG_STALL_PROT_EN && addr <= REG_STALL_RESET) {
         switch (addr) {
@@ -1608,6 +1616,16 @@ static void MODBUS_WriteRegister(MB_Context_t *ctx, uint16_t addr, uint16_t valu
     }
     if (addr == REG_IRQ_PRIO_EXTI9_5) {
         if (value <= 15) { mc->irq_prio_exti9_5 = (uint8_t)value; HAL_NVIC_SetPriority(EXTI9_5_IRQn, value, 0); config_dirty = 1; }
+    }
+
+    /* 双向复位居中容差/超时寄存器写入 0x00A8~0x00A9 (新增)
+     * TIME(容差): 1~1000脉冲, 0或超出保留原值
+     * TIMEOUT(超时): 0~1000000个5ms tick, 0=不启用超时 */
+    if (addr == REG_HOME_CENTER_TOLERANCE) {
+        if (value >= 1 && value <= 1000) { mc->home_center_tolerance = (int32_t)value; config_dirty = 1; }
+    }
+    if (addr == REG_HOME_CENTER_TIMEOUT) {
+        if (value <= 1000000) { mc->home_center_timeout = value; config_dirty = 1; }
     }
 
     /* 如果需要立即应用目标值 */
